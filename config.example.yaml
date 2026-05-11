@@ -1,0 +1,289 @@
+default_profile: windows-dev
+sampling:
+  samples_per_bucket: 3
+  seed: 12345
+  max_per_group: 1
+batch:
+  default_count: 20
+  default_realtime_factor: 2.9
+  window:
+    enabled: false
+    start: 02:00
+    end: 07:00
+node:
+  id: windows-dev
+  roles:
+    web_ui: false
+    worker: false
+    manager: false
+web_ui:
+  enabled: false
+  host: 127.0.0.1
+  port: 5055
+  auth:
+    enabled: false
+    username: admin
+    password_hash: ''
+    session_ttl_seconds: 43200
+shared_state_dir: '.work/shared_state'
+local_work_dir: .work
+worker:
+  enabled: false
+  execute: false
+  max_parallel_jobs: 1
+  run_continuously: false
+  loop:
+    idle_sleep_seconds: 5
+    empty_backoff_seconds: 3600
+  schedule:
+    enabled: false
+    start: 02:00
+    end: 07:00
+    outside_window_behavior: finish_current_do_not_start_new
+  stop_mode_default: stop_after_current
+manager:
+  enabled: false
+  run_continuously: false
+  loop:
+    idle_sleep_seconds: 5
+    empty_backoff_seconds: 3600
+  execute: false
+  require_successful_jellyfin_refresh: false
+io_limits:
+  use_shared_locks: true
+  max_concurrent_nas_reads: 1
+  max_concurrent_nas_writes: 1
+  max_concurrent_active_encodes: 3
+  max_concurrent_finalizers: 1
+buckets:
+  anime:
+    high:
+      min_mb: 1024
+      max_mb: null
+    medium:
+      min_mb: 500
+      max_mb: 1024
+    low:
+      min_mb: 300
+      max_mb: 500
+  series:
+    high:
+      min_mb: 2048
+      max_mb: null
+    medium:
+      min_mb: 1024
+      max_mb: 2048
+    low:
+      min_mb: 500
+      max_mb: 1024
+  movie:
+    huge:
+      min_mb: 10240
+      max_mb: null
+    large:
+      min_mb: 5120
+      max_mb: 10240
+    medium:
+      min_mb: 2048
+      max_mb: 5120
+encoding:
+  anime:
+    encoder: libx265
+    crf: 24
+    preset: medium
+    pix_fmt: yuv420p10le
+    audio: copy
+    subtitles: copy
+  series:
+    encoder: libx265
+    crf: 24
+    preset: medium
+    pix_fmt: yuv420p10le
+    audio: copy
+    subtitles: copy
+  movie:
+    encoder: libx265
+    crf: 23
+    preset: medium
+    pix_fmt: yuv420p10le
+    audio: copy
+    subtitles: copy
+  unknown:
+    encoder: libx265
+    crf: 24
+    preset: medium
+    pix_fmt: yuv420p10le
+    audio: copy
+    subtitles: copy
+skip_rules:
+  skip_hevc: true
+  skip_av1: true
+  skip_4k: true
+  skip_hdr: true
+  min_duration_seconds: 300
+  skip_normalized_marker: true
+  normalized_markers:
+  - '[TEST-HEVC-'
+  - '[NORMALIZED-HEVC-'
+verification:
+  max_duration_diff_seconds: 2
+  clip_max_duration_diff_seconds: 6
+  min_output_source_ratio: 0.15
+  max_output_source_ratio: 0.95
+  per_media_type:
+    anime:
+      min_output_source_ratio: 0.08
+track_policy:
+  enabled: true
+  require_high_confidence: true
+  global:
+    if_language_unknown: keep
+    if_only_one_audio_track: keep
+    if_no_target_audio_found: keep_all
+    if_confidence_below_high: keep_all
+    copy_selected_audio: true
+    copy_selected_subtitles: true
+    transcode_audio: false
+  anime:
+    target_audio_languages:
+    - eng
+    drop_other_audio_if_target_found: true
+  series:
+    target_audio_languages:
+    - cze
+    drop_other_audio_if_target_found: true
+  movie:
+    target_audio_languages:
+    - cze
+    drop_other_audio_if_target_found: true
+  unknown:
+    cleanup_enabled: false
+tools:
+  ffmpeg: ffmpeg
+  ffprobe: ffprobe
+profiles:
+  windows-dev:
+    output_root: 'D:\Media\RIPTEST'
+    libraries:
+      anime:
+      - 'D:\Media\ANIME'
+      - 'D:\Media\ANIME MOVIES'
+      series:
+      - 'D:\Media\SERIALY'
+      movie:
+      - 'D:\Media\FILMY'
+    processed_registry:
+      enabled: true
+      path: 'D:\Media\RIPTEST\state\processed_sources.json'
+    jellyfin:
+      enabled: false
+      server_url: http://127.0.0.1:8096
+      api_key: ''
+      timeout_seconds: 30
+      path_mappings:
+      - local_prefix: 'D:\Media'
+        jellyfin_prefix: /mnt/media
+  windows-testfull:
+    output_root: 'D:\Media\RIPTEST'
+    libraries:
+      anime:
+      - 'D:\Media\ANIME'
+      - 'D:\Media\ANIME MOVIES'
+      series:
+      - 'D:\Media\SERIALY'
+      movie:
+      - 'D:\Media\FILMY'
+    sampling:
+      samples_per_bucket: 1
+    processed_registry:
+      enabled: true
+      path: 'D:\Media\RIPTEST\state\processed_sources.json'
+    jellyfin:
+      enabled: false
+      server_url: http://127.0.0.1:8096
+      api_key: ''
+      timeout_seconds: 30
+      path_mappings:
+      - local_prefix: 'D:\Media'
+        jellyfin_prefix: /mnt/media
+  media-server-manager:
+    extends: windows-dev
+    node:
+      id: media-server
+      roles:
+        web_ui: true
+        worker: true
+        manager: true
+    worker:
+      enabled: false
+      run_continuously: false
+      loop:
+        idle_sleep_seconds: 5
+      schedule:
+        enabled: false
+        start: 02:00
+        end: 07:00
+        outside_window_behavior: finish_current_do_not_start_new
+    manager:
+      enabled: false
+      run_continuously: false
+      loop:
+        idle_sleep_seconds: 5
+      execute: false
+      require_successful_jellyfin_refresh: false
+    jellyfin:
+      enabled: true
+      server_url: http://127.0.0.1:8096
+      api_key: ''
+      timeout_seconds: 30
+      path_mappings:
+      - local_prefix: 'D:\Media'
+        jellyfin_prefix: /mnt/media
+  gaming-worker:
+    extends: windows-dev
+    node:
+      id: gaming-server
+      roles:
+        web_ui: true
+        worker: true
+        manager: false
+    worker:
+      enabled: false
+      run_continuously: false
+      loop:
+        idle_sleep_seconds: 5
+      schedule:
+        enabled: false
+  desktop-worker:
+    extends: windows-dev
+    node:
+      id: desktop-pc
+      roles:
+        web_ui: true
+        worker: false
+        manager: false
+    worker:
+      enabled: false
+      schedule:
+        enabled: false
+  linux-nas:
+    output_root: /mnt/media/RIPTEST
+    libraries:
+      anime:
+      - /mnt/media/ANIME
+      - /mnt/media/ANIME MOVIES
+      series:
+      - /mnt/media/SERIALY
+      movie:
+      - /mnt/media/FILMY
+    processed_registry:
+      enabled: true
+      path: /mnt/media/RIPTEST/state/processed_sources.json
+    jellyfin:
+      enabled: false
+      server_url: http://127.0.0.1:8096
+      api_key: ''
+      timeout_seconds: 30
+      path_mappings:
+      - local_prefix: /mnt/media
+        jellyfin_prefix: /mnt/media

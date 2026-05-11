@@ -16,6 +16,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Copy `config.example.yaml` to `config.yaml` and fill in your local paths and secrets before running commands.
+
 The repository now uses a single `config.yaml` with named profiles. Common settings live at the top level and environment-specific or scenario-specific overrides live under `profiles:`.
 
 The default profile is `windows-dev`. To use a different one, pass `--profile`:
