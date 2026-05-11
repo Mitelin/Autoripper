@@ -121,6 +121,64 @@ def local_work_dir(config: dict[str, Any]) -> Path:
     return Path(config.get("local_work_dir") or ".work")
 
 
+def _normalized_mapping_prefix(value: str) -> str:
+    text = str(value or "")
+    if text in {"/", "\\"}:
+        return text
+    return text.rstrip("/\\")
+
+
+def _path_has_prefix(path: str, prefix: str) -> bool:
+    if not prefix:
+        return False
+    return path == prefix or path.startswith(prefix + "/") or path.startswith(prefix + "\\")
+
+
+def _apply_path_prefix_mapping(path: str, source_prefix: str, target_prefix: str) -> str:
+    normalized_path = str(path or "")
+    normalized_source = _normalized_mapping_prefix(source_prefix)
+    normalized_target = _normalized_mapping_prefix(target_prefix)
+    if not _path_has_prefix(normalized_path, normalized_source):
+        return normalized_path
+    suffix = normalized_path[len(normalized_source):]
+    return f"{normalized_target}{suffix}"
+
+
+def node_path_mappings(config: dict[str, Any]) -> list[dict[str, str]]:
+    mappings = config.get("node_path_mappings") or []
+    result: list[dict[str, str]] = []
+    for item in mappings:
+        if not isinstance(item, dict):
+            continue
+        canonical_prefix = _normalized_mapping_prefix(str(item.get("canonical_prefix") or ""))
+        local_prefix = _normalized_mapping_prefix(str(item.get("local_prefix") or ""))
+        if not canonical_prefix or not local_prefix:
+            continue
+        result.append({
+            "canonical_prefix": canonical_prefix,
+            "local_prefix": local_prefix,
+        })
+    return result
+
+
+def map_canonical_to_local_path(config: dict[str, Any], path: str) -> str:
+    mapped_path = str(path or "")
+    for mapping in node_path_mappings(config):
+        candidate = _apply_path_prefix_mapping(mapped_path, mapping["canonical_prefix"], mapping["local_prefix"])
+        if candidate != mapped_path:
+            return candidate
+    return mapped_path
+
+
+def map_local_to_canonical_path(config: dict[str, Any], path: str) -> str:
+    mapped_path = str(path or "")
+    for mapping in node_path_mappings(config):
+        candidate = _apply_path_prefix_mapping(mapped_path, mapping["local_prefix"], mapping["canonical_prefix"])
+        if candidate != mapped_path:
+            return candidate
+    return mapped_path
+
+
 def shared_locks_enabled(config: dict[str, Any]) -> bool:
     settings = config.get("io_limits") or {}
     return bool(settings.get("use_shared_locks", True))
@@ -132,7 +190,9 @@ def worker_job_work_dir(config: dict[str, Any], node: str, job_id: str) -> Path:
 
 def prepare_local_source_cache(config: dict[str, Any], node: str, job: dict[str, Any]) -> dict[str, Any]:
     job_id = str(job.get("job_id") or "unknown-job")
-    source_path = Path(str(job.get("source_path") or "source.bin"))
+    canonical_source_path = str(job.get("source_path") or "source.bin")
+    worker_local_source_path = map_canonical_to_local_path(config, canonical_source_path)
+    source_path = Path(worker_local_source_path)
     work_dir = worker_job_work_dir(config, node, job_id)
     input_dir = work_dir / "input"
     input_dir.mkdir(parents=True, exist_ok=True)
@@ -146,6 +206,8 @@ def prepare_local_source_cache(config: dict[str, Any], node: str, job: dict[str,
         copy_mode = "placeholder"
     return {
         "work_dir": str(work_dir),
+        "canonical_source_path": canonical_source_path,
+        "worker_local_source_path": worker_local_source_path,
         "local_source_path": str(local_source_path),
         "source_copy_mode": copy_mode,
         "source_size_bytes": local_source_path.stat().st_size,
@@ -405,6 +467,12 @@ def write_ready_output_artifacts(
     }
     write_json_atomic(worker_log_path, worker_log_payload)
     checksum_path.write_text(f"{hashlib.sha256(placeholder_text.encode('utf-8')).hexdigest()}  output.mkv\n", encoding="utf-8")
+    canonical_bundle_dir = map_local_to_canonical_path(config, str(bundle_dir))
+    canonical_output_path = map_local_to_canonical_path(config, str(placeholder_path))
+    canonical_ffprobe_path = map_local_to_canonical_path(config, str(ffprobe_path))
+    canonical_worker_log_path = map_local_to_canonical_path(config, str(worker_log_path))
+    canonical_checksum_path = map_local_to_canonical_path(config, str(checksum_path))
+    canonical_manifest_path = map_local_to_canonical_path(config, str(manifest_path))
     source_summary = job_source_summary(job)
     output_summary = {
         "duration_seconds": source_summary.get("duration_seconds"),
@@ -441,11 +509,11 @@ def write_ready_output_artifacts(
         "job_id": job_id,
         "node_id": node,
         "source_path": job.get("source_path"),
-        "ready_output_dir": str(bundle_dir),
-        "ready_output_path": str(placeholder_path),
-        "ffprobe_path": str(ffprobe_path),
-        "worker_log_path": str(worker_log_path),
-        "checksum_path": str(checksum_path),
+        "ready_output_dir": canonical_bundle_dir,
+        "ready_output_path": canonical_output_path,
+        "ffprobe_path": canonical_ffprobe_path,
+        "worker_log_path": canonical_worker_log_path,
+        "checksum_path": canonical_checksum_path,
         "created_at": utc_now(),
         "dry_run": True,
         "source_summary": source_summary,
@@ -455,12 +523,12 @@ def write_ready_output_artifacts(
     }
     write_json_atomic(manifest_path, manifest)
     return {
-        "ready_output_dir": str(bundle_dir),
-        "ready_output_path": str(placeholder_path),
-        "ready_output_manifest": str(manifest_path),
-        "ready_output_ffprobe": str(ffprobe_path),
-        "ready_output_worker_log": str(worker_log_path),
-        "ready_output_checksum": str(checksum_path),
+        "ready_output_dir": canonical_bundle_dir,
+        "ready_output_path": canonical_output_path,
+        "ready_output_manifest": canonical_manifest_path,
+        "ready_output_ffprobe": canonical_ffprobe_path,
+        "ready_output_worker_log": canonical_worker_log_path,
+        "ready_output_checksum": canonical_checksum_path,
         "ready_output_created_at": manifest["created_at"],
     }
 
@@ -638,7 +706,7 @@ def worker_step(config: dict[str, Any], node_override: str | None = None, force:
     else:
         target = move_claimed_job(config, claimed_path, "queue", {"requeued_at": utc_now(), "dry_run": not execute_mode, "local_space_check": space, "local_processing": {**(local_cache or {}), **(local_output or {}), **(encode_result or {})}, "execution_mode": "execute" if execute_mode else "dry_run"})
     local_cleanup = cleanup_local_job_workspace((local_cache or {}).get("work_dir"))
-    write_worker_heartbeat(config, node, "idle", "dry_run_complete")
+    write_worker_heartbeat(config, node, "idle", "execute_complete" if execute_mode else "dry_run_complete", current_job_id=None)
     return {
         "status": "dry_run_complete",
         "node_id": node,

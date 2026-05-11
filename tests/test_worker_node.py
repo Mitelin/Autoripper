@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import manager_node
 import queue_store
 import shared_locks
 import worker_node
@@ -60,6 +62,34 @@ class WorkerNodeTests(unittest.TestCase):
         required = worker_node.required_local_space_bytes({"source_size_bytes": 1024})
 
         self.assertEqual(required, int(1024 * 1.5 + 5 * 1024 * 1024 * 1024))
+
+    def test_map_canonical_to_local_path_rewrites_worker_mount(self) -> None:
+        config = {
+            "node_path_mappings": [
+                {
+                    "canonical_prefix": "/mnt/nas/filmy/",
+                    "local_prefix": "/mnt/nas-backup/",
+                }
+            ]
+        }
+
+        mapped = worker_node.map_canonical_to_local_path(config, "/mnt/nas/filmy/ANIME/a.mkv")
+
+        self.assertEqual(mapped, "/mnt/nas-backup/ANIME/a.mkv")
+
+    def test_map_local_to_canonical_path_rewrites_ready_output_mount(self) -> None:
+        config = {
+            "node_path_mappings": [
+                {
+                    "canonical_prefix": "/mnt/nas/filmy/",
+                    "local_prefix": "/mnt/nas-backup/",
+                }
+            ]
+        }
+
+        mapped = worker_node.map_local_to_canonical_path(config, "/mnt/nas-backup/RIPTEST/.ripper_state/ready_outputs/job/output.mkv")
+
+        self.assertEqual(mapped, "/mnt/nas/filmy/RIPTEST/.ripper_state/ready_outputs/job/output.mkv")
 
     def test_time_window_boundaries_match_finish_current_policy(self) -> None:
         start = worker_node.parse_hhmm("02:00")
@@ -118,6 +148,102 @@ class WorkerNodeTests(unittest.TestCase):
             self.assertFalse(Path(result["local_cleanup"]["path"]).exists())
             self.assertEqual(status["states"]["queue"], 0)
             self.assertEqual(status["states"]["ready_for_finalize"], 1)
+
+    def test_worker_dry_run_handoff_uses_canonical_ready_paths_with_node_mappings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            canonical_mount = temp_root / "canonical_mount"
+            worker_mount = temp_root / "worker_mount"
+            worker_source = worker_mount / "ANIME" / "episode01.mkv"
+            canonical_source = canonical_mount / "ANIME" / "episode01.mkv"
+            worker_source.parent.mkdir(parents=True, exist_ok=True)
+            canonical_source.parent.mkdir(parents=True, exist_ok=True)
+            worker_source.write_text("source-data\n", encoding="utf-8")
+            canonical_source.write_text("source-data\n", encoding="utf-8")
+
+            worker_config = {
+                "output_root": str(worker_mount / "RIPTEST"),
+                "libraries": {"anime": [str(canonical_mount / "ANIME")]},
+                "shared_state_dir": str(worker_mount / "RIPTEST" / ".ripper_state"),
+                "local_work_dir": str(temp_root / "work"),
+                "node": {"id": "gaming-worker", "roles": {"web_ui": True, "worker": True, "manager": False}},
+                "worker": {
+                    "enabled": True,
+                    "schedule": {"enabled": False, "start": "02:00", "end": "07:00", "outside_window_behavior": "finish_current_do_not_start_new"},
+                },
+                "node_path_mappings": [
+                    {
+                        "canonical_prefix": str(canonical_mount),
+                        "local_prefix": str(worker_mount),
+                    }
+                ],
+            }
+            manager_config = {
+                "output_root": str(canonical_mount / "RIPTEST"),
+                "libraries": {"anime": [str(canonical_mount / "ANIME")]},
+                "shared_state_dir": str(canonical_mount / "RIPTEST" / ".ripper_state"),
+                "node": {"id": "media-server", "roles": {"web_ui": True, "worker": True, "manager": True}},
+                "manager": {"enabled": True, "run_continuously": True, "require_successful_jellyfin_refresh": False},
+                "io_limits": {"use_shared_locks": True, "max_concurrent_finalizers": 1},
+                "node_path_mappings": [
+                    {
+                        "canonical_prefix": str(canonical_mount),
+                        "local_prefix": str(canonical_mount),
+                    }
+                ],
+            }
+            queue_store.enqueue_job(
+                worker_config,
+                {
+                    "schema_version": 1,
+                    "job_id": "job_mapped_ready",
+                    "status": "queue",
+                    "source_path": str(canonical_source),
+                    "source_size_bytes": worker_source.stat().st_size,
+                    "media_type": "anime",
+                    "bucket": "anime_high",
+                    "duration_seconds": 120.0,
+                    "audio_stream_count": 1,
+                    "subtitle_stream_count": 0,
+                },
+            )
+
+            result = worker_node.worker_step(worker_config, dry_run_result="ready")
+            worker_job = queue_store.read_json(Path(result["job_path"]))
+            worker_manifest_path = Path(worker_config["shared_state_dir"]) / "ready_outputs" / "job_mapped_ready" / "manifest.json"
+            worker_manifest = queue_store.read_json(worker_manifest_path)
+            worker_heartbeat = queue_store.read_json(Path(worker_config["shared_state_dir"]) / "workers" / "gaming-worker.json")
+
+            expected_worker_local_source = str(worker_source)
+            expected_canonical_output_dir = str(canonical_mount / "RIPTEST" / ".ripper_state" / "ready_outputs" / "job_mapped_ready")
+            expected_canonical_output_path = str(canonical_mount / "RIPTEST" / ".ripper_state" / "ready_outputs" / "job_mapped_ready" / "output.mkv")
+
+            self.assertEqual(worker_job["source_path"], str(canonical_source))
+            self.assertEqual(result["source_path"], str(canonical_source))
+            self.assertEqual(result["local_processing"]["canonical_source_path"], str(canonical_source))
+            self.assertEqual(result["local_processing"]["worker_local_source_path"], expected_worker_local_source)
+            self.assertEqual(worker_job["ready_output_dir"], expected_canonical_output_dir)
+            self.assertEqual(worker_job["ready_output_path"], expected_canonical_output_path)
+            self.assertEqual(worker_manifest["ready_output_dir"], expected_canonical_output_dir)
+            self.assertEqual(worker_manifest["ready_output_path"], expected_canonical_output_path)
+            self.assertEqual(worker_manifest["ffprobe_path"], str(canonical_mount / "RIPTEST" / ".ripper_state" / "ready_outputs" / "job_mapped_ready" / "output.ffprobe.json"))
+            self.assertEqual(worker_manifest["worker_log_path"], str(canonical_mount / "RIPTEST" / ".ripper_state" / "ready_outputs" / "job_mapped_ready" / "worker_log.json"))
+            self.assertEqual(worker_manifest["checksum_path"], str(canonical_mount / "RIPTEST" / ".ripper_state" / "ready_outputs" / "job_mapped_ready" / "checksum.sha256"))
+            self.assertEqual(worker_heartbeat["worker_state"], "idle")
+            self.assertEqual(worker_heartbeat["current_phase"], "dry_run_complete")
+            self.assertIsNone(worker_heartbeat["current_job_id"])
+
+            shutil.copytree(Path(worker_config["shared_state_dir"]), Path(manager_config["shared_state_dir"]), dirs_exist_ok=True)
+
+            manager_result = manager_node.manager_step(manager_config, dry_run_result="done")
+            status = queue_store.queue_status(manager_config)
+
+            self.assertEqual(manager_result["status"], "dry_run_complete")
+            self.assertEqual(manager_result["result_state"], "done")
+            self.assertTrue(manager_result["ready_output_check"]["ok"])
+            self.assertEqual(manager_result["ready_output_check"]["ready_output_path"], expected_canonical_output_path)
+            self.assertTrue(manager_result["verification"]["ok"])
+            self.assertEqual(status["states"]["done"], 1)
 
     def test_worker_step_requeues_when_nas_read_lock_is_busy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
