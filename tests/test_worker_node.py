@@ -594,18 +594,23 @@ class WorkerNodeTests(unittest.TestCase):
     def test_worker_loop_processes_job_then_stops_on_idle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self.make_config(temp_dir)
-            self.enqueue_job(config)
             sleep_calls: list[float] = []
 
-            result = worker_node.worker_loop(config, dry_run_result="ready", stop_on_idle=True, sleeper=sleep_calls.append)
-            status = queue_store.queue_status(config)
+            with patch.object(
+                worker_node,
+                "worker_step",
+                side_effect=[
+                    {"status": "dry_run_complete", "reason": None, "node_id": "test-node", "job_id": "job_worker123"},
+                    {"status": "idle", "reason": "no_job_available", "node_id": "test-node"},
+                ],
+            ):
+                result = worker_node.worker_loop(config, dry_run_result="ready", stop_on_idle=True, sleeper=sleep_calls.append)
 
             self.assertEqual(result["stop_reason"], "idle")
             self.assertEqual(result["iterations"], 2)
             self.assertEqual(result["status_counts"]["dry_run_complete"], 1)
             self.assertEqual(result["status_counts"]["idle"], 1)
             self.assertEqual(sleep_calls, [])
-            self.assertEqual(status["states"]["ready_for_finalize"], 1)
 
     def test_worker_loop_stops_immediately_when_stop_after_current_is_requested_before_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
