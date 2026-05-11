@@ -315,7 +315,7 @@ def interrupted_encode_result(
 
 
 def run_local_ffmpeg_encode(config: dict[str, Any], job: dict[str, Any], local_cache: dict[str, Any], node: str | None = None) -> dict[str, Any]:
-    from media_normalizer import build_ffmpeg_command, verify_output
+    from media_normalizer import build_ffmpeg_command, extract_metadata, run_ffprobe, verify_output
     from track_policy import apply_track_policy
 
     job_id = str(job.get("job_id") or "unknown-job")
@@ -324,8 +324,32 @@ def run_local_ffmpeg_encode(config: dict[str, Any], job: dict[str, Any], local_c
     output_dir = work_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
     local_output_path = output_dir / "output.mkv"
+
     source_item = job_source_summary(job)
-    track_policy_result = apply_track_policy(config, job)
+    ffprobe_bin = str((config.get("tools") or {}).get("ffprobe") or "ffprobe")
+    source_probe = run_ffprobe(local_source_path, ffprobe_bin)
+    if source_probe.ok and source_probe.data:
+        probed_item = extract_metadata(
+            local_source_path,
+            str(job.get("media_type") or "unknown"),
+            str(job.get("library_root") or ""),
+            source_probe.data,
+        )
+        source_item = {
+            **source_item,
+            **probed_item,
+            "source_path": str(job.get("source_path") or source_item.get("source_path") or local_source_path),
+            "library_root": str(job.get("library_root") or probed_item.get("library_root") or ""),
+            "media_type": str(job.get("media_type") or probed_item.get("media_type") or "unknown"),
+        }
+
+    track_policy_result = apply_track_policy(config, source_item)
+    if not source_probe.ok:
+        track_policy_result = {
+            **track_policy_result,
+            "source_probe_error": source_probe.error,
+        }
+
     command = build_ffmpeg_command(config, local_source_path, local_output_path, str(job.get("media_type") or "unknown"), track_policy_result)
     completed = shutil.which(command[0])
     if completed is None:
