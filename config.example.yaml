@@ -206,8 +206,33 @@ profiles:
       path_mappings:
       - local_prefix: 'D:\Media'
         jellyfin_prefix: /mnt/media
+  linux-nas:
+    output_root: /mnt/nas/filmy/RIPTEST
+    shared_state_dir: /mnt/nas/filmy/RIPTEST/.ripper_state
+    libraries:
+      anime:
+      - /mnt/nas/filmy/ANIME
+      - /mnt/nas/filmy/ANIME MOVIES
+      series:
+      - /mnt/nas/filmy/SERIALY
+      movie:
+      - /mnt/nas/filmy/FILMY
+    processed_registry:
+      enabled: true
+      path: /mnt/nas/filmy/RIPTEST/state/processed_sources.json
+    node_path_mappings:
+    - canonical_prefix: /mnt/nas/filmy
+      local_prefix: /mnt/nas/filmy
+    jellyfin:
+      enabled: false
+      server_url: http://127.0.0.1:8096
+      api_key: ''
+      timeout_seconds: 30
+      path_mappings:
+      - local_prefix: /mnt/nas/filmy
+        jellyfin_prefix: /mnt/nas/filmy
   media-server-manager:
-    extends: windows-dev
+    extends: linux-nas
     node:
       id: media-server
       roles:
@@ -237,10 +262,15 @@ profiles:
       api_key: ''
       timeout_seconds: 30
       path_mappings:
-      - local_prefix: 'D:\Media'
-        jellyfin_prefix: /mnt/media
+      - local_prefix: /mnt/nas/filmy
+        jellyfin_prefix: /mnt/nas/filmy
   gaming-worker:
-    extends: windows-dev
+    extends: linux-nas
+    output_root: /mnt/nas-backup/RIPTEST
+    shared_state_dir: /mnt/nas-backup/RIPTEST/.ripper_state
+    node_path_mappings:
+    - canonical_prefix: /mnt/nas/filmy
+      local_prefix: /mnt/nas-backup
     node:
       id: gaming-server
       roles:
@@ -266,24 +296,3 @@ profiles:
       enabled: false
       schedule:
         enabled: false
-  linux-nas:
-    output_root: /mnt/media/RIPTEST
-    libraries:
-      anime:
-      - /mnt/media/ANIME
-      - /mnt/media/ANIME MOVIES
-      series:
-      - /mnt/media/SERIALY
-      movie:
-      - /mnt/media/FILMY
-    processed_registry:
-      enabled: true
-      path: /mnt/media/RIPTEST/state/processed_sources.json
-    jellyfin:
-      enabled: false
-      server_url: http://127.0.0.1:8096
-      api_key: ''
-      timeout_seconds: 30
-      path_mappings:
-      - local_prefix: /mnt/media
-        jellyfin_prefix: /mnt/media

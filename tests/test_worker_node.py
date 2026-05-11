@@ -210,7 +210,8 @@ class WorkerNodeTests(unittest.TestCase):
 
             result = worker_node.worker_step(worker_config, dry_run_result="ready")
             worker_job = queue_store.read_json(Path(result["job_path"]))
-            worker_manifest_path = Path(worker_config["shared_state_dir"]) / "ready_outputs" / "job_mapped_ready" / "manifest.json"
+            canonical_manifest_path = Path(str(worker_job["ready_output_manifest"]))
+            worker_manifest_path = Path(worker_node.map_canonical_to_local_path(worker_config, str(canonical_manifest_path)))
             worker_manifest = queue_store.read_json(worker_manifest_path)
             worker_heartbeat = queue_store.read_json(Path(worker_config["shared_state_dir"]) / "workers" / "gaming-worker.json")
 
@@ -222,8 +223,13 @@ class WorkerNodeTests(unittest.TestCase):
             self.assertEqual(result["source_path"], str(canonical_source))
             self.assertEqual(result["local_processing"]["canonical_source_path"], str(canonical_source))
             self.assertEqual(result["local_processing"]["worker_local_source_path"], expected_worker_local_source)
+            self.assertTrue(str(worker_job["ready_output_manifest"]).startswith(str(canonical_mount)))
+            self.assertTrue(str(worker_job["ready_output_path"]).startswith(str(canonical_mount)))
+            self.assertTrue(str(result["local_processing"]["worker_local_source_path"]).startswith(str(worker_mount)))
             self.assertEqual(worker_job["ready_output_dir"], expected_canonical_output_dir)
             self.assertEqual(worker_job["ready_output_path"], expected_canonical_output_path)
+            self.assertEqual(worker_job["ready_output_manifest"], str(canonical_manifest_path))
+            self.assertTrue(str(worker_manifest_path).startswith(str(worker_mount)))
             self.assertEqual(worker_manifest["ready_output_dir"], expected_canonical_output_dir)
             self.assertEqual(worker_manifest["ready_output_path"], expected_canonical_output_path)
             self.assertEqual(worker_manifest["ffprobe_path"], str(canonical_mount / "RIPTEST" / ".ripper_state" / "ready_outputs" / "job_mapped_ready" / "output.ffprobe.json"))
@@ -233,7 +239,10 @@ class WorkerNodeTests(unittest.TestCase):
             self.assertEqual(worker_heartbeat["current_phase"], "dry_run_complete")
             self.assertIsNone(worker_heartbeat["current_job_id"])
 
-            shutil.copytree(Path(worker_config["shared_state_dir"]), Path(manager_config["shared_state_dir"]), dirs_exist_ok=True)
+            manager_root = queue_store.init_state(manager_config)
+            worker_root = Path(worker_config["shared_state_dir"])
+            shutil.copy2(worker_root / "ready_for_finalize" / "job_mapped_ready.json", manager_root / "ready_for_finalize" / "job_mapped_ready.json")
+            shutil.copytree(worker_manifest_path.parent, manager_root / "ready_outputs" / "job_mapped_ready", dirs_exist_ok=True)
 
             manager_result = manager_node.manager_step(manager_config, dry_run_result="done")
             status = queue_store.queue_status(manager_config)
@@ -586,14 +595,16 @@ class WorkerNodeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self.make_config(temp_dir)
             self.enqueue_job(config)
+            sleep_calls: list[float] = []
 
-            result = worker_node.worker_loop(config, dry_run_result="ready", stop_on_idle=True)
+            result = worker_node.worker_loop(config, dry_run_result="ready", stop_on_idle=True, sleeper=sleep_calls.append)
             status = queue_store.queue_status(config)
 
             self.assertEqual(result["stop_reason"], "idle")
             self.assertEqual(result["iterations"], 2)
             self.assertEqual(result["status_counts"]["dry_run_complete"], 1)
             self.assertEqual(result["status_counts"]["idle"], 1)
+            self.assertEqual(sleep_calls, [])
             self.assertEqual(status["states"]["ready_for_finalize"], 1)
 
     def test_worker_loop_stops_immediately_when_stop_after_current_is_requested_before_start(self) -> None:

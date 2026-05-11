@@ -9,15 +9,20 @@ import media_normalizer as mn
 
 
 class ConfigProfileTests(unittest.TestCase):
-    def test_real_gaming_worker_profile_inherits_windows_dev(self) -> None:
-        config = mn.load_config(Path("config.yaml"), "gaming-worker")
+  def test_real_gaming_worker_profile_uses_linux_game_mount(self) -> None:
+    config = mn.load_config(Path("config.example.yaml"), "gaming-worker")
 
-        self.assertEqual(config["active_profile"], "gaming-worker")
-        self.assertEqual(config["output_root"], r"\\192.168.50.23\admin\RIPTEST")
-        self.assertEqual(config["node"]["id"], "gaming-server")
-        self.assertFalse(config["worker"]["enabled"])
-        self.assertFalse(config["worker"]["run_continuously"])
-        self.assertIn("anime", config["libraries"])
+    self.assertEqual(config["active_profile"], "gaming-worker")
+    self.assertEqual(config["output_root"], "/mnt/nas-backup/RIPTEST")
+    self.assertEqual(config["shared_state_dir"], "/mnt/nas-backup/RIPTEST/.ripper_state")
+    self.assertEqual(config["node"]["id"], "gaming-server")
+    self.assertEqual(
+      config["node_path_mappings"],
+      [{"canonical_prefix": "/mnt/nas/filmy", "local_prefix": "/mnt/nas-backup"}],
+    )
+    self.assertFalse(config["worker"]["enabled"])
+    self.assertFalse(config["worker"]["run_continuously"])
+    self.assertIn("anime", config["libraries"])
 
     def test_profile_extends_and_overrides_nested_values(self) -> None:
         yaml_text = textwrap.dedent(
