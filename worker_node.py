@@ -4,6 +4,7 @@ import hashlib
 import json
 import socket
 import shutil
+import subprocess
 import time
 from datetime import datetime, time as datetime_time
 from pathlib import Path
@@ -233,11 +234,91 @@ def write_local_encoded_placeholder(config: dict[str, Any], node: str, job: dict
     }
 
 
-def run_local_ffmpeg_encode(config: dict[str, Any], job: dict[str, Any], local_cache: dict[str, Any]) -> dict[str, Any]:
+def ffmpeg_log_path(config: dict[str, Any], job_id: str) -> Path:
+    root = init_state(config)
+    return root / "logs" / "jobs" / f"{job_id}.ffmpeg.log"
+
+
+def encode_heartbeat_interval_seconds(config: dict[str, Any]) -> float:
+    value = worker_settings(config).get("encode_heartbeat_interval_seconds", 5)
+    return max(1.0, float(value))
+
+
+def encode_no_progress_timeout_seconds(config: dict[str, Any]) -> float:
+    value = worker_settings(config).get("encode_no_progress_timeout_seconds", 600)
+    return max(1.0, float(value))
+
+
+def output_progress_snapshot(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "size_bytes": 0,
+            "mtime_timestamp": None,
+            "mtime": None,
+            "token": (False, 0, None),
+        }
+    stat = path.stat()
+    return {
+        "size_bytes": stat.st_size,
+        "mtime_timestamp": stat.st_mtime,
+        "mtime": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
+        "token": (True, stat.st_size, stat.st_mtime),
+    }
+
+
+def read_log_tail(path: Path, max_chars: int = 8000) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return text[-max_chars:]
+
+
+def terminate_process(process: subprocess.Popen[Any], timeout_seconds: float = 5.0) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout_seconds)
+
+
+def interrupted_encode_result(
+    reason: str,
+    command: list[str],
+    track_policy_result: dict[str, Any],
+    local_output_path: Path,
+    log_path: Path,
+    started_at: float,
+    process: subprocess.Popen[Any] | None = None,
+) -> dict[str, Any]:
+    partial_output_deleted = False
+    if local_output_path.exists():
+        local_output_path.unlink()
+        partial_output_deleted = True
+    progress = output_progress_snapshot(local_output_path)
+    return {
+        "ok": False,
+        "reason": reason,
+        "ffmpeg_command": command,
+        "track_policy": track_policy_result,
+        "ffmpeg_log_path": str(log_path),
+        "ffmpeg_log_tail": read_log_tail(log_path),
+        "ffmpeg_pid": getattr(process, "pid", None),
+        "encode_elapsed_seconds": round(time.monotonic() - started_at, 1),
+        "output_size_bytes": progress["size_bytes"],
+        "output_mtime": progress["mtime"],
+        "partial_output_deleted": partial_output_deleted,
+        "source_untouched": True,
+    }
+
+
+def run_local_ffmpeg_encode(config: dict[str, Any], job: dict[str, Any], local_cache: dict[str, Any], node: str | None = None) -> dict[str, Any]:
     from media_normalizer import build_ffmpeg_command, verify_output
     from track_policy import apply_track_policy
-    import subprocess
 
+    job_id = str(job.get("job_id") or "unknown-job")
     local_source_path = Path(str(local_cache["local_source_path"]))
     work_dir = Path(str(local_cache["work_dir"]))
     output_dir = work_dir / "output"
@@ -255,49 +336,81 @@ def run_local_ffmpeg_encode(config: dict[str, Any], job: dict[str, Any], local_c
             "track_policy": track_policy_result,
         }
 
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
-    hard_stop_reason = None
-    while True:
-        return_code = process.poll()
-        if return_code is not None:
-            break
-        control = read_node_control(config, node_id(config))
-        if control.get("worker_command") == "hard_stop":
-            hard_stop_reason = "hard_stop_requested"
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-            break
-        schedule = worker_schedule_check(config)
-        if schedule.get("enabled") and not schedule.get("allowed_to_claim") and schedule.get("outside_window_behavior") == "hard_stop":
-            hard_stop_reason = "schedule_hard_stop_requested"
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-            break
-        time.sleep(0.2)
+    log_path = ffmpeg_log_path(config, job_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    heartbeat_interval = encode_heartbeat_interval_seconds(config)
+    no_progress_timeout = encode_no_progress_timeout_seconds(config)
+    started_at = time.monotonic()
+    last_heartbeat_at = 0.0
+    progress = output_progress_snapshot(local_output_path)
+    last_progress_token = progress["token"]
+    last_progress_at = started_at
+    process: subprocess.Popen[Any] | None = None
+    stop_reason = None
 
-    stdout, stderr = process.communicate()
-    if hard_stop_reason:
-        partial_output_deleted = False
-        if local_output_path.exists():
-            local_output_path.unlink()
-            partial_output_deleted = True
+    try:
+        with log_path.open("a", encoding="utf-8", errors="replace") as log_handle:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=log_handle)
+            while True:
+                return_code = process.poll()
+                now = time.monotonic()
+                progress = output_progress_snapshot(local_output_path)
+                if progress["token"] != last_progress_token:
+                    last_progress_token = progress["token"]
+                    last_progress_at = now
+                if return_code is not None:
+                    break
+                if node and (now - last_heartbeat_at) >= heartbeat_interval:
+                    write_worker_heartbeat(
+                        config,
+                        node,
+                        "running",
+                        "encoding_execute",
+                        current_job_id=job_id,
+                        extra={
+                            "execution_mode": "execute",
+                            "encode_elapsed_seconds": round(now - started_at, 1),
+                            "output_size_bytes": progress["size_bytes"],
+                            "output_mtime": progress["mtime"],
+                            "ffmpeg_pid": getattr(process, "pid", None),
+                            "local_processing": {
+                                "work_dir": local_cache.get("work_dir"),
+                                "local_source_path": local_cache.get("local_source_path"),
+                                "local_output_path": str(local_output_path),
+                                "ffmpeg_log_path": str(log_path),
+                            },
+                        },
+                    )
+                    last_heartbeat_at = now
+                control = read_node_control(config, node or node_id(config))
+                if control.get("worker_command") == "hard_stop":
+                    stop_reason = "hard_stop_requested"
+                    terminate_process(process)
+                    break
+                schedule = worker_schedule_check(config)
+                if schedule.get("enabled") and not schedule.get("allowed_to_claim") and schedule.get("outside_window_behavior") == "hard_stop":
+                    stop_reason = "schedule_hard_stop_requested"
+                    terminate_process(process)
+                    break
+                if (now - last_progress_at) >= no_progress_timeout:
+                    stop_reason = "encode_no_progress_timeout"
+                    terminate_process(process)
+                    break
+                time.sleep(0.2)
+    except (KeyboardInterrupt, SystemExit):
+        stop_reason = "worker_process_interrupted"
+        if process is not None:
+            terminate_process(process)
+
+    if stop_reason:
+        return interrupted_encode_result(stop_reason, command, track_policy_result, local_output_path, log_path, started_at, process)
+    if process is None:
         return {
             "ok": False,
-            "reason": hard_stop_reason,
+            "reason": "ffmpeg_start_failed",
             "ffmpeg_command": command,
             "track_policy": track_policy_result,
-            "stderr": stderr.strip(),
-            "stdout": stdout.strip(),
-            "partial_output_deleted": partial_output_deleted,
-            "source_untouched": True,
+            "ffmpeg_log_path": str(log_path),
         }
     if process.returncode != 0:
         return {
@@ -305,10 +418,12 @@ def run_local_ffmpeg_encode(config: dict[str, Any], job: dict[str, Any], local_c
             "reason": "ffmpeg_failed",
             "ffmpeg_command": command,
             "track_policy": track_policy_result,
-            "stderr": stderr.strip(),
-            "stdout": stdout.strip(),
+            "ffmpeg_log_path": str(log_path),
+            "ffmpeg_log_tail": read_log_tail(log_path),
+            "ffmpeg_pid": getattr(process, "pid", None),
         }
     verification, output_summary, errors = verify_output(config, source_item, local_output_path, track_policy_result)
+    progress = output_progress_snapshot(local_output_path)
     return {
         "ok": not errors,
         "reason": None if not errors else "verification_failed",
@@ -319,6 +434,11 @@ def run_local_ffmpeg_encode(config: dict[str, Any], job: dict[str, Any], local_c
         "errors": errors,
         "local_output_path": str(local_output_path),
         "local_output_size_bytes": local_output_path.stat().st_size if local_output_path.exists() else 0,
+        "ffmpeg_log_path": str(log_path),
+        "ffmpeg_pid": getattr(process, "pid", None),
+        "encode_elapsed_seconds": round(time.monotonic() - started_at, 1),
+        "output_size_bytes": progress["size_bytes"],
+        "output_mtime": progress["mtime"],
     }
 
 
@@ -629,9 +749,9 @@ def worker_step(config: dict[str, Any], node_override: str | None = None, force:
                         "active_encode_lock": encode_lock,
                     }
             write_worker_heartbeat(config, node, "running", "encoding_execute", current_job_id=job.get("job_id"), extra={"local_space_check": space, "local_processing": local_cache, "active_encode_lock": encode_lock, "execution_mode": "execute"})
-            encode_result = run_local_ffmpeg_encode(config, job, local_cache or {})
+            encode_result = run_local_ffmpeg_encode(config, job, local_cache or {}, node=node)
             if not encode_result.get("ok"):
-                interruption_reasons = {"hard_stop_requested", "schedule_hard_stop_requested"}
+                interruption_reasons = {"hard_stop_requested", "schedule_hard_stop_requested", "encode_no_progress_timeout", "worker_process_interrupted"}
                 failure_state = "interrupted" if encode_result.get("reason") in interruption_reasons else "failed"
                 failure_timestamp_key = "interrupted_at" if failure_state == "interrupted" else "failed_at"
                 local_processing_payload = {**(local_cache or {}), **(encode_result or {})}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -313,7 +314,7 @@ class WorkerNodeTests(unittest.TestCase):
             source.write_text("source-data\n", encoding="utf-8")
             self.enqueue_real_source_job(config, source)
 
-            def fake_encode(_config: dict, _job: dict, local_cache: dict) -> dict:
+            def fake_encode(_config: dict, _job: dict, local_cache: dict, node: str | None = None) -> dict:
                 output_path = Path(str(local_cache["work_dir"])) / "output" / "output.mkv"
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 output_path.write_text("encoded-data\n", encoding="utf-8")
@@ -441,6 +442,47 @@ class WorkerNodeTests(unittest.TestCase):
             self.assertTrue(result["source_untouched"])
             self.assertTrue(fake_process.terminated)
             self.assertFalse(output_path.exists())
+
+    def test_run_local_ffmpeg_encode_redirects_stderr_to_log_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_config(temp_dir)
+            source = Path(temp_dir) / "library" / "file.mkv"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text("source-data\n", encoding="utf-8")
+            work_dir = Path(temp_dir) / "work" / "job"
+            output_path = work_dir / "output" / "output.mkv"
+            local_cache = {"local_source_path": str(source), "work_dir": str(work_dir)}
+            job = {"job_id": "job_worker_execute", "media_type": "anime", "source_path": str(source), "source_size_bytes": source.stat().st_size}
+            popen_kwargs: dict[str, Any] = {}
+
+            class FakeProcess:
+                def __init__(self) -> None:
+                    self.returncode = 0
+                    self.pid = 4242
+
+                def poll(self) -> int | None:
+                    return self.returncode
+
+            def fake_popen(command: list[str], stdout: Any = None, stderr: Any = None) -> FakeProcess:
+                popen_kwargs["command"] = command
+                popen_kwargs["stdout"] = stdout
+                popen_kwargs["stderr"] = stderr
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text("encoded-data\n", encoding="utf-8")
+                stderr.write("ffmpeg stderr line\n" + ("x" * 200000))
+                stderr.flush()
+                return FakeProcess()
+
+            with patch("media_normalizer.build_ffmpeg_command", return_value=["ffmpeg", "-i", str(source), str(output_path)]), patch("track_policy.apply_track_policy", return_value={}), patch("media_normalizer.verify_output", return_value=({"output_exists": True}, {"video_codec": "hevc"}, [])), patch("subprocess.Popen", side_effect=fake_popen), patch("worker_node.shutil.which", return_value="ffmpeg"):
+                result = worker_node.run_local_ffmpeg_encode(config, job, local_cache, node="test-node")
+
+            self.assertTrue(result["ok"])
+            self.assertIs(popen_kwargs["stdout"], subprocess.DEVNULL)
+            self.assertIsNot(popen_kwargs["stderr"], subprocess.PIPE)
+            self.assertEqual(result["ffmpeg_pid"], 4242)
+            log_path = Path(str(result["ffmpeg_log_path"]))
+            self.assertTrue(log_path.exists())
+            self.assertIn("ffmpeg stderr line", log_path.read_text(encoding="utf-8", errors="replace"))
 
     def test_worker_step_execute_moves_job_to_interrupted_when_hard_stop_is_requested(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
