@@ -551,10 +551,11 @@ def write_ready_output_artifacts(
     manifest_path = bundle_dir / "manifest.json"
     if local_output_path and Path(str(local_output_path)).exists():
         shutil.copy2(Path(str(local_output_path)), placeholder_path)
-        placeholder_text = placeholder_path.read_text(encoding="utf-8")
+        placeholder_bytes = placeholder_path.read_bytes()
     else:
         placeholder_text = f"dry-run ready output for {job_id}\nsource={job.get('source_path') or ''}\nnode={node}\n"
         placeholder_path.write_text(placeholder_text, encoding="utf-8")
+        placeholder_bytes = placeholder_text.encode("utf-8")
     ffprobe_path.write_text(
         json.dumps(
             {
@@ -586,7 +587,7 @@ def write_ready_output_artifacts(
         "written_at": utc_now(),
     }
     write_json_atomic(worker_log_path, worker_log_payload)
-    checksum_path.write_text(f"{hashlib.sha256(placeholder_text.encode('utf-8')).hexdigest()}  output.mkv\n", encoding="utf-8")
+    checksum_path.write_text(f"{hashlib.sha256(placeholder_bytes).hexdigest()}  output.mkv\n", encoding="utf-8")
     canonical_bundle_dir = map_local_to_canonical_path(config, str(bundle_dir))
     canonical_output_path = map_local_to_canonical_path(config, str(placeholder_path))
     canonical_ffprobe_path = map_local_to_canonical_path(config, str(ffprobe_path))

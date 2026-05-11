@@ -484,6 +484,40 @@ class WorkerNodeTests(unittest.TestCase):
             self.assertTrue(log_path.exists())
             self.assertIn("ffmpeg stderr line", log_path.read_text(encoding="utf-8", errors="replace"))
 
+    def test_worker_step_execute_accepts_binary_output_with_invalid_utf8_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_config(temp_dir)
+            source = Path(temp_dir) / "library" / "file.mkv"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text("source-data\n", encoding="utf-8")
+            self.enqueue_real_source_job(config, source)
+
+            def fake_encode(_config: dict, _job: dict, local_cache: dict, node: str | None = None) -> dict:
+                output_path = Path(str(local_cache["work_dir"])) / "output" / "output.mkv"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"\xa3\xff\x00binary-output")
+                return {
+                    "ok": True,
+                    "ffmpeg_command": ["ffmpeg", "-i", str(local_cache["local_source_path"]), str(output_path)],
+                    "verification": {"output_exists": True},
+                    "output_summary": {"video_codec": "hevc", "audio_stream_count": 1, "subtitle_stream_count": 0},
+                    "errors": [],
+                    "local_output_path": str(output_path),
+                    "local_output_size_bytes": output_path.stat().st_size,
+                    "ffmpeg_log_tail": "bad\ufffdtext",
+                }
+
+            with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(config)):
+                with patch.object(worker_node, "run_local_ffmpeg_encode", side_effect=fake_encode):
+                    result = worker_node.worker_step(config, dry_run_result="ready", execute=True)
+
+            job = queue_store.read_json(Path(result["job_path"]))
+            checksum_path = Path(str(job["ready_output_checksum"]))
+            self.assertEqual(result["result_state"], "ready_for_finalize")
+            self.assertTrue(Path(job["ready_output_path"]).exists())
+            self.assertTrue(checksum_path.exists())
+            self.assertRegex(checksum_path.read_text(encoding="utf-8"), r"^[0-9a-f]{64}  output\.mkv\n$")
+
     def test_worker_step_execute_moves_job_to_interrupted_when_hard_stop_is_requested(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self.make_config(temp_dir)
