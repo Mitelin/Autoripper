@@ -27,6 +27,16 @@ class WorkerNodeTests(unittest.TestCase):
             },
         }
 
+    def enough_local_space(self, config: dict) -> dict:
+        return {
+            "local_work_dir": str(config["local_work_dir"]),
+            "required_bytes": 1024,
+            "required_gb": 0.0,
+            "available_bytes": 1024 * 1024 * 1024,
+            "available_gb": 1.0,
+            "enough_space": True,
+        }
+
     def enqueue_job(self, config: dict) -> None:
         queue_store.enqueue_job(
             config,
@@ -117,7 +127,8 @@ class WorkerNodeTests(unittest.TestCase):
             config = self.make_config(temp_dir)
             self.enqueue_job(config)
 
-            result = worker_node.worker_step(config, dry_run_result="requeue")
+            with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(config)):
+                result = worker_node.worker_step(config, dry_run_result="requeue")
             heartbeat_path = Path(config["shared_state_dir"]) / "workers" / "test-node.json"
             status = queue_store.queue_status(config)
 
@@ -132,7 +143,8 @@ class WorkerNodeTests(unittest.TestCase):
             config = self.make_config(temp_dir)
             self.enqueue_job(config)
 
-            result = worker_node.worker_step(config, dry_run_result="ready")
+            with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(config)):
+                result = worker_node.worker_step(config, dry_run_result="ready")
             job = queue_store.read_json(Path(result["job_path"]))
             status = queue_store.queue_status(config)
 
@@ -208,7 +220,8 @@ class WorkerNodeTests(unittest.TestCase):
                 },
             )
 
-            result = worker_node.worker_step(worker_config, dry_run_result="ready")
+            with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(worker_config)):
+                result = worker_node.worker_step(worker_config, dry_run_result="ready")
             worker_job = queue_store.read_json(Path(result["job_path"]))
             canonical_manifest_path = Path(str(worker_job["ready_output_manifest"]))
             worker_manifest_path = Path(worker_node.map_canonical_to_local_path(worker_config, str(canonical_manifest_path)))
@@ -261,7 +274,8 @@ class WorkerNodeTests(unittest.TestCase):
             held_lock = shared_locks.acquire_lock(config, "nas_read", "other-worker", "job-other")
 
             try:
-                result = worker_node.worker_step(config, dry_run_result="ready")
+                with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(config)):
+                    result = worker_node.worker_step(config, dry_run_result="ready")
             finally:
                 shared_locks.release_lock(Path(held_lock["path"]))
 
@@ -278,7 +292,8 @@ class WorkerNodeTests(unittest.TestCase):
             held_lock = shared_locks.acquire_lock(config, "nas_write", "other-worker", "job-other")
 
             try:
-                result = worker_node.worker_step(config, dry_run_result="ready")
+                with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(config)):
+                    result = worker_node.worker_step(config, dry_run_result="ready")
             finally:
                 shared_locks.release_lock(Path(held_lock["path"]))
 
@@ -312,8 +327,9 @@ class WorkerNodeTests(unittest.TestCase):
                     "local_output_size_bytes": output_path.stat().st_size,
                 }
 
-            with patch.object(worker_node, "run_local_ffmpeg_encode", side_effect=fake_encode):
-                result = worker_node.worker_step(config, dry_run_result="ready", execute=True)
+            with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(config)):
+                with patch.object(worker_node, "run_local_ffmpeg_encode", side_effect=fake_encode):
+                    result = worker_node.worker_step(config, dry_run_result="ready", execute=True)
 
             status = queue_store.queue_status(config)
             job = queue_store.read_json(Path(result["job_path"]))
@@ -444,7 +460,8 @@ class WorkerNodeTests(unittest.TestCase):
                     "source_untouched": True,
                 },
             ):
-                result = worker_node.worker_step(config, dry_run_result="ready", execute=True)
+                with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(config)):
+                    result = worker_node.worker_step(config, dry_run_result="ready", execute=True)
 
             status = queue_store.queue_status(config)
             job = queue_store.read_json(Path(result["job_path"]))
@@ -482,7 +499,8 @@ class WorkerNodeTests(unittest.TestCase):
                     "source_untouched": True,
                 },
             ):
-                result = worker_node.worker_step(config, dry_run_result="ready", execute=True)
+                with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(config)):
+                    result = worker_node.worker_step(config, dry_run_result="ready", execute=True)
 
             status = queue_store.queue_status(config)
             job = queue_store.read_json(Path(result["job_path"]))
@@ -503,7 +521,8 @@ class WorkerNodeTests(unittest.TestCase):
             held_lock = shared_locks.acquire_lock(config, "active_encode", "other-worker", "job-other")
 
             try:
-                result = worker_node.worker_step(config, dry_run_result="ready", execute=True)
+                with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(config)):
+                    result = worker_node.worker_step(config, dry_run_result="ready", execute=True)
             finally:
                 shared_locks.release_lock(Path(held_lock["path"]))
 
