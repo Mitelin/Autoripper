@@ -562,7 +562,18 @@ def normalize_jellyfin_path(path: str) -> str:
 def jellyfin_exact_path_item(items: list[dict[str, Any]], jellyfin_path: str) -> dict[str, Any] | None:
     normalized_target = normalize_jellyfin_path(jellyfin_path)
     for item in items:
-        if normalize_jellyfin_path(str(item.get("Path") or "")) == normalized_target:
+        candidate_paths: list[str] = []
+
+        item_path = str(item.get("Path") or "")
+        if item_path:
+            candidate_paths.append(item_path)
+
+        for media_source in item.get("MediaSources") or []:
+            media_source_path = str(media_source.get("Path") or "")
+            if media_source_path:
+                candidate_paths.append(media_source_path)
+
+        if any(normalize_jellyfin_path(candidate_path) == normalized_target for candidate_path in candidate_paths):
             return item
     return None
 
@@ -570,9 +581,12 @@ def jellyfin_exact_path_item(items: list[dict[str, Any]], jellyfin_path: str) ->
 def jellyfin_search_terms_for_path(source_path: str) -> list[str]:
     path = Path(source_path)
     raw_terms = [path.stem, path.parent.name]
-    episode_match = re.match(r"^s\d{1,2}e\d{1,3}[ ._\-]+(.+)$", path.stem, re.IGNORECASE)
+    episode_match = re.search(r"\bs\d{1,2}e\d{1,3}\b[ ._\-]+(.+)$", path.stem, re.IGNORECASE)
     if episode_match:
-        raw_terms.append(episode_match.group(1))
+        episode_title = episode_match.group(1)
+        episode_title = re.sub(r"\b(?:WEB[- ._]?DL|WEBDL|BluRay|BRRip|HDRip|DVDRip|x264|x265|H\.?264|H\.?265|HEVC|AVC|AAC|DDP?5\.1|10bit|8bit|1080p|720p|2160p|480p)\b.*$", "", episode_title, flags=re.IGNORECASE)
+        episode_title = episode_title.strip(" ._-")
+        raw_terms.append(episode_title)
     cleaned_terms: list[str] = []
     seen: set[str] = set()
     for term in raw_terms:
@@ -592,7 +606,7 @@ def jellyfin_search_terms_for_path(source_path: str) -> list[str]:
 
 def jellyfin_find_item_by_search(config: dict[str, Any], source_path: str, jellyfin_path: str) -> dict[str, Any] | None:
     for term in jellyfin_search_terms_for_path(source_path):
-        query = urllib_parse.urlencode({"Recursive": "true", "Fields": "Path", "SearchTerm": term, "Limit": "50"})
+        query = urllib_parse.urlencode({"Recursive": "true", "Fields": "Path,MediaSources", "SearchTerm": term, "Limit": "50"})
         data = jellyfin_api_json(config, f"/Items?{query}")
         item = jellyfin_exact_path_item(data.get("Items") or [], jellyfin_path)
         if item is not None:
@@ -620,7 +634,7 @@ def jellyfin_api_json(config: dict[str, Any], path: str, method: str = "GET") ->
 
 def jellyfin_find_item_id_by_path(config: dict[str, Any], source_path: str) -> str | None:
     jellyfin_path = jellyfin_map_path(config, source_path)
-    query = urllib_parse.urlencode({"Recursive": "true", "Fields": "Path", "Path": jellyfin_path, "Limit": "10"})
+    query = urllib_parse.urlencode({"Recursive": "true", "Fields": "Path,MediaSources", "Path": jellyfin_path, "Limit": "10"})
     data = jellyfin_api_json(config, f"/Items?{query}")
     item = jellyfin_exact_path_item(data.get("Items") or [], jellyfin_path)
     if item is None:
