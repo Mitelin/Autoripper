@@ -318,17 +318,25 @@ def claim_next_job(config: dict[str, Any], node_id: str | None = None, from_stat
     for source in sorted((root / from_state).glob("*.json")):
         job_id = source.stem.split(".", 1)[0]
         target = root / to_state / f"{job_id}.{safe_node}.json"
+
         try:
-            os.rename(source, target)
+            job = read_json(source)
         except FileNotFoundError:
             continue
-        except FileExistsError:
-            continue
-        job = read_json(target)
+
         job["status"] = to_state
         job["claimed_by"] = safe_node
         job["claimed_at"] = utc_now()
-        write_json_atomic(target, job)
+
+        try:
+            write_json_atomic(target, job)
+            source.unlink()
+        except FileNotFoundError:
+            target.unlink(missing_ok=True)
+            continue
+        except FileExistsError:
+            continue
+
         return {"job": job, "path": str(target)}
     return None
 
