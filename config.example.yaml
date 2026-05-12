@@ -49,6 +49,42 @@ manager:
     empty_backoff_seconds: 3600
   execute: false
   require_successful_jellyfin_refresh: false
+production:
+  enabled: false
+  tick_seconds: 30
+  enqueue:
+    enabled: true
+    priority: production
+    queue_target: 5
+    queue_max: 10
+    enqueue_count_per_tick: 2
+    filesystem_limit: 300
+    min_duration_seconds: 300
+    max_duration_seconds: null
+    media_types:
+    - anime
+    - series
+    - movie
+    strategy: largest_first
+  finalizer:
+    enabled: true
+    max_finalize_per_tick: 2
+  backpressure:
+    max_ready_for_finalize_jobs: 5
+    max_ready_outputs_gb: 20
+    max_running_jobs: 3
+    max_total_inflight_jobs: 10
+    min_shared_state_free_gb: 0
+    min_output_root_free_gb: 0
+  recovery:
+    recover_stale_jobs: true
+    recover_stale_locks: true
+    requeue_interrupted_jobs: true
+  safety:
+    require_manager_execute: true
+    require_jellyfin_enabled: true
+    require_worker_disabled_on_manager_node: true
+    require_successful_jellyfin_refresh: false
 io_limits:
   use_shared_locks: true
   max_concurrent_nas_reads: 1
@@ -241,6 +277,7 @@ profiles:
         manager: true
     worker:
       enabled: false
+      execute: false
       run_continuously: false
       loop:
         idle_sleep_seconds: 5
@@ -250,12 +287,14 @@ profiles:
         end: 07:00
         outside_window_behavior: finish_current_do_not_start_new
     manager:
-      enabled: false
-      run_continuously: false
+      enabled: true
+      run_continuously: true
       loop:
         idle_sleep_seconds: 5
-      execute: false
+      execute: true
       require_successful_jellyfin_refresh: false
+    production:
+      enabled: false
     jellyfin:
       enabled: true
       server_url: http://127.0.0.1:8096
@@ -278,12 +317,17 @@ profiles:
         worker: true
         manager: false
     worker:
-      enabled: false
-      run_continuously: false
+      enabled: true
+      execute: true
+      run_continuously: true
       loop:
         idle_sleep_seconds: 5
       schedule:
         enabled: false
+    manager:
+      enabled: false
+      execute: false
+      run_continuously: false
   desktop-worker:
     extends: windows-dev
     node:

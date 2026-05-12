@@ -205,6 +205,117 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(result, 0)
             loop_mock.assert_called_once_with(config, node_override="worker-a", force=False, dry_run_result="ready", execute=True, max_iterations=3, idle_sleep_seconds=0.1, stop_on_idle=True)
 
+    def production_config(self, temp_dir: str) -> tuple[Path, dict]:
+        config_path = self.write_config(temp_dir)
+        config = mn.load_config(config_path)
+        config["node"] = {"id": "media-server", "roles": {"web_ui": True, "worker": True, "manager": True}}
+        config["worker"] = {"enabled": False, "run_continuously": False}
+        config["manager"] = {"enabled": True, "run_continuously": True, "execute": True}
+        config["jellyfin"] = {"enabled": True, "server_url": "http://jellyfin", "api_key": "test"}
+        config["production"] = {
+            "enabled": True,
+            "tick_seconds": 0,
+            "enqueue": {"queue_target": 2, "queue_max": 3, "enqueue_count_per_tick": 2, "filesystem_limit": 10, "min_duration_seconds": None},
+            "finalizer": {"enabled": True, "max_finalize_per_tick": 1},
+            "backpressure": {"max_ready_for_finalize_jobs": 5, "max_ready_outputs_gb": 20, "max_running_jobs": 3, "max_total_inflight_jobs": 10},
+            "recovery": {"recover_stale_jobs": False, "recover_stale_locks": False, "requeue_interrupted_jobs": False},
+            "safety": {"require_manager_execute": True, "require_jellyfin_enabled": True, "require_worker_disabled_on_manager_node": True},
+        }
+        return config_path, config
+
+    def test_production_loop_cli_wires_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path, config = self.production_config(temp_dir)
+
+            with patch.object(mn, "load_config", return_value=config), patch.object(mn, "production_loop", return_value={"status": "loop_complete", "iterations": 1}) as loop_mock:
+                result = mn.main(["production-loop", "--config", str(config_path), "--node-id", "media-server", "--execute", "--max-iterations", "1", "--tick-seconds", "0"])
+
+            self.assertEqual(result, 0)
+            loop_mock.assert_called_once_with(config, node_override="media-server", execute=True, max_iterations=1, tick_seconds=0.0)
+
+    def test_production_tick_blocks_enqueue_when_ready_outputs_limit_exceeded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, config = self.production_config(temp_dir)
+            config["production"]["backpressure"]["max_ready_outputs_gb"] = 0
+            root = queue_store.init_state(config)
+            ready_dir = root / "ready_outputs" / "job_big"
+            ready_dir.mkdir(parents=True, exist_ok=True)
+            (ready_dir / "output.mkv").write_bytes(b"x" * 1024)
+
+            with patch.object(mn, "plan_top_candidates") as plan_mock:
+                result = mn.production_tick(config)
+
+            self.assertEqual(result["production_state"], "blocked")
+            self.assertIn("enqueue blocked: ready_outputs size limit exceeded", result["blocked_reasons"])
+            plan_mock.assert_not_called()
+
+    def test_production_tick_finalizes_before_enqueueing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, config = self.production_config(temp_dir)
+            source = self.create_source_file(temp_dir)
+            root = queue_store.init_state(config)
+            queue_store.write_json_atomic(root / "ready_for_finalize" / "job_ready.json", {"schema_version": 1, "job_id": "job_ready", "status": "ready_for_finalize", "source_path": str(source)})
+            item = {"source_path": str(source.parent / "next.mkv"), "library_root": str(source.parent), "media_type": "anime", "bucket": "anime_high", "file_size_bytes": 200, "file_size_mb": 0.1, "duration_seconds": 120.0, "video_codec": "h264", "audio_stream_count": 1, "subtitle_stream_count": 0}
+
+            with patch.object(mn, "plan_top_candidates", return_value=([], [item], {"selection_strategy": "test"})):
+                result = mn.production_tick(config)
+
+            status = queue_store.queue_status(config)
+            self.assertEqual(result["last_finalize_count"], 1)
+            self.assertEqual(result["last_enqueue_count"], 1)
+            self.assertEqual(status["states"]["done"], 1)
+            self.assertEqual(status["states"]["queue"], 1)
+
+    def test_production_enqueue_skips_duplicate_source_in_existing_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, config = self.production_config(temp_dir)
+            source = self.create_source_file(temp_dir)
+            root = queue_store.init_state(config)
+            job_id = queue_store.job_id_for_source(str(source), source.stat().st_size, source.stat().st_mtime_ns)
+            queue_store.write_json_atomic(root / "done" / f"{job_id}.json", {"schema_version": 1, "job_id": job_id, "status": "done", "source_path": str(source)})
+            duplicate = {"source_path": str(source), "library_root": str(source.parent), "media_type": "anime", "bucket": "anime_high", "file_size_bytes": source.stat().st_size, "source_mtime_ns": source.stat().st_mtime_ns, "file_size_mb": 0.1, "duration_seconds": 120.0, "video_codec": "h264", "audio_stream_count": 1, "subtitle_stream_count": 0}
+
+            with patch.object(mn, "plan_top_candidates", return_value=([], [duplicate], {"selection_strategy": "test"})):
+                result = mn.production_enqueue_once(config, 1, "production")
+
+            self.assertEqual(result["created_count"], 0)
+            self.assertEqual(result["skipped_existing_count"], 1)
+            self.assertEqual(queue_store.queue_status(config)["states"]["queue"], 0)
+
+    def test_production_enqueue_filters_configured_media_types_before_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, config = self.production_config(temp_dir)
+            config["production"]["enqueue"]["media_types"] = ["anime", "series"]
+            config["production"]["enqueue"]["filesystem_limit"] = 5
+            config["tools"] = {"ffprobe": "ffprobe"}
+            library = Path(temp_dir) / "library"
+            anime = self.create_source_file(temp_dir, "library/anime.mkv")
+            series = self.create_source_file(temp_dir, "library/series.mkv")
+            movie = self.create_source_file(temp_dir, "library/movie.mkv")
+            anime.write_bytes(b"a" * 300)
+            series.write_bytes(b"s" * 500)
+            movie.write_bytes(b"m" * 1000)
+            config["libraries"] = {"anime": [str(library)], "series": [str(library)], "movie": [str(library)]}
+
+            def fake_walk(_config: dict) -> list[dict]:
+                return [
+                    {"source_path": str(movie), "media_type": "movie", "library_root": str(library)},
+                    {"source_path": str(series), "media_type": "series", "library_root": str(library)},
+                    {"source_path": str(anime), "media_type": "anime", "library_root": str(library)},
+                ]
+
+            def fake_extract(path: Path, media_type: str, library_root: str, _probe: dict) -> dict:
+                stat = path.stat()
+                return {"source_path": str(path), "library_root": library_root, "media_type": media_type, "bucket": f"{media_type}_high", "file_size_bytes": stat.st_size, "file_size_mb": stat.st_size / 1024 / 1024, "source_mtime_ns": stat.st_mtime_ns, "duration_seconds": 120.0, "video_codec": "h264", "audio_stream_count": 1, "subtitle_stream_count": 0}
+
+            with patch.object(mn, "require_tool"), patch.object(mn, "walk_libraries", side_effect=fake_walk), patch.object(mn, "run_ffprobe", return_value=mn.ProbeResult(ok=True, data={})), patch.object(mn, "extract_metadata", side_effect=fake_extract), patch.object(mn, "bucket_for_item", side_effect=lambda item, _config: item.get("bucket") or f"{item['media_type']}_high"), patch.object(mn, "skip_reason", return_value=None):
+                result = mn.production_enqueue_once(config, 2, "production")
+
+            queued = [queue_store.read_json(path) for path in queue_store.list_state_files(config, "queue")]
+            self.assertEqual(result["created_count"], 2)
+            self.assertEqual([Path(item["source_path"]).name for item in result["enqueued"]], ["series.mkv", "anime.mkv"])
+            self.assertNotIn("movie", [job["media_type"] for job in queued])
+
     def test_main_worker_step_wires_execute_argument(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = self.write_config(temp_dir)

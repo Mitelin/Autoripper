@@ -20,8 +20,9 @@ class ConfigProfileTests(unittest.TestCase):
       config["node_path_mappings"],
       [{"canonical_prefix": "/mnt/nas/filmy", "local_prefix": "/mnt/nas-backup"}],
     )
-    self.assertFalse(config["worker"]["enabled"])
-    self.assertFalse(config["worker"]["run_continuously"])
+    self.assertTrue(config["worker"]["enabled"])
+    self.assertTrue(config["worker"]["execute"])
+    self.assertTrue(config["worker"]["run_continuously"])
     self.assertIn("anime", config["libraries"])
 
     def test_profile_extends_and_overrides_nested_values(self) -> None:

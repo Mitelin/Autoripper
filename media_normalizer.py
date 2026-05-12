@@ -23,7 +23,7 @@ from urllib import request as urllib_request
 
 import yaml
 
-from queue_store import build_job_payload, claim_next_job, enqueue_job, init_state, queue_status, read_node_control, recover_stale_running_jobs, requeue_interrupted_jobs, set_global_control, set_node_control
+from queue_store import JOB_STATES, build_job_payload, claim_next_job, enqueue_job, init_state, list_state_files, queue_status, read_json, read_node_control, recover_stale_running_jobs, requeue_interrupted_jobs, sanitize_node_id, set_global_control, set_node_control, shared_state_dir, write_json_atomic
 from manager_node import manager_loop, manager_step, node_id as configured_manager_node_id, write_manager_heartbeat
 from shared_locks import acquire_lock, lock_status, recover_stale_locks, release_lock
 from track_policy import apply_track_policy
@@ -681,13 +681,20 @@ def fast_top_filesystem_candidates(
     config: dict[str, Any],
     media_type_filter: str | None = None,
     bucket_filter: str | None = None,
+    exclude_source_paths: set[str] | None = None,
+    media_type_filters: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     registry = load_registry(config)
+    excluded = exclude_source_paths or set()
     candidates: list[dict[str, Any]] = []
     for candidate in walk_libraries(config):
         if media_type_filter and candidate["media_type"] != media_type_filter:
             continue
+        if media_type_filters is not None and candidate["media_type"] not in media_type_filters:
+            continue
         path = Path(candidate["source_path"])
+        if normalized_source_path(path) in excluded:
+            continue
         if registry_enabled(config) and registry_record_for_source(registry, path):
             continue
         try:
@@ -722,10 +729,13 @@ def plan_top_candidates(
     filesystem_limit: int | None = None,
     min_duration: float | None = None,
     max_duration: float | None = None,
+    exclude_source_paths: set[str] | None = None,
+    dedupe_sampling_groups: bool = True,
+    media_type_filters: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     ffprobe = (config.get("tools") or {}).get("ffprobe", "ffprobe")
     require_tool(ffprobe)
-    filesystem_candidates = fast_top_filesystem_candidates(config, media_type_filter, bucket_filter)
+    filesystem_candidates = fast_top_filesystem_candidates(config, media_type_filter, bucket_filter, exclude_source_paths=exclude_source_paths, media_type_filters=media_type_filters)
     limited_candidates = filesystem_candidates[:filesystem_limit] if filesystem_limit else filesystem_candidates
     checked_items: list[dict[str, Any]] = []
     selected: list[dict[str, Any]] = []
@@ -755,10 +765,11 @@ def plan_top_candidates(
             continue
         if not bucket_filter_matches(item.get("bucket"), bucket_filter):
             continue
-        group_name = item.get("sampling_group") or Path(item["source_path"]).parent.name
-        if group_name in seen_groups:
-            continue
-        seen_groups.add(group_name)
+        if dedupe_sampling_groups:
+            group_name = item.get("sampling_group") or Path(item["source_path"]).parent.name
+            if group_name in seen_groups:
+                continue
+            seen_groups.add(group_name)
         selected.append(item)
 
     stats = {
@@ -772,6 +783,9 @@ def plan_top_candidates(
         "filesystem_candidates_considered": len(limited_candidates),
         "ffprobe_candidates_checked": len(checked_items),
         "selected_count": len(selected),
+        "excluded_source_count": len(exclude_source_paths or set()),
+        "dedupe_sampling_groups": dedupe_sampling_groups,
+        "media_type_filters": sorted(media_type_filters) if media_type_filters is not None else None,
     }
     return checked_items, selected, stats
 
@@ -1358,17 +1372,21 @@ def run_node_control_command(
     node_id: str,
     worker_command: str | None,
     manager_command: str | None,
+    production_command: str | None,
     updated_by: str | None,
 ) -> int:
     current = read_node_control(config, node_id)
     next_worker_command = current.get("worker_command")
     next_manager_command = current.get("manager_command")
+    next_production_command = current.get("production_command")
     if worker_command is not None:
         next_worker_command = None if worker_command == "none" else worker_command
     if manager_command is not None:
         next_manager_command = None if manager_command == "none" else manager_command
-    if worker_command is not None or manager_command is not None:
-        set_node_control(config, node_id, worker_command=next_worker_command, manager_command=next_manager_command, updated_by=updated_by)
+    if production_command is not None:
+        next_production_command = None if production_command == "none" else production_command
+    if worker_command is not None or manager_command is not None or production_command is not None:
+        set_node_control(config, node_id, worker_command=next_worker_command, manager_command=next_manager_command, production_command=next_production_command, updated_by=updated_by)
         current = read_node_control(config, node_id)
     print(json.dumps(current, indent=2, ensure_ascii=False))
     return 0
@@ -1473,6 +1491,373 @@ def run_recover_stale_locks_command(config: dict[str, Any]) -> int:
 
 def run_requeue_interrupted_jobs_command(config: dict[str, Any], job_ids: list[str] | None, limit: int | None) -> int:
     print(json.dumps(requeue_interrupted_jobs(config, job_ids=job_ids, limit=limit), indent=2, ensure_ascii=False))
+    return 0
+
+
+def production_settings(config: dict[str, Any]) -> dict[str, Any]:
+    defaults = {
+        "enabled": False,
+        "tick_seconds": 30,
+        "enqueue": {
+            "enabled": True,
+            "priority": "production",
+            "queue_target": 5,
+            "queue_max": 10,
+            "enqueue_count_per_tick": 2,
+            "filesystem_limit": 300,
+            "min_duration_seconds": 300,
+            "max_duration_seconds": None,
+            "media_types": ["anime", "series", "movie"],
+            "strategy": "largest_first",
+        },
+        "finalizer": {"enabled": True, "max_finalize_per_tick": 2},
+        "backpressure": {
+            "max_ready_for_finalize_jobs": 5,
+            "max_ready_outputs_gb": 20,
+            "max_running_jobs": 3,
+            "max_total_inflight_jobs": 10,
+            "min_shared_state_free_gb": 0,
+            "min_output_root_free_gb": 0,
+        },
+        "recovery": {"recover_stale_jobs": True, "recover_stale_locks": True, "requeue_interrupted_jobs": True},
+        "safety": {
+            "require_manager_execute": True,
+            "require_jellyfin_enabled": True,
+            "require_worker_disabled_on_manager_node": True,
+            "require_successful_jellyfin_refresh": False,
+        },
+    }
+    return merge_config(defaults, config.get("production") or {})
+
+
+def configured_media_types_for_production(config: dict[str, Any]) -> set[str]:
+    enqueue = production_settings(config).get("enqueue") or {}
+    configured = enqueue.get("media_types") or list((config.get("libraries") or {}).keys())
+    return {str(media_type) for media_type in configured}
+
+
+def source_paths_in_job_states(config: dict[str, Any], states: tuple[str, ...] = JOB_STATES) -> set[str]:
+    source_paths: set[str] = set()
+    for state in states:
+        for path in list_state_files(config, state):
+            try:
+                job = read_json(path)
+            except (OSError, json.JSONDecodeError):
+                continue
+            source_path = job.get("source_path")
+            if source_path:
+                source_paths.add(normalized_source_path(Path(str(source_path))))
+    return source_paths
+
+
+def production_status_path(config: dict[str, Any], node_id: str) -> Path:
+    return shared_state_dir(config) / "production" / f"{sanitize_filename(sanitize_node_id(node_id))}.json"
+
+
+def read_production_status(config: dict[str, Any], node_id: str | None = None) -> dict[str, Any]:
+    node = configured_manager_node_id(config, node_id)
+    path = production_status_path(config, node)
+    if not path.exists():
+        return {}
+    return read_json(path)
+
+
+def write_production_status(config: dict[str, Any], node_id: str, payload: dict[str, Any]) -> Path:
+    path = production_status_path(config, node_id)
+    write_json_atomic(path, payload)
+    return path
+
+
+def production_safety_blockers(config: dict[str, Any], execute: bool) -> list[str]:
+    settings = production_settings(config)
+    safety = settings.get("safety") or {}
+    roles = ((config.get("node") or {}).get("roles") or {})
+    manager = config.get("manager") or {}
+    worker = config.get("worker") or {}
+    jellyfin = config.get("jellyfin") or {}
+    blockers: list[str] = []
+    if not bool(roles.get("manager", False)):
+        blockers.append("manager role disabled")
+    if not bool(manager.get("enabled", False)):
+        blockers.append("manager disabled")
+    if bool(safety.get("require_manager_execute", True)) and not bool(execute or manager.get("execute", False)):
+        blockers.append("manager execute disabled")
+    if bool(safety.get("require_jellyfin_enabled", True)) and not bool(jellyfin.get("enabled", False)):
+        blockers.append("jellyfin disabled")
+    if bool(safety.get("require_worker_disabled_on_manager_node", True)) and bool(worker.get("enabled", False)):
+        blockers.append("worker enabled on manager node")
+    return blockers
+
+
+def production_backpressure(config: dict[str, Any], status: dict[str, Any], execute: bool) -> dict[str, Any]:
+    settings = production_settings(config)
+    enqueue = settings.get("enqueue") or {}
+    limits = settings.get("backpressure") or {}
+    states = status.get("states") or {}
+    global_control = status.get("global_control") or {}
+    queue_count = int(states.get("queue", 0))
+    running_count = int(states.get("running", 0))
+    ready_count = int(states.get("ready_for_finalize", 0))
+    finalizing_count = int(states.get("finalizing", 0))
+    inflight_count = queue_count + running_count + ready_count + finalizing_count
+    ready_outputs_gb = float(status.get("ready_outputs_total_size_gb") or 0)
+    reasons: list[str] = []
+    if not bool(enqueue.get("enabled", True)):
+        reasons.append("enqueue disabled")
+    if queue_count >= int(enqueue.get("queue_max", 10)):
+        reasons.append("queue is full")
+    if ready_count >= int(limits.get("max_ready_for_finalize_jobs", 5)):
+        reasons.append("too many ready_for_finalize jobs")
+    if ready_outputs_gb >= float(limits.get("max_ready_outputs_gb", 20)):
+        reasons.append("ready_outputs size limit exceeded")
+    if running_count >= int(limits.get("max_running_jobs", 3)):
+        reasons.append("too many running jobs")
+    if inflight_count >= int(limits.get("max_total_inflight_jobs", 10)):
+        reasons.append("too many inflight jobs")
+    min_shared_state_free_gb = float(limits.get("min_shared_state_free_gb", 0) or 0)
+    if min_shared_state_free_gb > 0:
+        try:
+            shared_free_gb = shutil.disk_usage(shared_state_dir(config)).free / 1024 / 1024 / 1024
+            if shared_free_gb < min_shared_state_free_gb:
+                reasons.append("shared state free space below limit")
+        except OSError:
+            reasons.append("shared state free space unavailable")
+    min_output_root_free_gb = float(limits.get("min_output_root_free_gb", 0) or 0)
+    if min_output_root_free_gb > 0:
+        try:
+            output_root = Path(str(config.get("output_root")))
+            output_root.mkdir(parents=True, exist_ok=True)
+            output_free_gb = shutil.disk_usage(output_root).free / 1024 / 1024 / 1024
+            if output_free_gb < min_output_root_free_gb:
+                reasons.append("output root free space below limit")
+        except OSError:
+            reasons.append("output root free space unavailable")
+    queue_state = str(global_control.get("queue_state") or "running")
+    if queue_state == "paused":
+        reasons.append("global queue paused")
+    if queue_state == "maintenance":
+        reasons.append("global queue maintenance")
+    if not bool(global_control.get("allow_new_claims", True)):
+        reasons.append("new claims disabled")
+    reasons.extend(production_safety_blockers(config, execute))
+    return {
+        "allowed": not reasons,
+        "blocked_reasons": [f"enqueue blocked: {reason}" for reason in reasons],
+        "counts": {
+            "queue": queue_count,
+            "running": running_count,
+            "ready_for_finalize": ready_count,
+            "finalizing": finalizing_count,
+            "inflight": inflight_count,
+        },
+        "limits": {
+            "queue_max": int(enqueue.get("queue_max", 10)),
+            "max_ready_for_finalize_jobs": int(limits.get("max_ready_for_finalize_jobs", 5)),
+            "max_ready_outputs_gb": float(limits.get("max_ready_outputs_gb", 20)),
+            "max_running_jobs": int(limits.get("max_running_jobs", 3)),
+            "max_total_inflight_jobs": int(limits.get("max_total_inflight_jobs", 10)),
+            "min_shared_state_free_gb": min_shared_state_free_gb,
+            "min_output_root_free_gb": min_output_root_free_gb,
+        },
+    }
+
+
+def production_enqueue_once(config: dict[str, Any], max_count: int, priority: str) -> dict[str, Any]:
+    media_types = configured_media_types_for_production(config)
+    settings = production_settings(config)
+    enqueue = settings.get("enqueue") or {}
+    excluded = source_paths_in_job_states(config)
+    media_type_filter = next(iter(media_types)) if len(media_types) == 1 else None
+    filesystem_limit = enqueue.get("filesystem_limit")
+    checked, selected, stats = plan_top_candidates(
+        config,
+        max_count,
+        media_type_filter=media_type_filter,
+        bucket_filter=None,
+        filesystem_limit=int(filesystem_limit) if filesystem_limit is not None else None,
+        min_duration=float(enqueue.get("min_duration_seconds")) if enqueue.get("min_duration_seconds") is not None else None,
+        max_duration=float(enqueue.get("max_duration_seconds")) if enqueue.get("max_duration_seconds") is not None else None,
+        exclude_source_paths=excluded,
+        dedupe_sampling_groups=False,
+        media_type_filters=media_types,
+    )
+    created = 0
+    skipped_existing = 0
+    enqueued: list[dict[str, Any]] = []
+    for item in selected[:max_count]:
+        job = build_job_payload(item, priority=priority, created_by="production")
+        was_created, path = enqueue_job(config, job)
+        if was_created:
+            created += 1
+            enqueued.append({"job_id": job.get("job_id"), "source_path": job.get("source_path"), "job_path": str(path)})
+        else:
+            skipped_existing += 1
+    return {
+        "created_count": created,
+        "skipped_existing_count": skipped_existing,
+        "enqueued": enqueued,
+        "checked_count": len(checked),
+        "selected_count": len(selected),
+        "planning_stats": stats,
+    }
+
+
+def production_tick(
+    config: dict[str, Any],
+    node_override: str | None = None,
+    execute: bool = False,
+    enqueue_enabled: bool = True,
+    finalizer_enabled: bool = True,
+) -> dict[str, Any]:
+    node = configured_manager_node_id(config, node_override)
+    settings = production_settings(config)
+    control = read_node_control(config, node)
+    command = control.get("production_command")
+    state = "running"
+    phase = "checking"
+    last_error = None
+    recovery_result: dict[str, Any] = {}
+    finalize_results: list[dict[str, Any]] = []
+    enqueue_result: dict[str, Any] = {"created_count": 0, "skipped_existing_count": 0, "enqueued": []}
+    blocked_reasons: list[str] = []
+
+    try:
+        init_state(config)
+        status_before = queue_status(config)
+        if not bool(settings.get("enabled", False)):
+            state = "paused"
+            phase = "disabled"
+            blocked_reasons = ["production disabled"]
+        elif command in {"paused", "stop_after_current"}:
+            state = "paused"
+            phase = str(command)
+            blocked_reasons = [f"production {command}"]
+        elif command == "maintenance" or str((status_before.get("global_control") or {}).get("queue_state") or "") == "maintenance":
+            state = "paused"
+            phase = "maintenance"
+            blocked_reasons = ["production maintenance"]
+        else:
+            recovery = settings.get("recovery") or {}
+            phase = "recovering"
+            if bool(recovery.get("recover_stale_jobs", True)):
+                recovery_result["stale_jobs"] = recover_stale_running_jobs(config)
+            if bool(recovery.get("recover_stale_locks", True)):
+                recovery_result["stale_locks"] = recover_stale_locks(config)
+            if bool(recovery.get("requeue_interrupted_jobs", True)):
+                recovery_result["interrupted"] = requeue_interrupted_jobs(config, limit=1)
+
+            finalizer = settings.get("finalizer") or {}
+            if finalizer_enabled and bool(finalizer.get("enabled", True)):
+                phase = "finalizing"
+                for _ in range(max(int(finalizer.get("max_finalize_per_tick", 2)), 0)):
+                    result = manager_step(config, node_override=node, force=False, dry_run_result="done", execute=execute)
+                    finalize_results.append(result)
+                    if result.get("status") in {"idle", "skipped"}:
+                        break
+
+            status_after_finalize = queue_status(config)
+            backpressure = production_backpressure(config, status_after_finalize, execute)
+            blocked_reasons = backpressure["blocked_reasons"]
+            if enqueue_enabled and backpressure["allowed"]:
+                enqueue = settings.get("enqueue") or {}
+                queue_target = int(enqueue.get("queue_target", 5))
+                queue_count = int((status_after_finalize.get("states") or {}).get("queue", 0))
+                enqueue_budget = max(queue_target - queue_count, 0)
+                per_tick = int(enqueue.get("enqueue_count_per_tick", 2))
+                enqueue_count = min(max(enqueue_budget, 0), max(per_tick, 0))
+                if enqueue_count > 0:
+                    phase = "enqueueing"
+                    enqueue_result = production_enqueue_once(config, enqueue_count, str(enqueue.get("priority") or "production"))
+                else:
+                    phase = "idle"
+            else:
+                state = "blocked" if blocked_reasons else "idle"
+                phase = "blocked" if blocked_reasons else "idle"
+
+        final_status = queue_status(config)
+        final_backpressure = production_backpressure(config, final_status, execute)
+        if final_backpressure["blocked_reasons"] and state == "running":
+            state = "blocked"
+        payload = {
+            "node_id": node,
+            "production_state": state,
+            "current_phase": phase,
+            "last_tick_at": utc_now(),
+            "last_enqueue_count": int(enqueue_result.get("created_count", 0)),
+            "last_finalize_count": len([item for item in finalize_results if item.get("status") not in {"idle", "skipped"}]),
+            "blocked_reasons": blocked_reasons or final_backpressure["blocked_reasons"],
+            "state_counts": final_status.get("states") or {},
+            "ready_outputs_total_size_gb": final_status.get("ready_outputs_total_size_gb", 0),
+            "ready_outputs_dir_count": final_status.get("ready_outputs_dir_count", 0),
+            "limits": final_backpressure.get("limits") or {},
+            "last_error": last_error,
+            "recovery": recovery_result,
+            "finalize_results": finalize_results,
+            "enqueue_result": enqueue_result,
+            "control": control,
+        }
+    except Exception as exc:
+        payload = {
+            "node_id": node,
+            "production_state": "error",
+            "current_phase": phase,
+            "last_tick_at": utc_now(),
+            "last_enqueue_count": 0,
+            "last_finalize_count": len([item for item in finalize_results if item.get("status") not in {"idle", "skipped"}]),
+            "blocked_reasons": blocked_reasons,
+            "state_counts": (queue_status(config).get("states") if config else {}) or {},
+            "ready_outputs_total_size_gb": 0,
+            "ready_outputs_dir_count": 0,
+            "limits": {},
+            "last_error": str(exc),
+            "recovery": recovery_result,
+            "finalize_results": finalize_results,
+            "enqueue_result": enqueue_result,
+            "control": control,
+        }
+    write_production_status(config, node, payload)
+    return payload
+
+
+def production_loop(
+    config: dict[str, Any],
+    node_override: str | None = None,
+    execute: bool = False,
+    max_iterations: int | None = None,
+    tick_seconds: float | None = None,
+    sleeper: Callable[[float], None] | None = None,
+) -> dict[str, Any]:
+    settings = production_settings(config)
+    effective_tick_seconds = float(tick_seconds if tick_seconds is not None else settings.get("tick_seconds", 30))
+    if effective_tick_seconds < 0:
+        raise ValueError("tick_seconds must be non-negative")
+    if max_iterations is not None and int(max_iterations) <= 0:
+        raise ValueError("max_iterations must be greater than 0")
+    sleep_fn = sleeper or time.sleep
+    config_path = Path(str(config.get("__config_path"))) if config.get("__config_path") else None
+    profile = config.get("__selected_profile")
+    results: list[dict[str, Any]] = []
+    iterations = 0
+    while True:
+        tick_config = load_config(config_path, profile) if config_path else config
+        result = production_tick(tick_config, node_override=node_override, execute=execute)
+        results.append(result)
+        iterations += 1
+        if max_iterations is not None and iterations >= int(max_iterations):
+            break
+        sleep_fn(effective_tick_seconds)
+    return {
+        "status": "loop_complete",
+        "iterations": iterations,
+        "tick_seconds": effective_tick_seconds,
+        "max_iterations": max_iterations,
+        "last_result": results[-1] if results else None,
+        "results": results,
+    }
+
+
+def run_production_loop_command(config: dict[str, Any], node_override: str | None, execute: bool, max_iterations: int | None, tick_seconds: float | None) -> int:
+    print(json.dumps(production_loop(config, node_override=node_override, execute=execute, max_iterations=max_iterations, tick_seconds=tick_seconds), indent=2, ensure_ascii=False))
     return 0
 
 
@@ -1750,6 +2135,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparser.add_argument("--node-id", required=True, help="Target node id for per-node loop commands")
     subparser.add_argument("--worker-command", choices=["stop_after_current", "none"], default=None, help="Set or clear the worker command for this node")
     subparser.add_argument("--manager-command", choices=["stop_after_current", "none"], default=None, help="Set or clear the manager command for this node")
+    subparser.add_argument("--production-command", choices=["running", "paused", "stop_after_current", "maintenance", "none"], default=None, help="Set or clear the production command for this node")
     subparser.add_argument("--updated-by", default=None, help="Node/user label written into node control")
     subparser = subparsers.add_parser("enqueue-top")
     subparser.add_argument("--config", required=True, type=Path)
@@ -1835,6 +2221,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparser.add_argument("--max-iterations", type=int, default=None, help="Optional hard cap on manager loop iterations")
     subparser.add_argument("--idle-sleep-seconds", type=float, default=None, help="Sleep interval used after idle or gated iterations")
     subparser.add_argument("--stop-on-idle", action="store_true", help="Stop the loop after the first no_ready_job_available result")
+    subparser = subparsers.add_parser("production-loop")
+    subparser.add_argument("--config", required=True, type=Path)
+    subparser.add_argument("--profile", default=None, help="Optional config profile from the YAML file")
+    subparser.add_argument("--node-id", default=None, help="Override configured manager node id")
+    subparser.add_argument("--execute", action="store_true", help="Allow production finalizer to execute file replacement")
+    subparser.add_argument("--max-iterations", type=int, default=None, help="Optional hard cap for tests")
+    subparser.add_argument("--tick-seconds", type=float, default=None, help="Override production tick interval")
     return parser
 
 
@@ -1888,7 +2281,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "queue-control":
             return run_queue_control_command(config, args.state, args.updated_by)
         if args.command == "node-control":
-            return run_node_control_command(config, args.node_id, args.worker_command, args.manager_command, args.updated_by)
+            return run_node_control_command(config, args.node_id, args.worker_command, args.manager_command, args.production_command, args.updated_by)
         if args.command == "enqueue-top":
             count = args.count or int(batch_settings(config).get("default_count", 20))
             return run_enqueue_top_command(config, count, args.media_type, args.bucket, args.filesystem_limit, args.min_duration, args.max_duration, args.priority)
@@ -1914,6 +2307,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_manager_step_command(config, args.node_id, args.force, args.dry_run_result, args.execute)
         if args.command == "manager-loop":
             return run_manager_loop_command(config, args.node_id, args.force, args.dry_run_result, args.execute, args.max_iterations, args.idle_sleep_seconds, args.stop_on_idle)
+        if args.command == "production-loop":
+            return run_production_loop_command(config, args.node_id, args.execute, args.max_iterations, args.tick_seconds)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

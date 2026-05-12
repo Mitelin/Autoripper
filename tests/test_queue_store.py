@@ -83,7 +83,25 @@ class QueueStoreTests(unittest.TestCase):
             self.assertEqual(status["node_control_count"], 1)
             self.assertEqual(status["node_controls"][0]["node_id"], "worker-a")
             self.assertEqual(status["node_controls"][0]["worker_command"], "stop_after_current")
+            self.assertIn("production_command", status["node_controls"][0])
             self.assertEqual(status["node_controls"][0]["updated_by"], "test")
+
+    def test_queue_status_includes_ready_output_size_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_config(temp_dir)
+            root = queue_store.init_state(config)
+            ready_dir = root / "ready_outputs" / "job_size"
+            nested_dir = ready_dir / "nested"
+            nested_dir.mkdir(parents=True, exist_ok=True)
+            (ready_dir / "output.mkv").write_bytes(b"x" * 1024)
+            (nested_dir / "manifest.json").write_bytes(b"y" * 512)
+
+            status = queue_store.queue_status(config)
+
+            self.assertEqual(status["ready_outputs_dir_count"], 1)
+            self.assertEqual(status["ready_outputs_file_count"], 2)
+            self.assertEqual(status["ready_outputs_total_size_bytes"], 1536)
+            self.assertIn("ready_outputs_total_size_gb", status)
 
     def test_queue_status_includes_worker_and_manager_heartbeat_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

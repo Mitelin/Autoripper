@@ -449,6 +449,8 @@ class WebUiTests(unittest.TestCase):
             self.assertTrue(Path(payload["finalization_log"]).exists())
             self.assertEqual(status["states"]["done"], 1)
             self.assertIn("Finalize Pending Now", html)
+            self.assertIn("Production Mode", html)
+            self.assertIn("Run Tick Now", html)
 
     def test_web_ui_server_can_trigger_jellyfin_full_scan(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -905,6 +907,32 @@ class WebUiTests(unittest.TestCase):
                 host, port = server.server_address[:2]
                 request = Request(
                     f"http://{host}:{port}/api/manager/stop-after-current",
+                    data=json.dumps({"updated_by": "web-ui-test"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as context:
+                    urlopen(request)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+            self.assertIn("409", str(context.exception))
+            context.exception.close()
+
+    def test_web_ui_worker_start_returns_conflict_on_manager_node_when_worker_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_manager_config(temp_dir)
+            config["worker"] = {"enabled": False, "run_continuously": False}
+            queue_store.init_state(config)
+            server = web_ui.create_web_ui_server(config, host="127.0.0.1", port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address[:2]
+                request = Request(
+                    f"http://{host}:{port}/api/worker/start",
                     data=json.dumps({"updated_by": "web-ui-test"}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",

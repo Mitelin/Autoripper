@@ -141,6 +141,7 @@ def build_status_payload(config: dict[str, Any]) -> dict[str, Any]:
     manager = config.get("manager") or {}
     status = queue_status(config)
     status["locks"] = lock_status(config)
+    production = config.get("production") or {}
     return {
         "generated_at": utc_now(),
         "node_id": sanitize_node_id((config.get("node") or {}).get("id")),
@@ -160,9 +161,36 @@ def build_status_payload(config: dict[str, Any]) -> dict[str, Any]:
                 "configured_enabled": bool(manager.get("enabled", False)),
                 "run_continuously": bool(manager.get("run_continuously", False)),
             },
+            "production": {
+                "role_enabled": bool(roles.get("manager", False)),
+                "configured_enabled": bool(production.get("enabled", False)),
+                "run_continuously": bool(production.get("enabled", False)),
+            },
         },
         "active_profile": config.get("active_profile"),
         "status": status,
+        "production": build_production_payload(config),
+    }
+
+
+def build_production_payload(config: dict[str, Any]) -> dict[str, Any]:
+    root = init_state(config)
+    node = local_node_id(config)
+    status_path = root / "production" / f"{node}.json"
+    status = read_json(status_path) if status_path.exists() else {}
+    production = config.get("production") or {}
+    backpressure = production.get("backpressure") or {}
+    queue = queue_status(config)
+    return {
+        "generated_at": utc_now(),
+        "node_id": node,
+        "production_enabled": bool(production.get("enabled", False)),
+        "control": read_node_control(config, node),
+        "status": status,
+        "ready_outputs_total_size_gb": queue.get("ready_outputs_total_size_gb", 0),
+        "ready_outputs_dir_count": queue.get("ready_outputs_dir_count", 0),
+        "ready_outputs_limit_gb": float(backpressure.get("max_ready_outputs_gb", 20)),
+        "ready_outputs_backpressure_active": float(queue.get("ready_outputs_total_size_gb") or 0) >= float(backpressure.get("max_ready_outputs_gb", 20)),
     }
 
 
@@ -418,6 +446,25 @@ def persist_manager_enabled(config: dict[str, Any], enabled: bool) -> Path:
     return path
 
 
+def persist_production_enabled(config: dict[str, Any], enabled: bool) -> Path:
+    path = config_source_path(config)
+    with path.open("r", encoding="utf-8") as handle:
+        raw_config = yaml.safe_load(handle) or {}
+    selected_profile = config.get("__selected_profile")
+    if selected_profile:
+        profiles = raw_config.setdefault("profiles", {})
+        profile_config = profiles.setdefault(str(selected_profile), {})
+        production = profile_config.setdefault("production", {})
+    else:
+        production = raw_config.setdefault("production", {})
+    production["enabled"] = bool(enabled)
+    with path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(raw_config, handle, sort_keys=False, allow_unicode=False)
+    runtime_production = config.setdefault("production", {})
+    runtime_production["enabled"] = bool(enabled)
+    return path
+
+
 def persist_manager_settings(config: dict[str, Any], manager_settings: dict[str, Any], jellyfin_settings: dict[str, Any]) -> Path:
     path = config_source_path(config)
     with path.open("r", encoding="utf-8") as handle:
@@ -445,12 +492,34 @@ def persist_manager_settings(config: dict[str, Any], manager_settings: dict[str,
 def build_dashboard_html(config: dict[str, Any]) -> str:
     title = f"Autoripper Node {sanitize_node_id((config.get('node') or {}).get('id'))}"
     roles = ((config.get("node") or {}).get("roles") or {})
+    worker = config.get("worker") or {}
     manager_controls = ""
+    production_panel = ""
     manager_settings_section = ""
     maintenance_controls = '<button class="btn-secondary" onclick="postAction(\'/api/maintenance/recover-stale-jobs\')">Recover Stale Jobs</button><button class="btn-secondary" onclick="confirmAction(\'This will release stale shared lock slots whose heartbeat has expired. Continue?\', \'/api/maintenance/recover-stale-locks\')">Recover Stale Locks</button><button class="btn-warning" onclick="confirmAction(\'This will move interrupted jobs back into queue for another claim attempt. Continue?\', \'/api/maintenance/requeue-interrupted-jobs\')">Requeue Interrupted Jobs</button>'
     auth_controls = ""
     if bool(roles.get("manager", False)):
         manager_controls = '<button class="btn-secondary" onclick="postAction(\'/api/manager/start\')">Start Manager</button><button class="btn-secondary" onclick="postAction(\'/api/manager/pause\')">Pause Manager</button><button class="btn-primary" onclick="postAction(\'/api/manager/finalize-now\')">Finalize Pending Now</button><button class="btn-secondary" onclick="postAction(\'/api/jellyfin/full-scan\')">Trigger Jellyfin Full Scan</button><button class="btn-primary" onclick="postAction(\'/api/manager/stop-after-current\')">Manager Stop After Current</button>'
+        production_panel = '''
+        <section class="panel span-12" id="production-panel">
+            <div class="panel-header">
+                <div>
+                    <span class="eyebrow">Media server production</span>
+                    <h2>Production Mode</h2>
+                </div>
+            </div>
+            <div class="controls">
+                <button class="btn-primary" onclick="postAction('/api/production/start')">Start Production</button>
+                <button class="btn-secondary" onclick="postAction('/api/production/pause')">Pause Production</button>
+                <button class="btn-warning" onclick="postAction('/api/production/maintenance')">Maintenance Mode</button>
+                <button class="btn-primary" onclick="postAction('/api/production/stop-after-current')">Stop After Current</button>
+                <button class="btn-secondary" onclick="postAction('/api/production/run-tick-now')">Run Tick Now</button>
+                <button class="btn-secondary" onclick="postAction('/api/production/enqueue-now')">Enqueue Now</button>
+                <button class="btn-primary" onclick="postAction('/api/manager/finalize-now')">Finalize Pending Now</button>
+            </div>
+            <div class="cards" id="production-cards" style="margin-top: 14px;"></div>
+            <div class="summary-list" id="production-summary" style="margin-top: 14px;"></div>
+        </section>'''
         manager_settings_section = '''
         <section class="panel span-12">
             <div class="panel-header">
@@ -477,6 +546,12 @@ def build_dashboard_html(config: dict[str, Any]) -> str:
         </section>'''
     if web_ui_auth_enabled(config):
         auth_controls = '<form method="post" action="/logout" class="logout-form"><button class="btn-secondary" type="submit">Logout</button></form>'
+    worker_controls = '<button class="btn-secondary" onclick="postAction(\'/api/worker/start\')">Start Worker</button><button class="btn-secondary" onclick="postAction(\'/api/worker/pause\')">Pause Worker</button><button class="btn-primary" onclick="postAction(\'/api/worker/stop-after-current\')">Stop After Current</button>'
+    danger_controls = '<button class="btn-danger" onclick="confirmAction(\'This will terminate the current local ffmpeg process, delete partial local output, and move the job to interrupted. The original media file will not be touched. Continue?\', \'/api/worker/hard-stop\')">Worker Hard Stop</button>'
+    worker_controls_blocked = not bool(roles.get("worker", False)) or (bool(roles.get("manager", False)) and not bool(worker.get("enabled", False)))
+    if worker_controls_blocked:
+        worker_controls = '<span class="muted">Worker controls disabled by this node role/config.</span>'
+        danger_controls = '<span class="muted">Worker hard stop disabled by this node role/config.</span>'
     return f"""<!doctype html>
 <html lang=\"en\">
 <head>
@@ -583,9 +658,7 @@ def build_dashboard_html(config: dict[str, Any]) -> str:
                     <h3>Worker</h3>
                     <p>Start, pause, or let the local worker finish its current encode cleanly.</p>
                     <div class="controls">
-                        <button class="btn-secondary" onclick="postAction('/api/worker/start')">Start Worker</button>
-                        <button class="btn-secondary" onclick="postAction('/api/worker/pause')">Pause Worker</button>
-                        <button class="btn-primary" onclick="postAction('/api/worker/stop-after-current')">Stop After Current</button>
+                        {worker_controls}
                     </div>
                 </div>
                 <div class="command-group">
@@ -606,7 +679,7 @@ def build_dashboard_html(config: dict[str, Any]) -> str:
                     <h3>Danger Zone</h3>
                     <p>Hard stop terminates local ffmpeg and moves the current job to interrupted.</p>
                     <div class="controls">
-                        <button class="btn-danger" onclick="confirmAction('This will terminate the current local ffmpeg process, delete partial local output, and move the job to interrupted. The original media file will not be touched. Continue?', '/api/worker/hard-stop')">Worker Hard Stop</button>
+                        {danger_controls}
                     </div>
                 </div>
             </div>
@@ -625,6 +698,7 @@ def build_dashboard_html(config: dict[str, Any]) -> str:
             <p>Visible only on manager-role nodes. These actions handle finalization and Jellyfin refresh from the media server side.</p>
             <div class="controls">{manager_controls}</div>
         </section>
+        {production_panel}
         <section class=\"panel span-12\">
             <h2>Node Overview</h2>
             <div class=\"cards\" id=\"overview-cards\">
@@ -972,6 +1046,8 @@ def build_dashboard_html(config: dict[str, Any]) -> str:
             const managerSummary = status.manager_summary || {{}};
             const locks = status.locks || {{}};
             const states = status.states || {{}};
+            const production = payload.production || {{}};
+            const productionStatus = production.status || {{}};
             const queueState = globalControl.queue_state || 'unknown';
             const queueTone = queueState === 'running' ? 'ok' : (queueState === 'maintenance' ? 'danger' : 'warn');
             const localWorkerHeartbeat = localHeartbeat(payload, 'worker');
@@ -1018,6 +1094,25 @@ def build_dashboard_html(config: dict[str, Any]) -> str:
             ].join('');
             document.getElementById('manager-summary').innerHTML = summaryRows(Object.entries(managerSummary.state_counts || {{}}));
             renderLockStatus(locks);
+            if (document.getElementById('production-cards')) {{
+                const blockedReasons = productionStatus.blocked_reasons || [];
+                const productionState = productionStatus.production_state || (production.production_enabled ? 'waiting' : 'disabled');
+                const productionTone = productionState === 'running' || productionState === 'idle' ? 'ok' : (productionState === 'blocked' ? 'warn' : 'danger');
+                document.getElementById('production-cards').innerHTML = [
+                    card('Production State', productionState, productionTone),
+                    card('Ready Outputs GB', production.ready_outputs_total_size_gb || 0, production.ready_outputs_backpressure_active ? 'danger' : 'ok'),
+                    card('Ready Limit GB', production.ready_outputs_limit_gb || 0),
+                    card('Last Enqueue', productionStatus.last_enqueue_count || 0),
+                    card('Last Finalize', productionStatus.last_finalize_count || 0),
+                ].join('');
+                document.getElementById('production-summary').innerHTML = summaryRows([
+                    ['Enabled', production.production_enabled ? 'Yes' : 'No'],
+                    ['Phase', productionStatus.current_phase || 'n/a'],
+                    ['Last Tick', productionStatus.last_tick_at || 'n/a'],
+                    ['Ready Output Dirs', production.ready_outputs_dir_count || 0],
+                    ['Blocked Reasons', blockedReasons.length ? blockedReasons.join('; ') : 'none'],
+                ]);
+            }}
         }}
         async function postAction(path) {{
             try {{
@@ -1179,6 +1274,23 @@ def build_dashboard_html(config: dict[str, Any]) -> str:
 
 
 def make_handler(config: dict[str, Any]) -> type[BaseHTTPRequestHandler]:
+    def set_local_control_command(
+        worker_command: str | None = None,
+        manager_command: str | None = None,
+        production_command: str | None = None,
+        updated_by: str | None = None,
+    ) -> None:
+        node = local_node_id(config)
+        current = read_node_control(config, node)
+        set_node_control(
+            config,
+            node,
+            worker_command=current.get("worker_command") if worker_command is None else worker_command,
+            manager_command=current.get("manager_command") if manager_command is None else manager_command,
+            production_command=current.get("production_command") if production_command is None else production_command,
+            updated_by=updated_by,
+        )
+
     class WebUiHandler(BaseHTTPRequestHandler):
         def _is_authenticated(self) -> bool:
             if not web_ui_auth_enabled(config):
@@ -1265,6 +1377,9 @@ def make_handler(config: dict[str, Any]) -> type[BaseHTTPRequestHandler]:
             if path == "/api/locks":
                 self._write_json(build_locks_payload(config))
                 return
+            if path == "/api/production":
+                self._write_json(build_production_payload(config))
+                return
             if path == "/api/settings/manager":
                 roles = ((config.get("node") or {}).get("roles") or {})
                 if not bool(roles.get("manager", False)):
@@ -1300,22 +1415,38 @@ def make_handler(config: dict[str, Any]) -> type[BaseHTTPRequestHandler]:
                 self._write_auth_required(path)
                 return
             if path == "/api/worker/stop-after-current":
+                roles = ((config.get("node") or {}).get("roles") or {})
+                if not bool(roles.get("worker", False)) or (bool(roles.get("manager", False)) and not bool((config.get("worker") or {}).get("enabled", False))):
+                    self._write_json({"error": "worker_controls_disabled", "node_id": local_node_id(config)}, status=HTTPStatus.CONFLICT)
+                    return
                 payload = self._read_json_body()
                 updated_by = sanitize_node_id(str(payload.get("updated_by") or local_node_id(config)))
-                set_node_control(config, local_node_id(config), worker_command="stop_after_current", updated_by=updated_by)
+                set_local_control_command(worker_command="stop_after_current", updated_by=updated_by)
                 self._write_json(build_local_worker_control_payload(config), status=HTTPStatus.OK)
                 return
             if path == "/api/worker/hard-stop":
+                roles = ((config.get("node") or {}).get("roles") or {})
+                if not bool(roles.get("worker", False)) or (bool(roles.get("manager", False)) and not bool((config.get("worker") or {}).get("enabled", False))):
+                    self._write_json({"error": "worker_controls_disabled", "node_id": local_node_id(config)}, status=HTTPStatus.CONFLICT)
+                    return
                 payload = self._read_json_body()
                 updated_by = sanitize_node_id(str(payload.get("updated_by") or local_node_id(config)))
-                set_node_control(config, local_node_id(config), worker_command="hard_stop", updated_by=updated_by)
+                set_local_control_command(worker_command="hard_stop", updated_by=updated_by)
                 self._write_json(build_local_worker_control_payload(config), status=HTTPStatus.OK)
                 return
             if path == "/api/worker/start":
+                roles = ((config.get("node") or {}).get("roles") or {})
+                if not bool(roles.get("worker", False)) or (bool(roles.get("manager", False)) and not bool((config.get("worker") or {}).get("enabled", False))):
+                    self._write_json({"error": "worker_controls_disabled", "node_id": local_node_id(config)}, status=HTTPStatus.CONFLICT)
+                    return
                 persist_worker_enabled(config, True)
                 self._write_json(build_local_worker_control_payload(config), status=HTTPStatus.OK)
                 return
             if path == "/api/worker/pause":
+                roles = ((config.get("node") or {}).get("roles") or {})
+                if not bool(roles.get("worker", False)):
+                    self._write_json({"error": "worker_role_disabled", "node_id": local_node_id(config)}, status=HTTPStatus.CONFLICT)
+                    return
                 persist_worker_enabled(config, False)
                 self._write_json(build_local_worker_control_payload(config), status=HTTPStatus.OK)
                 return
@@ -1342,7 +1473,7 @@ def make_handler(config: dict[str, Any]) -> type[BaseHTTPRequestHandler]:
                     return
                 payload = self._read_json_body()
                 updated_by = sanitize_node_id(str(payload.get("updated_by") or local_node_id(config)))
-                set_node_control(config, local_node_id(config), manager_command="stop_after_current", updated_by=updated_by)
+                set_local_control_command(manager_command="stop_after_current", updated_by=updated_by)
                 self._write_json(build_local_manager_control_payload(config), status=HTTPStatus.OK)
                 return
             if path == "/api/manager/finalize-now":
@@ -1351,6 +1482,59 @@ def make_handler(config: dict[str, Any]) -> type[BaseHTTPRequestHandler]:
                     self._write_json({"error": "manager_role_disabled", "node_id": local_node_id(config)}, status=HTTPStatus.CONFLICT)
                     return
                 self._write_json(manager_step(config), status=HTTPStatus.OK)
+                return
+            if path == "/api/production/start":
+                roles = ((config.get("node") or {}).get("roles") or {})
+                if not bool(roles.get("manager", False)):
+                    self._write_json({"error": "manager_role_disabled", "node_id": local_node_id(config)}, status=HTTPStatus.CONFLICT)
+                    return
+                payload = self._read_json_body()
+                updated_by = sanitize_node_id(str(payload.get("updated_by") or local_node_id(config)))
+                persist_production_enabled(config, True)
+                set_local_control_command(production_command="running", updated_by=updated_by)
+                self._write_json(build_production_payload(config), status=HTTPStatus.OK)
+                return
+            if path == "/api/production/pause":
+                roles = ((config.get("node") or {}).get("roles") or {})
+                if not bool(roles.get("manager", False)):
+                    self._write_json({"error": "manager_role_disabled", "node_id": local_node_id(config)}, status=HTTPStatus.CONFLICT)
+                    return
+                payload = self._read_json_body()
+                updated_by = sanitize_node_id(str(payload.get("updated_by") or local_node_id(config)))
+                set_local_control_command(production_command="paused", updated_by=updated_by)
+                self._write_json(build_production_payload(config), status=HTTPStatus.OK)
+                return
+            if path == "/api/production/maintenance":
+                roles = ((config.get("node") or {}).get("roles") or {})
+                if not bool(roles.get("manager", False)):
+                    self._write_json({"error": "manager_role_disabled", "node_id": local_node_id(config)}, status=HTTPStatus.CONFLICT)
+                    return
+                payload = self._read_json_body()
+                updated_by = sanitize_node_id(str(payload.get("updated_by") or local_node_id(config)))
+                set_global_control(config, "maintenance", allow_new_claims=False, allow_finalizer=False, updated_by=updated_by)
+                set_local_control_command(production_command="maintenance", updated_by=updated_by)
+                self._write_json(build_production_payload(config), status=HTTPStatus.OK)
+                return
+            if path == "/api/production/stop-after-current":
+                roles = ((config.get("node") or {}).get("roles") or {})
+                if not bool(roles.get("manager", False)):
+                    self._write_json({"error": "manager_role_disabled", "node_id": local_node_id(config)}, status=HTTPStatus.CONFLICT)
+                    return
+                payload = self._read_json_body()
+                updated_by = sanitize_node_id(str(payload.get("updated_by") or local_node_id(config)))
+                set_local_control_command(production_command="stop_after_current", updated_by=updated_by)
+                self._write_json(build_production_payload(config), status=HTTPStatus.OK)
+                return
+            if path == "/api/production/run-tick-now" or path == "/api/production/enqueue-now":
+                roles = ((config.get("node") or {}).get("roles") or {})
+                if not bool(roles.get("manager", False)):
+                    self._write_json({"error": "manager_role_disabled", "node_id": local_node_id(config)}, status=HTTPStatus.CONFLICT)
+                    return
+                from media_normalizer import production_tick
+
+                execute = bool((config.get("manager") or {}).get("execute", False))
+                result = production_tick(config, execute=execute, finalizer_enabled=path != "/api/production/enqueue-now")
+                self._write_json(result, status=HTTPStatus.OK)
                 return
             if path == "/api/jellyfin/full-scan":
                 roles = ((config.get("node") or {}).get("roles") or {})

@@ -155,14 +155,25 @@ def run_manager_verification(config: dict[str, Any], job: dict[str, Any]) -> dic
     if bool(job.get("dry_run") or manifest.get("dry_run")):
         ffprobe_payload = read_json(Path(str(ffprobe_path))) if ffprobe_path and Path(str(ffprobe_path)).exists() else {}
         output_summary = ffprobe_payload.get("output_summary") or {}
+        track_policy_result = ffprobe_payload.get("track_policy") or manifest.get("track_policy") or {}
+        if track_policy_result.get("applied"):
+            expected_audio_count = track_policy_result.get("expected_audio_stream_count")
+            expected_subtitle_count = track_policy_result.get("expected_subtitle_stream_count")
+        else:
+            expected_audio_count = source_item.get("audio_stream_count")
+            expected_subtitle_count = source_item.get("subtitle_stream_count")
         errors: list[str] = []
+        output_audio_count = output_summary.get("audio_stream_count")
+        output_subtitle_count = output_summary.get("subtitle_stream_count")
+        audio_streams_ok = (output_audio_count == expected_audio_count and (output_audio_count or 0) >= 1) if expected_audio_count is not None else output_audio_count is None or output_audio_count >= 1
+        subtitle_streams_ok = output_subtitle_count == expected_subtitle_count if expected_subtitle_count is not None else True
         verification = {
             "ffprobe_payload_ok": bool(ffprobe_payload),
             "job_id_matches": ffprobe_payload.get("job_id") == job.get("job_id"),
             "source_path_matches": ffprobe_payload.get("source_path") == job.get("source_path"),
             "video_stream_exists": bool(output_summary.get("video_codec")),
-            "audio_streams_ok": output_summary.get("audio_stream_count") == source_item.get("audio_stream_count"),
-            "subtitle_streams_ok": output_summary.get("subtitle_stream_count") == source_item.get("subtitle_stream_count"),
+            "audio_streams_ok": audio_streams_ok,
+            "subtitle_streams_ok": subtitle_streams_ok,
             "duration_ok": source_item.get("duration_seconds") is None or output_summary.get("duration_seconds") == source_item.get("duration_seconds"),
             "output_non_empty": (output_summary.get("file_size_bytes") or 0) > 0,
         }
@@ -180,7 +191,7 @@ def run_manager_verification(config: dict[str, Any], job: dict[str, Any]) -> dic
 
     from media_normalizer import verify_output
 
-    verification, output_summary, errors = verify_output(config, source_item, Path(str(job["ready_output_path"])))
+    verification, output_summary, errors = verify_output(config, source_item, Path(str(job["ready_output_path"])), manifest.get("track_policy"))
     return {
         "ok": not errors,
         "mode": "ffprobe_output",

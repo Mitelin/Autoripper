@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import manager_node
+import media_normalizer as mn
 import queue_store
 import shared_locks
 import worker_node
@@ -380,7 +381,8 @@ class WorkerNodeTests(unittest.TestCase):
             local_cache = {"local_source_path": str(source), "work_dir": str(work_dir)}
             job = {"job_id": "job_worker_execute", "media_type": "anime", "source_path": str(source), "source_size_bytes": source.stat().st_size}
 
-            with patch("media_normalizer.build_ffmpeg_command", return_value=["ffmpeg", "-i", str(source), str(output_path)]), patch("track_policy.apply_track_policy", return_value={}), patch("subprocess.Popen", return_value=fake_process), patch("worker_node.shutil.which", return_value="ffmpeg"):
+            probe = mn.ProbeResult(ok=True, data={"streams": [{"codec_type": "video", "codec_name": "h264"}, {"codec_type": "audio", "codec_name": "aac"}], "format": {"duration": "120", "size": str(source.stat().st_size)}})
+            with patch("media_normalizer.build_ffmpeg_command", return_value=["ffmpeg", "-i", str(source), str(output_path)]), patch("media_normalizer.run_ffprobe", return_value=probe), patch("track_policy.apply_track_policy", return_value={}), patch("subprocess.Popen", return_value=fake_process), patch("worker_node.shutil.which", return_value="ffmpeg"):
                 result = worker_node.run_local_ffmpeg_encode(config, job, local_cache)
 
             self.assertFalse(result["ok"])
@@ -433,7 +435,8 @@ class WorkerNodeTests(unittest.TestCase):
             local_cache = {"local_source_path": str(source), "work_dir": str(work_dir)}
             job = {"job_id": "job_worker_execute", "media_type": "anime", "source_path": str(source), "source_size_bytes": source.stat().st_size}
 
-            with patch("media_normalizer.build_ffmpeg_command", return_value=["ffmpeg", "-i", str(source), str(output_path)]), patch("track_policy.apply_track_policy", return_value={}), patch("subprocess.Popen", return_value=fake_process), patch("worker_node.shutil.which", return_value="ffmpeg"), patch.object(worker_node, "worker_schedule_check", return_value={"enabled": True, "start": "02:00", "end": "07:00", "outside_window_behavior": "hard_stop", "checked_at": "2026-05-10T07:00:00+02:00", "allowed_to_claim": False}):
+            probe = mn.ProbeResult(ok=True, data={"streams": [{"codec_type": "video", "codec_name": "h264"}, {"codec_type": "audio", "codec_name": "aac"}], "format": {"duration": "120", "size": str(source.stat().st_size)}})
+            with patch("media_normalizer.build_ffmpeg_command", return_value=["ffmpeg", "-i", str(source), str(output_path)]), patch("media_normalizer.run_ffprobe", return_value=probe), patch("track_policy.apply_track_policy", return_value={}), patch("subprocess.Popen", return_value=fake_process), patch("worker_node.shutil.which", return_value="ffmpeg"), patch.object(worker_node, "worker_schedule_check", return_value={"enabled": True, "start": "02:00", "end": "07:00", "outside_window_behavior": "hard_stop", "checked_at": "2026-05-10T07:00:00+02:00", "allowed_to_claim": False}):
                 result = worker_node.run_local_ffmpeg_encode(config, job, local_cache)
 
             self.assertFalse(result["ok"])
@@ -473,7 +476,8 @@ class WorkerNodeTests(unittest.TestCase):
                 stderr.flush()
                 return FakeProcess()
 
-            with patch("media_normalizer.build_ffmpeg_command", return_value=["ffmpeg", "-i", str(source), str(output_path)]), patch("track_policy.apply_track_policy", return_value={}), patch("media_normalizer.verify_output", return_value=({"output_exists": True}, {"video_codec": "hevc"}, [])), patch("subprocess.Popen", side_effect=fake_popen), patch("worker_node.shutil.which", return_value="ffmpeg"):
+            probe = mn.ProbeResult(ok=True, data={"streams": [{"codec_type": "video", "codec_name": "h264"}, {"codec_type": "audio", "codec_name": "aac"}], "format": {"duration": "120", "size": str(source.stat().st_size)}})
+            with patch("media_normalizer.build_ffmpeg_command", return_value=["ffmpeg", "-i", str(source), str(output_path)]), patch("media_normalizer.run_ffprobe", return_value=probe), patch("track_policy.apply_track_policy", return_value={}), patch("media_normalizer.verify_output", return_value=({"output_exists": True}, {"video_codec": "hevc"}, [])), patch("subprocess.Popen", side_effect=fake_popen), patch("worker_node.shutil.which", return_value="ffmpeg"):
                 result = worker_node.run_local_ffmpeg_encode(config, job, local_cache, node="test-node")
 
             self.assertTrue(result["ok"])

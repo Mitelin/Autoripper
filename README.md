@@ -175,6 +175,7 @@ GET /api/workers  -> worker and manager heartbeat summaries
 GET /api/jobs     -> jobs grouped by queue state
 GET /api/logs     -> latest manager and worker-related JSON logs
 GET /api/locks    -> shared lock status with stale/active counts
+GET /api/production -> production heartbeat, backpressure, and ready output accounting
 GET /api/settings/worker-schedule -> local worker schedule payload and runtime allowance
 ```
 
@@ -190,6 +191,12 @@ POST /api/manager/start             -> persists manager.enabled=true for the loc
 POST /api/manager/pause             -> persists manager.enabled=false for the local node config
 POST /api/manager/finalize-now      -> runs one immediate local manager finalization pass
 POST /api/jellyfin/full-scan        -> triggers a Jellyfin full library refresh from the local manager node
+POST /api/production/start          -> enables production and sets production_command=running
+POST /api/production/pause          -> sets production_command=paused
+POST /api/production/maintenance    -> sets global maintenance and production_command=maintenance
+POST /api/production/stop-after-current -> sets production_command=stop_after_current
+POST /api/production/run-tick-now   -> runs one production tick immediately
+POST /api/production/enqueue-now    -> runs only the enqueue side of one production tick
 ```
 
 These worker endpoints write the existing per-node control file for the local `node.id`. `stop-after-current` exits cleanly before the next iteration. `hard-stop` is now also honored during local execute encoding: the worker terminates the local ffmpeg process, deletes partial local output, and moves the job to `interrupted` without touching the original media source.
@@ -291,6 +298,27 @@ python media_normalizer.py manager-loop --config config.yaml --profile media-ser
 If `manager.require_successful_jellyfin_refresh: true` is enabled, the manager treats any non-`refreshed` Jellyfin result as a post-finalization failure and moves the job JSON into `failed_finalize` after the file replacement has already been applied.
 
 `manager-loop` is the first continuous manager runner. It repeatedly calls `manager-step`, drains available `ready_for_finalize` work without sleeping between successful iterations, and only sleeps after `idle`, `manager_disabled`, `global_finalizer_paused`, or `finalizer_lock_unavailable`. Use `--stop-on-idle` for bounded smoke runs and `--max-iterations` for safe development caps.
+
+`production-loop` is the normal media-server orchestrator. Each tick recovers stale work if enabled, finalizes pending `ready_for_finalize` jobs first, recalculates backpressure, and only then enqueues new largest-first jobs. It blocks enqueue when queue, running, ready output size, ready job count, inflight count, global pause/maintenance, or manager safety checks exceed the configured limits.
+
+```powershell
+python media_normalizer.py production-loop --config config.yaml --profile media-server-manager --execute
+python media_normalizer.py production-loop --config config.yaml --profile media-server-manager --execute --max-iterations 1 --tick-seconds 0
+```
+
+Production writes heartbeat/status JSON under `.ripper_state/production/<node_id>.json`, including blocked reasons, queue counts, ready output size, last enqueue count, and last finalize count. `queue-status` and the web UI also expose recursive `ready_outputs` size accounting.
+
+Intended always-on services can keep running while the GUI controls pause/resume through control files:
+
+```text
+media server:
+	autoripper-web.service        -> python media_normalizer.py web-ui --config /home/mitelin/apps/Autoripper/config.yaml --profile media-server-manager
+	autoripper-production.service -> python media_normalizer.py production-loop --config /home/mitelin/apps/Autoripper/config.yaml --profile media-server-manager --execute
+
+game worker:
+	autoripper-web.service    -> python media_normalizer.py web-ui --config /home/mitelin/apps/Autoripper/config.yaml --profile gaming-worker
+	autoripper-worker.service -> python media_normalizer.py worker-loop --config /home/mitelin/apps/Autoripper/config.yaml --profile gaming-worker --execute --dry-run-result ready
+```
 
 Each manager step writes a per-job finalization log under `.ripper_state/logs/manager/<job_id>.json` so the finalizer decision is still auditable after the job JSON moves between state directories.
 

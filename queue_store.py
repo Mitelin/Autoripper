@@ -35,6 +35,7 @@ SUPPORT_DIRS = (
     "locks/finalizer",
     "control/nodes",
     "config",
+    "production",
 )
 
 
@@ -223,9 +224,38 @@ def aggregate_heartbeat_summaries(summaries: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def ready_outputs_disk_usage(config: dict[str, Any]) -> dict[str, Any]:
+    root = init_state(config)
+    ready_outputs_root = root / "ready_outputs"
+    total_bytes = 0
+    file_count = 0
+    dir_count = 0
+    if ready_outputs_root.exists():
+        for child in ready_outputs_root.iterdir():
+            if not child.is_dir():
+                continue
+            dir_count += 1
+            for dirpath, _, filenames in os.walk(child):
+                for filename in filenames:
+                    path = Path(dirpath) / filename
+                    try:
+                        total_bytes += path.stat().st_size
+                        file_count += 1
+                    except OSError:
+                        continue
+    return {
+        "ready_outputs_path": str(ready_outputs_root),
+        "ready_outputs_total_size_bytes": total_bytes,
+        "ready_outputs_total_size_gb": round(total_bytes / 1024 / 1024 / 1024, 3),
+        "ready_outputs_dir_count": dir_count,
+        "ready_outputs_file_count": file_count,
+    }
+
+
 def queue_status(config: dict[str, Any]) -> dict[str, Any]:
     root = init_state(config)
     states = {state: len(list((root / state).glob("*.json"))) for state in JOB_STATES}
+    ready_outputs = ready_outputs_disk_usage(config)
     workers = len(list((root / "workers").glob("*.json")))
     worker_heartbeats = read_heartbeat_summaries(config, root / "workers", "worker")
     manager_heartbeats = read_heartbeat_summaries(config, root / "manager", "manager")
@@ -235,6 +265,7 @@ def queue_status(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "shared_state_dir": str(root),
         "states": states,
+        **ready_outputs,
         "workers": workers,
         "worker_heartbeats": worker_heartbeats,
         "worker_heartbeat_count": len(worker_heartbeats),
@@ -279,10 +310,13 @@ def read_node_control(config: dict[str, Any], node_id: str) -> dict[str, Any]:
             "node_id": sanitize_node_id(node_id),
             "worker_command": None,
             "manager_command": None,
+            "production_command": None,
             "updated_at": None,
             "updated_by": None,
         }
-    return read_json(path)
+    control = read_json(path)
+    control.setdefault("production_command", None)
+    return control
 
 
 def set_node_control(
@@ -290,14 +324,18 @@ def set_node_control(
     node_id: str,
     worker_command: str | None = None,
     manager_command: str | None = None,
+    production_command: str | None = None,
     updated_by: str | None = None,
 ) -> Path:
     valid_worker_commands = {None, "stop_after_current", "hard_stop"}
     valid_manager_commands = {None, "stop_after_current"}
+    valid_production_commands = {None, "running", "paused", "stop_after_current", "maintenance"}
     if worker_command not in valid_worker_commands:
         raise ValueError("worker_command must be one of: stop_after_current, hard_stop, none")
     if manager_command not in valid_manager_commands:
         raise ValueError("manager_command must be one of: stop_after_current, none")
+    if production_command not in valid_production_commands:
+        raise ValueError("production_command must be one of: running, paused, stop_after_current, maintenance, none")
     path = node_control_path(config, node_id)
     write_json_atomic(
         path,
@@ -305,6 +343,7 @@ def set_node_control(
             "node_id": sanitize_node_id(node_id),
             "worker_command": worker_command,
             "manager_command": manager_command,
+            "production_command": production_command,
             "updated_at": utc_now(),
             "updated_by": updated_by or sanitize_node_id(),
         },
