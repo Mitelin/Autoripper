@@ -166,6 +166,19 @@ verification:
   clip_max_duration_diff_seconds: 6
   min_output_source_ratio: 0.15
   max_output_source_ratio: 0.95
+  bitrate_thresholds:
+    anime:
+      1080p:
+        hard_fail_kbps: 500
+        warning_kbps: 700
+    series:
+      1080p:
+        hard_fail_kbps: 900
+        warning_kbps: 1200
+    movie:
+      1080p:
+        hard_fail_kbps: 1200
+        warning_kbps: 1800
   per_media_type:
     anime:
       min_output_source_ratio: 0.08

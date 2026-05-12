@@ -940,6 +940,51 @@ def verification_limits(config: dict[str, Any], media_type: str | None) -> dict[
     return verification
 
 
+DEFAULT_BITRATE_THRESHOLDS_1080P = {
+    "anime": {"hard_fail_kbps": 500, "warning_kbps": 700},
+    "series": {"hard_fail_kbps": 900, "warning_kbps": 1200},
+    "movie": {"hard_fail_kbps": 1200, "warning_kbps": 1800},
+    "unknown": {"hard_fail_kbps": 900, "warning_kbps": 1200},
+}
+
+
+def resolution_bucket(item: dict[str, Any]) -> str:
+    height = to_int(item.get("video_height"))
+    width = to_int(item.get("video_width"))
+    largest_dimension = max(value for value in (height, width) if value is not None) if height or width else None
+    if height and height >= 1800 or largest_dimension and largest_dimension >= 3000:
+        return "4k"
+    if height and height <= 800:
+        return "720p"
+    return "1080p"
+
+
+def scaled_bitrate_thresholds(media_type: str, bucket: str) -> dict[str, int]:
+    base = DEFAULT_BITRATE_THRESHOLDS_1080P.get(media_type) or DEFAULT_BITRATE_THRESHOLDS_1080P["unknown"]
+    scale = {"720p": 0.6, "1080p": 1.0, "4k": 2.75}.get(bucket, 1.0)
+    return {
+        "hard_fail_kbps": int(round(float(base["hard_fail_kbps"]) * scale)),
+        "warning_kbps": int(round(float(base["warning_kbps"]) * scale)),
+    }
+
+
+def suspicious_size_threshold(config: dict[str, Any], media_type: str | None, source_item: dict[str, Any], output_item: dict[str, Any]) -> dict[str, Any]:
+    effective_media_type = str(media_type or "unknown")
+    bucket = resolution_bucket(output_item if output_item.get("video_height") or output_item.get("video_width") else source_item)
+    threshold = scaled_bitrate_thresholds(effective_media_type, bucket)
+    configured = (((config.get("verification") or {}).get("bitrate_thresholds") or {}).get(effective_media_type) or {}).get(bucket) or {}
+    if configured:
+        threshold.update({key: int(value) for key, value in configured.items() if value is not None})
+    return {"media_type": effective_media_type, "resolution": bucket, **threshold}
+
+
+def estimated_overall_bitrate_kbps(size_bytes: int, duration_seconds: Any) -> int | None:
+    duration = to_float(duration_seconds)
+    if not duration or duration <= 0 or size_bytes <= 0:
+        return None
+    return int(round((size_bytes * 8) / duration / 1000))
+
+
 def verify_output(
     config: dict[str, Any],
     source_item: dict[str, Any],
@@ -958,10 +1003,19 @@ def verify_output(
         "subtitle_streams_ok": False,
         "size_reduction_ok": False,
         "not_suspiciously_tiny": False,
+        "output_to_source_ratio": None,
+        "source_size_bytes": source_item.get("file_size_bytes") or 0,
+        "output_size_bytes": None,
+        "overall_bitrate_kbps": None,
+        "suspicious_size_warning": False,
+        "suspicious_size_warning_reason": None,
+        "suspicious_size_hard_fail": False,
+        "suspicious_size_threshold_used": None,
     }
     if not output.exists():
         return verification, None, ["Output file does not exist"]
     output_size = output.stat().st_size
+    verification["output_size_bytes"] = output_size
     verification["output_non_empty"] = output_size > 0
     if output_size <= 0:
         errors.append("Output file is empty")
@@ -998,14 +1052,42 @@ def verify_output(
 
     source_size = source_item.get("file_size_bytes") or 0
     ratio = output_size / source_size if source_size else 0
+    output_bitrate_kbps = output_item.get("overall_bitrate_kbps") or estimated_overall_bitrate_kbps(output_size, output_item.get("duration_seconds") or source_duration)
+    threshold = suspicious_size_threshold(config, source_item.get("media_type"), source_item, output_item)
+    verification["output_to_source_ratio"] = ratio if source_size else None
+    verification["overall_bitrate_kbps"] = output_bitrate_kbps
+    verification["suspicious_size_threshold_used"] = threshold
     if expected_duration_seconds is None:
         verification["size_reduction_ok"] = ratio < float(limits.get("max_output_source_ratio", 0.95))
-        verification["not_suspiciously_tiny"] = ratio > float(limits.get("min_output_source_ratio", 0.15))
+        ratio_warning = bool(source_size and ratio <= float(limits.get("min_output_source_ratio", 0.15)))
+        bitrate_warning = output_bitrate_kbps is not None and output_bitrate_kbps < int(threshold["warning_kbps"])
+        bitrate_hard_fail = output_bitrate_kbps is not None and output_bitrate_kbps < int(threshold["hard_fail_kbps"])
+        warning_reasons = []
+        if ratio_warning:
+            warning_reasons.append(f"low output/source ratio {ratio:.3f} below legacy warning threshold {float(limits.get('min_output_source_ratio', 0.15)):.3f}")
+        if bitrate_warning:
+            warning_reasons.append(f"{threshold['media_type']} {threshold['resolution']} bitrate {output_bitrate_kbps} kbps below warning threshold {threshold['warning_kbps']} kbps")
+        verification["suspicious_size_warning"] = bool(warning_reasons)
+        verification["suspicious_size_warning_reason"] = "; ".join(warning_reasons) if warning_reasons else None
+        verification["suspicious_size_hard_fail"] = bool(bitrate_hard_fail)
+        verification["not_suspiciously_tiny"] = not bitrate_hard_fail and output_size > 0
     else:
         verification["size_reduction_ok"] = output_size < source_size
         verification["not_suspiciously_tiny"] = output_size > 0
 
-    for key, ok in verification.items():
+    hard_verification_keys = [
+        "output_exists",
+        "output_non_empty",
+        "ffprobe_ok",
+        "duration_ok",
+        "video_stream_exists",
+        "audio_streams_ok",
+        "subtitle_streams_ok",
+        "size_reduction_ok",
+        "not_suspiciously_tiny",
+    ]
+    for key in hard_verification_keys:
+        ok = verification.get(key)
         if not ok:
             errors.append(f"Verification failed: {key}")
     return verification, output_summary, errors
