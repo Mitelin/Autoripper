@@ -338,10 +338,90 @@ class WorkerNodeTests(unittest.TestCase):
             self.assertEqual(result["result_state"], "ready_for_finalize")
             self.assertEqual(result["execution_mode"], "execute")
             self.assertEqual(result["local_processing"]["output_summary"]["video_codec"], "hevc")
+            self.assertTrue(result["local_cleanup"]["removed"])
             self.assertEqual(job["execution_mode"], "execute")
             self.assertFalse(job["dry_run"])
             self.assertTrue(Path(job["ready_output_path"]).exists())
             self.assertEqual(status["states"]["ready_for_finalize"], 1)
+
+    def test_worker_step_execute_verification_failure_cleans_local_work_dir_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_config(temp_dir)
+            source = Path(temp_dir) / "library" / "file.mkv"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text("source-data\n", encoding="utf-8")
+            self.enqueue_real_source_job(config, source)
+
+            def fake_encode(_config: dict, _job: dict, local_cache: dict, node: str | None = None) -> dict:
+                output_path = Path(str(local_cache["work_dir"])) / "output" / "output.mkv"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text("encoded-data\n", encoding="utf-8")
+                return {
+                    "ok": False,
+                    "reason": "verification_failed",
+                    "verification": {"output_exists": True},
+                    "output_summary": {"video_codec": "hevc", "audio_stream_count": 1, "subtitle_stream_count": 0},
+                    "errors": ["Verification failed: audio_streams_ok"],
+                    "local_output_path": str(output_path),
+                    "local_output_size_bytes": output_path.stat().st_size,
+                }
+
+            with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(config)):
+                with patch.object(worker_node, "run_local_ffmpeg_encode", side_effect=fake_encode):
+                    result = worker_node.worker_step(config, dry_run_result="ready", execute=True)
+
+            status = queue_store.queue_status(config)
+            job = queue_store.read_json(Path(result["job_path"]))
+            output_path = Path(str(result["local_processing"]["local_output_path"]))
+            work_dir = Path(str(result["local_processing"]["work_dir"]))
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["result_state"], "failed")
+            self.assertTrue(result["local_cleanup"]["removed"])
+            self.assertFalse(output_path.exists())
+            self.assertFalse(work_dir.exists())
+            self.assertNotIn("inspection_output_path", job)
+            self.assertEqual(status["states"]["failed"], 1)
+
+    def test_worker_step_execute_preserves_failed_work_dir_when_verification_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_config(temp_dir)
+            source = Path(temp_dir) / "library" / "file.mkv"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text("source-data\n", encoding="utf-8")
+            self.enqueue_real_source_job(config, source)
+
+            def fake_encode(_config: dict, _job: dict, local_cache: dict, node: str | None = None) -> dict:
+                output_path = Path(str(local_cache["work_dir"])) / "output" / "output.mkv"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text("encoded-data\n", encoding="utf-8")
+                return {
+                    "ok": False,
+                    "reason": "verification_failed",
+                    "verification": {"output_exists": True},
+                    "output_summary": {"video_codec": "hevc", "audio_stream_count": 1, "subtitle_stream_count": 0},
+                    "errors": ["Verification failed: audio_streams_ok"],
+                    "local_output_path": str(output_path),
+                    "local_output_size_bytes": output_path.stat().st_size,
+                }
+
+            with patch.object(worker_node, "local_space_check", return_value=self.enough_local_space(config)):
+                with patch.object(worker_node, "run_local_ffmpeg_encode", side_effect=fake_encode):
+                    result = worker_node.worker_step(config, dry_run_result="ready", execute=True, keep_failed_work_dir=True)
+
+            status = queue_store.queue_status(config)
+            job = queue_store.read_json(Path(result["job_path"]))
+            work_dir = Path(str(job["inspection_work_dir"]))
+            output_path = Path(str(job["inspection_output_path"]))
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["result_state"], "failed")
+            self.assertFalse(result["local_cleanup"]["removed"])
+            self.assertEqual(result["local_cleanup"]["reason"], "preserved_for_inspection")
+            self.assertTrue(work_dir.exists())
+            self.assertTrue((work_dir / "input").exists())
+            self.assertTrue(output_path.exists())
+            self.assertEqual(job["inspection_note"], worker_node.PRESERVED_FAILED_WORK_DIR_NOTE)
+            self.assertEqual(result["local_processing"]["inspection_output_path"], str(output_path))
+            self.assertEqual(status["states"]["failed"], 1)
 
     def test_run_local_ffmpeg_encode_terminates_when_hard_stop_is_requested(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

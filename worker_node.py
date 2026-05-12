@@ -476,6 +476,41 @@ def cleanup_local_job_workspace(work_dir: str | None) -> dict[str, Any]:
     return {"attempted": True, "removed": True, "path": str(path)}
 
 
+PRESERVED_FAILED_WORK_DIR_NOTE = "Preserved because --keep-failed-work-dir was enabled"
+
+
+def failed_work_dir_inspection_payload(local_cache: dict[str, Any] | None, encode_result: dict[str, Any] | None, keep_failed_work_dir: bool) -> dict[str, str] | None:
+    if not keep_failed_work_dir:
+        return None
+    if str((encode_result or {}).get("reason") or "") != "verification_failed":
+        return None
+    output_path_value = (encode_result or {}).get("local_output_path")
+    work_dir_value = (local_cache or {}).get("work_dir")
+    if not output_path_value or not work_dir_value:
+        return None
+    output_path = Path(str(output_path_value))
+    work_dir = Path(str(work_dir_value))
+    if not output_path.exists() or not work_dir.exists():
+        return None
+    return {
+        "inspection_work_dir": str(work_dir),
+        "inspection_output_path": str(output_path),
+        "inspection_note": PRESERVED_FAILED_WORK_DIR_NOTE,
+    }
+
+
+def cleanup_or_preserve_local_job_workspace(work_dir: str | None, inspection: dict[str, str] | None = None) -> dict[str, Any]:
+    if inspection:
+        return {
+            "attempted": True,
+            "removed": False,
+            "reason": "preserved_for_inspection",
+            "path": inspection["inspection_work_dir"],
+            **inspection,
+        }
+    return cleanup_local_job_workspace(work_dir)
+
+
 def required_local_space_bytes(job: dict[str, Any]) -> int:
     source_size = int(job.get("source_size_bytes") or 0)
     safety_margin = 5 * 1024 * 1024 * 1024
@@ -678,7 +713,7 @@ def write_ready_output_artifacts(
     }
 
 
-def worker_step(config: dict[str, Any], node_override: str | None = None, force: bool = False, dry_run_result: str = "requeue", execute: bool | None = None) -> dict[str, Any]:
+def worker_step(config: dict[str, Any], node_override: str | None = None, force: bool = False, dry_run_result: str = "requeue", execute: bool | None = None, keep_failed_work_dir: bool = False) -> dict[str, Any]:
     node = node_id(config, node_override)
     worker_enabled = bool(worker_settings(config).get("enabled", False))
     execute_mode = worker_execute_enabled(config, execute)
@@ -779,7 +814,8 @@ def worker_step(config: dict[str, Any], node_override: str | None = None, force:
                 interruption_reasons = {"hard_stop_requested", "schedule_hard_stop_requested", "encode_no_progress_timeout", "worker_process_interrupted"}
                 failure_state = "interrupted" if encode_result.get("reason") in interruption_reasons else "failed"
                 failure_timestamp_key = "interrupted_at" if failure_state == "interrupted" else "failed_at"
-                local_processing_payload = {**(local_cache or {}), **(encode_result or {})}
+                inspection = failed_work_dir_inspection_payload(local_cache, encode_result, keep_failed_work_dir)
+                local_processing_payload = {**(local_cache or {}), **(encode_result or {}), **(inspection or {})}
                 interrupted_log = None
                 if failure_state == "interrupted":
                     interrupted_log = write_interrupted_job_log(
@@ -792,8 +828,8 @@ def worker_step(config: dict[str, Any], node_override: str | None = None, force:
                         execution_mode="execute",
                         requeued=False,
                     )
-                target = move_claimed_job(config, claimed_path, failure_state, {failure_timestamp_key: utc_now(), "error": encode_result.get("reason") or "local_encode_failed", "local_space_check": space, "local_processing": local_processing_payload, "execution_mode": "execute", "source_untouched": bool(encode_result.get("source_untouched", False)), "partial_output_deleted": bool(encode_result.get("partial_output_deleted", False)), "interrupted_log": str(interrupted_log) if interrupted_log else None})
-                local_cleanup = cleanup_local_job_workspace((local_cache or {}).get("work_dir"))
+                target = move_claimed_job(config, claimed_path, failure_state, {failure_timestamp_key: utc_now(), "error": encode_result.get("reason") or "local_encode_failed", "local_space_check": space, "local_processing": local_processing_payload, "execution_mode": "execute", "source_untouched": bool(encode_result.get("source_untouched", False)), "partial_output_deleted": bool(encode_result.get("partial_output_deleted", False)), "interrupted_log": str(interrupted_log) if interrupted_log else None, **(inspection or {})})
+                local_cleanup = cleanup_or_preserve_local_job_workspace((local_cache or {}).get("work_dir"), inspection)
                 failure_phase = str(encode_result.get("reason") or "local_encode_failed") if failure_state == "interrupted" else "local_encode_failed"
                 write_worker_heartbeat(config, node, "waiting", failure_phase, current_job_id=job.get("job_id"), extra={"local_space_check": space, "local_processing": local_processing_payload, "execution_mode": "execute", "interrupted_log": str(interrupted_log) if interrupted_log else None})
                 return {
@@ -871,6 +907,7 @@ def worker_loop(
     force: bool = False,
     dry_run_result: str = "requeue",
     execute: bool | None = None,
+    keep_failed_work_dir: bool = False,
     max_iterations: int | None = None,
     idle_sleep_seconds: float | None = None,
     stop_on_idle: bool = False,
@@ -902,7 +939,7 @@ def worker_loop(
             stop_reason = str(stop_command)
             break
 
-        result = worker_step(config, node_override=node_override, force=force, dry_run_result=dry_run_result, execute=execute)
+        result = worker_step(config, node_override=node_override, force=force, dry_run_result=dry_run_result, execute=execute, keep_failed_work_dir=keep_failed_work_dir)
         results.append(result)
 
         if effective_max_iterations is not None and len(results) >= effective_max_iterations:

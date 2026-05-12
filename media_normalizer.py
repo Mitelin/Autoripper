@@ -1433,8 +1433,8 @@ def run_worker_heartbeat_command(config: dict[str, Any], node_override: str | No
     return 0
 
 
-def run_worker_step_command(config: dict[str, Any], node_override: str | None, force: bool, dry_run_result: str, execute: bool) -> int:
-    result = worker_step(config, node_override=node_override, force=force, dry_run_result=dry_run_result, execute=execute)
+def run_worker_step_command(config: dict[str, Any], node_override: str | None, force: bool, dry_run_result: str, execute: bool, keep_failed_work_dir: bool = False) -> int:
+    result = worker_step(config, node_override=node_override, force=force, dry_run_result=dry_run_result, execute=execute, keep_failed_work_dir=keep_failed_work_dir)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 
@@ -1445,6 +1445,7 @@ def run_worker_loop_command(
     force: bool,
     dry_run_result: str,
     execute: bool,
+    keep_failed_work_dir: bool,
     max_iterations: int | None,
     idle_sleep_seconds: float | None,
     stop_on_idle: bool,
@@ -1455,6 +1456,7 @@ def run_worker_loop_command(
         force=force,
         dry_run_result=dry_run_result,
         execute=execute,
+        keep_failed_work_dir=keep_failed_work_dir,
         max_iterations=max_iterations,
         idle_sleep_seconds=idle_sleep_seconds,
         stop_on_idle=stop_on_idle,
@@ -2162,6 +2164,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparser.add_argument("--force", action="store_true", help="Ignore local worker enabled/schedule/global pause checks for development testing")
     subparser.add_argument("--dry-run-result", choices=["requeue", "ready", "failed"], default="requeue", help="Where to move the claimed job after a dry-run worker step")
     subparser.add_argument("--execute", action="store_true", help="Use real local ffmpeg encode into the ready bundle; requires --dry-run-result ready")
+    subparser.add_argument("--keep-failed-work-dir", "--preserve-failed-output", dest="keep_failed_work_dir", action="store_true", help="Keep the local worker work dir when execute-mode verification fails after producing output.mkv")
     subparser = subparsers.add_parser("worker-loop")
     subparser.add_argument("--config", required=True, type=Path)
     subparser.add_argument("--profile", default=None, help="Optional config profile from the YAML file")
@@ -2169,6 +2172,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparser.add_argument("--force", action="store_true", help="Ignore local worker enabled/schedule/global pause checks for development testing")
     subparser.add_argument("--dry-run-result", choices=["requeue", "ready", "failed"], default="requeue", help="Where to move the claimed job after a dry-run worker step")
     subparser.add_argument("--execute", action="store_true", help="Use real local ffmpeg encode into the ready bundle; requires --dry-run-result ready")
+    subparser.add_argument("--keep-failed-work-dir", "--preserve-failed-output", dest="keep_failed_work_dir", action="store_true", help="Keep the local worker work dir when execute-mode verification fails after producing output.mkv")
     subparser.add_argument("--max-iterations", type=int, default=None, help="Optional hard cap on worker loop iterations")
     subparser.add_argument("--idle-sleep-seconds", type=float, default=None, help="Sleep interval used after idle or gated iterations")
     subparser.add_argument("--stop-on-idle", action="store_true", help="Stop the loop after the first no_job_available result")
@@ -2290,9 +2294,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "worker-heartbeat":
             return run_worker_heartbeat_command(config, args.node_id)
         if args.command == "worker-step":
-            return run_worker_step_command(config, args.node_id, args.force, args.dry_run_result, args.execute)
+            return run_worker_step_command(config, args.node_id, args.force, args.dry_run_result, args.execute, args.keep_failed_work_dir)
         if args.command == "worker-loop":
-            return run_worker_loop_command(config, args.node_id, args.force, args.dry_run_result, args.execute, args.max_iterations, args.idle_sleep_seconds, args.stop_on_idle)
+            return run_worker_loop_command(config, args.node_id, args.force, args.dry_run_result, args.execute, args.keep_failed_work_dir, args.max_iterations, args.idle_sleep_seconds, args.stop_on_idle)
         if args.command == "node-run":
             return run_node_command(config, args.node_id, args.worker_dry_run_result, args.manager_dry_run_result, args.worker_execute, args.execute, args.max_iterations, args.idle_sleep_seconds, args.stop_on_idle)
         if args.command == "lock-status":

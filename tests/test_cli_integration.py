@@ -200,10 +200,21 @@ class CliIntegrationTests(unittest.TestCase):
             config["worker"] = {"enabled": True, "run_continuously": True}
 
             with patch.object(mn, "load_config", return_value=config), patch.object(mn, "worker_loop", return_value={"status": "loop_complete", "iterations": 1, "stop_reason": "idle"}) as loop_mock:
-                result = mn.main(["worker-loop", "--config", str(config_path), "--node-id", "worker-a", "--dry-run-result", "ready", "--execute", "--max-iterations", "3", "--idle-sleep-seconds", "0.1", "--stop-on-idle"])
+                result = mn.main(["worker-loop", "--config", str(config_path), "--node-id", "worker-a", "--dry-run-result", "ready", "--execute", "--keep-failed-work-dir", "--max-iterations", "3", "--idle-sleep-seconds", "0.1", "--stop-on-idle"])
 
             self.assertEqual(result, 0)
-            loop_mock.assert_called_once_with(config, node_override="worker-a", force=False, dry_run_result="ready", execute=True, max_iterations=3, idle_sleep_seconds=0.1, stop_on_idle=True)
+            loop_mock.assert_called_once_with(config, node_override="worker-a", force=False, dry_run_result="ready", execute=True, keep_failed_work_dir=True, max_iterations=3, idle_sleep_seconds=0.1, stop_on_idle=True)
+
+    def test_main_worker_step_wires_keep_failed_work_dir_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self.write_config(temp_dir)
+            config = mn.load_config(config_path)
+
+            with patch.object(mn, "load_config", return_value=config), patch.object(mn, "worker_step", return_value={"status": "failed", "result_state": "failed"}) as step_mock:
+                result = mn.main(["worker-step", "--config", str(config_path), "--dry-run-result", "ready", "--execute", "--keep-failed-work-dir"])
+
+            self.assertEqual(result, 0)
+            step_mock.assert_called_once_with(config, node_override=None, force=False, dry_run_result="ready", execute=True, keep_failed_work_dir=True)
 
     def production_config(self, temp_dir: str) -> tuple[Path, dict]:
         config_path = self.write_config(temp_dir)
@@ -325,7 +336,7 @@ class CliIntegrationTests(unittest.TestCase):
                 result = mn.main(["worker-step", "--config", str(config_path), "--dry-run-result", "ready", "--execute"])
 
             self.assertEqual(result, 0)
-            step_mock.assert_called_once_with(config, node_override=None, force=False, dry_run_result="ready", execute=True)
+            step_mock.assert_called_once_with(config, node_override=None, force=False, dry_run_result="ready", execute=True, keep_failed_work_dir=False)
 
     def test_main_maintenance_loop_wires_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
