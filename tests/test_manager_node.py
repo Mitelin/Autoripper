@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import manager_node
+import media_normalizer as mn
 import queue_store
 import shared_locks
 
@@ -143,11 +144,94 @@ class ManagerNodeTests(unittest.TestCase):
             self.assertTrue(result["verification"]["ok"])
             self.assertEqual(result["verification"]["output_summary"]["audio_stream_count"], 2)
             self.assertEqual(result["verification"]["output_summary"]["subtitle_stream_count"], 3)
+            self.assertEqual(result["verification"]["verification"]["expected_audio_stream_count"], 2)
+            self.assertEqual(result["verification"]["verification"]["expected_subtitle_stream_count"], 3)
+            self.assertEqual(result["verification"]["verification"]["expected_stream_count_source"], "track_policy")
             self.assertEqual(done_job["verification"]["output_summary"]["audio_stream_count"], 2)
             self.assertEqual(done_job["verification"]["output_summary"]["subtitle_stream_count"], 3)
             self.assertEqual(status["states"]["ready_for_finalize"], 0)
             self.assertEqual(status["states"]["done"], 1)
             self.assertEqual(shared_locks.lock_status(config)["finalizer"]["active"], 0)
+
+    def test_manager_step_uses_local_processing_track_policy_stream_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_config(temp_dir)
+            source = self.create_source_file(temp_dir)
+            ready_dir = Path(config["shared_state_dir"]) / "ready_outputs" / "job_local_policy"
+            ready_dir.mkdir(parents=True)
+            output_path = ready_dir / "output.mkv"
+            output_path.write_text("dry-run output\n", encoding="utf-8")
+            (ready_dir / "checksum.sha256").write_text("deadbeef  output.mkv\n", encoding="utf-8")
+            source_summary = {"media_type": "movie", "file_size_bytes": 1000, "duration_seconds": 120.0, "audio_stream_count": 2, "subtitle_stream_count": 1}
+            output_summary = {"duration_seconds": 120.0, "audio_stream_count": 1, "subtitle_stream_count": 1, "video_codec": "hevc", "file_size_bytes": 15}
+            local_processing = {"track_policy": {"applied": True, "expected_audio_stream_count": 1, "expected_subtitle_stream_count": 1}}
+            queue_store.write_json_atomic(ready_dir / "worker_log.json", {"job_id": "job_local_policy", "status": "ready_for_finalize", "local_processing": local_processing})
+            queue_store.write_json_atomic(ready_dir / "manifest.json", {"job_id": "job_local_policy", "source_path": str(source), "ready_output_path": str(output_path), "dry_run": True, "source_summary": source_summary, "output_summary": output_summary, "local_processing": local_processing})
+            queue_store.write_json_atomic(ready_dir / "output.ffprobe.json", {"job_id": "job_local_policy", "source_path": str(source), "dry_run": True, "source_summary": source_summary, "output_summary": output_summary})
+            self.enqueue_ready_job(config, {"schema_version": 1, "job_id": "job_local_policy", "status": "ready_for_finalize", "source_path": str(source), "media_type": "movie", "duration_seconds": 120.0, "audio_stream_count": 2, "subtitle_stream_count": 1, "source_size_bytes": 1000, "dry_run": True, "ready_output_dir": str(ready_dir), "ready_output_path": str(output_path), "ready_output_manifest": str(ready_dir / "manifest.json"), "ready_output_ffprobe": str(ready_dir / "output.ffprobe.json")})
+
+            result = manager_node.manager_step(config, dry_run_result="done")
+
+            verification = result["verification"]["verification"]
+            self.assertEqual(result["result_state"], "done")
+            self.assertTrue(result["verification"]["ok"])
+            self.assertTrue(verification["audio_streams_ok"])
+            self.assertTrue(verification["subtitle_streams_ok"])
+            self.assertEqual(verification["expected_audio_stream_count"], 1)
+            self.assertEqual(verification["expected_subtitle_stream_count"], 1)
+            self.assertEqual(verification["expected_stream_count_source"], "track_policy")
+
+    def test_manager_verification_uses_source_counts_when_track_policy_not_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_config(temp_dir)
+            source = self.create_source_file(temp_dir)
+            ready_dir = Path(config["shared_state_dir"]) / "ready_outputs" / "job_policy_not_applied"
+            ready_dir.mkdir(parents=True)
+            output_path = ready_dir / "output.mkv"
+            output_path.write_text("dry-run output\n", encoding="utf-8")
+            source_summary = {"media_type": "movie", "file_size_bytes": 1000, "duration_seconds": 120.0, "audio_stream_count": 2, "subtitle_stream_count": 1}
+            output_summary = {"duration_seconds": 120.0, "audio_stream_count": 1, "subtitle_stream_count": 1, "video_codec": "hevc", "file_size_bytes": 15}
+            local_processing = {"track_policy": {"applied": False, "expected_audio_stream_count": 1, "expected_subtitle_stream_count": 1}}
+            queue_store.write_json_atomic(ready_dir / "manifest.json", {"job_id": "job_policy_not_applied", "source_path": str(source), "ready_output_path": str(output_path), "dry_run": True, "source_summary": source_summary, "local_processing": local_processing})
+            queue_store.write_json_atomic(ready_dir / "output.ffprobe.json", {"job_id": "job_policy_not_applied", "source_path": str(source), "dry_run": True, "source_summary": source_summary, "output_summary": output_summary})
+            job = {"schema_version": 1, "job_id": "job_policy_not_applied", "status": "ready_for_finalize", "source_path": str(source), "media_type": "movie", "duration_seconds": 120.0, "audio_stream_count": 2, "subtitle_stream_count": 1, "source_size_bytes": 1000, "dry_run": True, "ready_output_dir": str(ready_dir), "ready_output_path": str(output_path), "ready_output_manifest": str(ready_dir / "manifest.json"), "ready_output_ffprobe": str(ready_dir / "output.ffprobe.json")}
+
+            result = manager_node.run_manager_verification(config, job)
+
+            verification = result["verification"]
+            self.assertFalse(result["ok"])
+            self.assertFalse(verification["audio_streams_ok"])
+            self.assertTrue(verification["subtitle_streams_ok"])
+            self.assertEqual(verification["expected_audio_stream_count"], 2)
+            self.assertEqual(verification["expected_subtitle_stream_count"], 1)
+            self.assertEqual(verification["expected_stream_count_source"], "source")
+
+    def test_manager_ffprobe_output_uses_local_processing_track_policy_stream_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.make_config(temp_dir)
+            source = self.create_source_file(temp_dir)
+            ready_dir = Path(config["shared_state_dir"]) / "ready_outputs" / "job_ffprobe_policy"
+            ready_dir.mkdir(parents=True)
+            output_path = ready_dir / "output.mkv"
+            output_path.write_text("encoded output\n", encoding="utf-8")
+            source_summary = {"media_type": "movie", "file_size_bytes": 1000, "duration_seconds": 120.0, "audio_stream_count": 2, "subtitle_stream_count": 1}
+            local_processing = {"track_policy": {"applied": True, "expected_audio_stream_count": 1, "expected_subtitle_stream_count": 1}}
+            queue_store.write_json_atomic(ready_dir / "worker_log.json", {"job_id": "job_ffprobe_policy", "status": "ready_for_finalize", "local_processing": local_processing})
+            queue_store.write_json_atomic(ready_dir / "manifest.json", {"job_id": "job_ffprobe_policy", "source_path": str(source), "ready_output_path": str(output_path), "dry_run": False, "source_summary": source_summary, "local_processing": local_processing})
+            job = {"schema_version": 1, "job_id": "job_ffprobe_policy", "status": "ready_for_finalize", "source_path": str(source), "media_type": "movie", "duration_seconds": 120.0, "audio_stream_count": 2, "subtitle_stream_count": 1, "source_size_bytes": 1000, "dry_run": False, "ready_output_dir": str(ready_dir), "ready_output_path": str(output_path), "ready_output_manifest": str(ready_dir / "manifest.json"), "ready_output_worker_log": str(ready_dir / "worker_log.json")}
+            output_item = {"duration_seconds": 120.0, "audio_stream_count": 1, "subtitle_stream_count": 1, "video_codec": "hevc", "file_size_bytes": output_path.stat().st_size, "file_size_mb": 0.001, "container_format": "matroska", "video_width": 1920, "video_height": 1080, "overall_bitrate_kbps": 1300}
+
+            with patch.object(mn, "run_ffprobe", return_value=mn.ProbeResult(ok=True, data={})), patch.object(mn, "extract_metadata", return_value=output_item):
+                result = manager_node.run_manager_verification(config, job)
+
+            verification = result["verification"]
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["mode"], "ffprobe_output")
+            self.assertTrue(verification["audio_streams_ok"])
+            self.assertTrue(verification["subtitle_streams_ok"])
+            self.assertEqual(verification["expected_audio_stream_count"], 1)
+            self.assertEqual(verification["expected_subtitle_stream_count"], 1)
+            self.assertEqual(verification["expected_stream_count_source"], "track_policy")
 
     def test_manager_step_skips_when_finalizer_lock_is_busy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

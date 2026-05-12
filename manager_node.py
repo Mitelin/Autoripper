@@ -139,6 +139,30 @@ def build_manager_source_item(job: dict[str, Any], manifest: dict[str, Any] | No
     }
 
 
+def ready_output_worker_log_path(job: dict[str, Any], manifest: dict[str, Any]) -> Path | None:
+    path_value = job.get("ready_output_worker_log") or manifest.get("worker_log_path")
+    if path_value:
+        return Path(str(path_value))
+    if job.get("ready_output_dir"):
+        return Path(str(job["ready_output_dir"])) / "worker_log.json"
+    return None
+
+
+def applied_track_policy_from_payloads(*payloads: dict[str, Any]) -> dict[str, Any]:
+    fallback: dict[str, Any] = {}
+    for payload in payloads:
+        if not payload:
+            continue
+        candidates = [payload.get("track_policy"), ((payload.get("local_processing") or {}).get("track_policy") if isinstance(payload.get("local_processing"), dict) else None)]
+        for candidate in candidates:
+            if isinstance(candidate, dict) and candidate:
+                if candidate.get("applied"):
+                    return candidate
+                if not fallback:
+                    fallback = candidate
+    return fallback
+
+
 def run_manager_verification(config: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     if not job.get("ready_output_path"):
         return {
@@ -151,17 +175,18 @@ def run_manager_verification(config: dict[str, Any], job: dict[str, Any]) -> dic
     manifest_path = job.get("ready_output_manifest")
     ffprobe_path = job.get("ready_output_ffprobe") or (Path(str(job["ready_output_dir"])) / "output.ffprobe.json" if job.get("ready_output_dir") else None)
     manifest = read_json(Path(str(manifest_path))) if manifest_path and Path(str(manifest_path)).exists() else {}
+    worker_log_path = ready_output_worker_log_path(job, manifest)
+    worker_log = read_json(worker_log_path) if worker_log_path and worker_log_path.exists() else {}
     source_item = build_manager_source_item(job, manifest)
     if bool(job.get("dry_run") or manifest.get("dry_run")):
         ffprobe_payload = read_json(Path(str(ffprobe_path))) if ffprobe_path and Path(str(ffprobe_path)).exists() else {}
         output_summary = ffprobe_payload.get("output_summary") or {}
-        track_policy_result = ffprobe_payload.get("track_policy") or manifest.get("track_policy") or {}
-        if track_policy_result.get("applied"):
-            expected_audio_count = track_policy_result.get("expected_audio_stream_count")
-            expected_subtitle_count = track_policy_result.get("expected_subtitle_stream_count")
-        else:
-            expected_audio_count = source_item.get("audio_stream_count")
-            expected_subtitle_count = source_item.get("subtitle_stream_count")
+        track_policy_result = applied_track_policy_from_payloads(ffprobe_payload, manifest, job, worker_log)
+        from media_normalizer import expected_stream_counts
+
+        expected_counts = expected_stream_counts(source_item, track_policy_result)
+        expected_audio_count = expected_counts["expected_audio_stream_count"]
+        expected_subtitle_count = expected_counts["expected_subtitle_stream_count"]
         errors: list[str] = []
         output_audio_count = output_summary.get("audio_stream_count")
         output_subtitle_count = output_summary.get("subtitle_stream_count")
@@ -174,12 +199,15 @@ def run_manager_verification(config: dict[str, Any], job: dict[str, Any]) -> dic
             "video_stream_exists": bool(output_summary.get("video_codec")),
             "audio_streams_ok": audio_streams_ok,
             "subtitle_streams_ok": subtitle_streams_ok,
+            **expected_counts,
             "duration_ok": source_item.get("duration_seconds") is None or output_summary.get("duration_seconds") == source_item.get("duration_seconds"),
             "output_non_empty": (output_summary.get("file_size_bytes") or 0) > 0,
         }
-        verification["ok"] = all(verification.values())
-        for key, value in verification.items():
-            if key != "ok" and not value:
+        hard_verification_keys = ["ffprobe_payload_ok", "job_id_matches", "source_path_matches", "video_stream_exists", "audio_streams_ok", "subtitle_streams_ok", "duration_ok", "output_non_empty"]
+        verification["ok"] = all(bool(verification.get(key)) for key in hard_verification_keys)
+        for key in hard_verification_keys:
+            value = verification.get(key)
+            if not value:
                 errors.append(f"Verification failed: {key}")
         return {
             "ok": verification["ok"],
@@ -191,7 +219,8 @@ def run_manager_verification(config: dict[str, Any], job: dict[str, Any]) -> dic
 
     from media_normalizer import verify_output
 
-    verification, output_summary, errors = verify_output(config, source_item, Path(str(job["ready_output_path"])), manifest.get("track_policy"))
+    track_policy_result = applied_track_policy_from_payloads(manifest, job, worker_log)
+    verification, output_summary, errors = verify_output(config, source_item, Path(str(job["ready_output_path"])), track_policy_result)
     return {
         "ok": not errors,
         "mode": "ffprobe_output",

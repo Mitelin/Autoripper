@@ -985,6 +985,20 @@ def estimated_overall_bitrate_kbps(size_bytes: int, duration_seconds: Any) -> in
     return int(round((size_bytes * 8) / duration / 1000))
 
 
+def expected_stream_counts(source_item: dict[str, Any], track_policy_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    if track_policy_result and track_policy_result.get("applied"):
+        return {
+            "expected_audio_stream_count": track_policy_result.get("expected_audio_stream_count"),
+            "expected_subtitle_stream_count": track_policy_result.get("expected_subtitle_stream_count"),
+            "expected_stream_count_source": "track_policy",
+        }
+    return {
+        "expected_audio_stream_count": source_item.get("audio_stream_count"),
+        "expected_subtitle_stream_count": source_item.get("subtitle_stream_count"),
+        "expected_stream_count_source": "source",
+    }
+
+
 def verify_output(
     config: dict[str, Any],
     source_item: dict[str, Any],
@@ -1011,6 +1025,9 @@ def verify_output(
         "suspicious_size_warning_reason": None,
         "suspicious_size_hard_fail": False,
         "suspicious_size_threshold_used": None,
+        "expected_audio_stream_count": None,
+        "expected_subtitle_stream_count": None,
+        "expected_stream_count_source": "source",
     }
     if not output.exists():
         return verification, None, ["Output file does not exist"]
@@ -1041,14 +1058,12 @@ def verify_output(
     if source_duration is not None and output_duration is not None:
         verification["duration_ok"] = abs(float(source_duration) - float(output_duration)) <= max_duration_diff
     verification["video_stream_exists"] = bool(output_item.get("video_codec"))
-    if track_policy_result and track_policy_result.get("applied"):
-        expected_audio_count = track_policy_result.get("expected_audio_stream_count")
-        expected_subtitle_count = track_policy_result.get("expected_subtitle_stream_count")
-        verification["audio_streams_ok"] = output_item.get("audio_stream_count") == expected_audio_count and output_item.get("audio_stream_count", 0) >= 1
-        verification["subtitle_streams_ok"] = output_item.get("subtitle_stream_count") == expected_subtitle_count
-    else:
-        verification["audio_streams_ok"] = output_item.get("audio_stream_count") == source_item.get("audio_stream_count")
-        verification["subtitle_streams_ok"] = output_item.get("subtitle_stream_count") == source_item.get("subtitle_stream_count")
+    expected_counts = expected_stream_counts(source_item, track_policy_result)
+    expected_audio_count = expected_counts["expected_audio_stream_count"]
+    expected_subtitle_count = expected_counts["expected_subtitle_stream_count"]
+    verification.update(expected_counts)
+    verification["audio_streams_ok"] = output_item.get("audio_stream_count") == expected_audio_count and output_item.get("audio_stream_count", 0) >= 1
+    verification["subtitle_streams_ok"] = output_item.get("subtitle_stream_count") == expected_subtitle_count
 
     source_size = source_item.get("file_size_bytes") or 0
     ratio = output_size / source_size if source_size else 0
