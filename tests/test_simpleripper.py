@@ -224,6 +224,46 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertEqual(simpleripper.scan_candidates([source.parent], config), [source])
 
+    def test_selected_folder_change_invalidates_empty_queue_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            folder_a = root / "library" / "A"
+            folder_b = root / "library" / "B"
+            folder_a.mkdir(parents=True)
+            folder_b.mkdir(parents=True)
+            source_b = folder_b / "candidate.mkv"
+            source_b.write_bytes(b"x" * 10)
+            config["scan"]["selected_folders"] = [{"path": str(folder_a), "media_type": "auto"}]
+
+            first = simpleripper.scan_candidates([folder_a], config)
+            self.assertEqual(first, [])
+
+            config["scan"]["selected_folders"] = [{"path": str(folder_b), "media_type": "auto"}]
+            second = simpleripper.scan_candidates([folder_b], config)
+
+            self.assertEqual(second, [source_b])
+            self.assertEqual(simpleripper.scan_state_get(config, "candidate_queue_scope_fingerprint"), simpleripper.scan_scope_fingerprint(config, [folder_b]))
+
+    def test_media_type_change_invalidates_scoped_skip_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            folder = root / "library" / "Scoped"
+            folder.mkdir(parents=True)
+            source = folder / "candidate.mkv"
+            source.write_bytes(b"x" * 10)
+            config["scan"]["selected_folders"] = [{"path": str(folder), "media_type": "auto"}]
+            simpleripper.fast_inventory_scan([folder], config)
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET decision = 'skip', decision_reason = 'already_hevc', policy_hash = ? WHERE path = ?", (simpleripper.policy_hash(config), str(source)))
+
+            config["scan"]["selected_folders"] = [{"path": str(folder), "media_type": "movie"}]
+
+            self.assertEqual(simpleripper.scan_candidates([folder], config), [source])
+
     def test_repeated_ffmpeg_failures_block_cached_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

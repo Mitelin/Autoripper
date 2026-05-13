@@ -26,6 +26,7 @@ import yaml
 
 
 APP_NAME = "SimpleRipper"
+SCAN_SCOPE_SCHEMA_VERSION = 1
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v", ".ts"}
 LANGUAGE_ALIASES = {
     "cze": {"cze", "ces", "cz", "czech", "cestina", "cesky", "cz dabing", "czech dub"},
@@ -154,6 +155,75 @@ def scan_cache_enabled(config: dict[str, Any]) -> bool:
 def folder_state_cache_enabled(config: dict[str, Any]) -> bool:
     settings = scan_cache_settings(config)
     return bool(settings.get("enabled") and settings.get("folder_state_cache_enabled"))
+
+
+def selected_scope_entries(config: dict[str, Any], folders: list[Path] | None = None) -> list[dict[str, str]]:
+    configured = normalize_selected_folder_entries((config.get("scan") or {}).get("selected_folders") or [])
+    if not folders:
+        return configured
+    folder_keys = {normalize_path_for_match(folder) for folder in folders}
+    matched = [item for item in configured if normalize_path_for_match(item["path"]) in folder_keys]
+    if matched:
+        return matched
+    return [{"path": str(folder), "media_type": "auto"} for folder in folders]
+
+
+def scan_scope_payload(config: dict[str, Any], folders: list[Path] | None = None) -> dict[str, Any]:
+    entries = selected_scope_entries(config, folders)
+    normalized_entries = [
+        {"path": normalize_path_for_prefix_match(item["path"]), "media_type": media_type_value(item.get("media_type"))}
+        for item in sorted(entries, key=lambda item: normalize_path_for_prefix_match(item["path"]))
+    ]
+    return {
+        "schema_version": SCAN_SCOPE_SCHEMA_VERSION,
+        "selected_folders": normalized_entries,
+        "file_extensions": sorted(scan_file_extensions(config)),
+        "skip_rules": config.get("skip_rules") or {},
+        "quality_profiles": config.get("quality_profiles") or {},
+        "retention_size_policy": config.get("retention_size_policy") or {},
+        "track_policy": config.get("track_policy") or {},
+        "verification": config.get("verification") or {},
+    }
+
+
+def scan_scope_fingerprint(config: dict[str, Any], folders: list[Path] | None = None) -> str:
+    payload = scan_scope_payload(config, folders)
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def path_in_scope(path: Path, scope_entries: list[dict[str, str]]) -> bool:
+    path_norm = normalize_path_for_prefix_match(path)
+    for entry in scope_entries:
+        prefix = normalize_path_for_prefix_match(entry["path"])
+        if path_norm == prefix or path_norm.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def invalidate_scoped_file_decisions(connection: sqlite3.Connection, scope_entries: list[dict[str, str]]) -> None:
+    if not scope_entries:
+        return
+    rows = connection.execute("SELECT path, decision FROM file_index").fetchall()
+    affected = [str(row["path"]) for row in rows if path_in_scope(Path(str(row["path"])), scope_entries) and str(row["decision"] or "") in {"skip", "encode_candidate"}]
+    if not affected:
+        return
+    connection.executemany(
+        "UPDATE file_index SET decision = NULL, decision_reason = NULL, policy_hash = NULL, estimated_saved_bytes = NULL, last_deep_checked_at = NULL, updated_at = ? WHERE path = ?",
+        [(utc_now(), item) for item in affected],
+    )
+
+
+def invalidate_candidate_queue_scope(config: dict[str, Any], reason: str, old_scope_fingerprint: str | None = None, new_scope_fingerprint: str | None = None, old_scope_entries: list[dict[str, str]] | None = None, new_scope_entries: list[dict[str, str]] | None = None) -> None:
+    with open_worker_cache(config) as connection:
+        for key in ("candidate_queue_scope_fingerprint", "candidate_queue_generated_at", "candidate_queue_generation_id"):
+            connection.execute("DELETE FROM scan_state WHERE key = ?", (key,))
+        scope_union: list[dict[str, str]] = []
+        for entry in (old_scope_entries or []) + (new_scope_entries or []):
+            if any(normalize_path_for_match(item["path"]) == normalize_path_for_match(entry["path"]) and item.get("media_type") == entry.get("media_type") for item in scope_union):
+                continue
+            scope_union.append(entry)
+        invalidate_scoped_file_decisions(connection, scope_union)
+    log_event(config, "candidate_queue_invalidated", reason=reason, old_scope=old_scope_fingerprint, new_scope=new_scope_fingerprint)
 
 
 def policy_hash(config: dict[str, Any]) -> str:
@@ -320,6 +390,8 @@ def clear_worker_file_cache(config: dict[str, Any]) -> None:
 def clear_worker_candidate_queue(config: dict[str, Any]) -> None:
     with open_worker_cache(config) as connection:
         connection.execute("UPDATE file_index SET decision = NULL, decision_reason = NULL, estimated_saved_bytes = NULL, updated_at = ? WHERE decision = 'encode_candidate'", (utc_now(),))
+        for key in ("candidate_queue_scope_fingerprint", "candidate_queue_generated_at", "candidate_queue_generation_id"):
+            connection.execute("DELETE FROM scan_state WHERE key = ?", (key,))
 
 
 def worker_cache_summary(config: dict[str, Any]) -> dict[str, Any]:
@@ -1295,6 +1367,7 @@ def refresh_folder_state_upwards(config: dict[str, Any], source: Path) -> None:
 def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str, Any]:
     now = utc_now()
     generation_id = f"{now}-{os.getpid()}"
+    scope_fingerprint = scan_scope_fingerprint(config, folders)
     seen = 0
     changed = 0
     skipped_folders = 0
@@ -1302,7 +1375,7 @@ def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str
     current_policy_hash = policy_hash(config)
     settings = scan_cache_settings(config)
     completed_generation_id = scan_state_get(config, "last_completed_inventory_generation_id")
-    log_event(config, "inventory_refresh_started", folders=[str(folder) for folder in folders], generation_id=generation_id, cache_path=str(worker_cache_path(config)))
+    log_event(config, "inventory_refresh_started", folders=[str(folder) for folder in folders], generation_id=generation_id, scope=scope_fingerprint, cache_path=str(worker_cache_path(config)))
 
     def scan_folder(connection: sqlite3.Connection, folder: Path) -> None:
         nonlocal seen, changed, skipped_folders
@@ -1437,6 +1510,18 @@ def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str
                 "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 ("last_policy_hash", policy_hash(config), now),
             )
+            connection.execute(
+                "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                ("candidate_queue_scope_fingerprint", scope_fingerprint, now),
+            )
+            connection.execute(
+                "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                ("candidate_queue_generated_at", now, now),
+            )
+            connection.execute(
+                "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                ("candidate_queue_generation_id", generation_id, now),
+            )
             queue_row = connection.execute("SELECT COUNT(*) AS count FROM file_index WHERE decision IS NULL OR decision = 'encode_candidate'").fetchone()
             queue_count = int(queue_row["count"] or 0) if queue_row else 0
     except Exception:
@@ -1444,10 +1529,11 @@ def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str
             connection.execute("UPDATE folder_index SET state = 'partial', reason = 'inventory_incomplete', scan_complete = 0, updated_at = ? WHERE inventory_generation_id = ? AND state = 'clean'", (utc_now(), generation_id))
         log_event(config, "inventory_refresh_incomplete", generation_id=generation_id)
         raise
-    log_event(config, "inventory_refresh_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, generation_id=generation_id, cache_path=str(worker_cache_path(config)))
-    log_event(config, "candidate_queue_refreshed", count=queue_count)
+    log_event(config, "inventory_refresh_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, generation_id=generation_id, scope=scope_fingerprint, cache_path=str(worker_cache_path(config)))
+    log_event(config, "candidate_queue_refreshed", count=queue_count, scope=scope_fingerprint)
+    log_event(config, "candidate_queue_rebuilt", count=queue_count, scope=scope_fingerprint, generation_id=generation_id)
     log_event(config, "fast_inventory_scan_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, cache_path=str(worker_cache_path(config)))
-    return {"indexed_files": seen, "changed_files": changed, "skipped_folders": skipped_folders, "generation_id": generation_id, "last_fast_inventory_scan_at": now}
+    return {"indexed_files": seen, "changed_files": changed, "skipped_folders": skipped_folders, "generation_id": generation_id, "scope_fingerprint": scope_fingerprint, "last_fast_inventory_scan_at": now}
 
 
 def fast_inventory_due(config: dict[str, Any]) -> bool:
@@ -1467,12 +1553,13 @@ def ensure_fast_inventory_scan(config: dict[str, Any], folders: list[Path], forc
     return None
 
 
-def cached_candidate_paths(config: dict[str, Any]) -> list[Path]:
+def cached_candidate_paths(config: dict[str, Any], folders: list[Path] | None = None, scope_match: bool = True) -> list[Path]:
     settings = scan_cache_settings(config)
     queue_size = max(1, int(settings.get("queue_size") or 25))
     current_policy_hash = policy_hash(config)
     now = utc_now()
     paths: list[Path] = []
+    scope_entries = selected_scope_entries(config, folders)
     with open_worker_cache(config) as connection:
         rows = connection.execute(
             """
@@ -1491,6 +1578,8 @@ def cached_candidate_paths(config: dict[str, Any]) -> list[Path]:
         ).fetchall()
         for row in rows:
             path = cache_path_row(row)
+            if scope_entries and not path_in_scope(path, scope_entries):
+                continue
             marker = marker_path(path, config)
             if not path.exists() or (marker is not None and marker.exists()) or source_lock_path(path, config).exists():
                 continue
@@ -1504,7 +1593,7 @@ def cached_candidate_paths(config: dict[str, Any]) -> list[Path]:
                     (int(stat.st_size), int(stat.st_mtime_ns), utc_now(), str(path)),
                 )
             paths.append(path)
-    log_event(config, "candidate_queue_loaded", count=len(paths))
+    log_event(config, "candidate_queue_loaded", count=len(paths), scope_match=scope_match)
     if not paths:
         log_event(config, "candidate_queue_empty")
     return paths
@@ -1641,8 +1730,26 @@ def uncached_scan_candidates(folders: list[Path], config: dict[str, Any]) -> lis
 
 def scan_candidates(folders: list[Path], config: dict[str, Any]) -> list[Path]:
     if scan_cache_enabled(config):
-        ensure_fast_inventory_scan(config, folders)
-        return cached_candidate_paths(config)
+        current_scope = scan_scope_fingerprint(config, folders)
+        log_event(config, "scan_scope_fingerprint", current=current_scope)
+        stored_scope = scan_state_get(config, "candidate_queue_scope_fingerprint")
+        stored_generation = scan_state_get(config, "candidate_queue_generation_id")
+        completed_generation = scan_state_get(config, "last_completed_inventory_generation_id")
+        scope_match = bool(stored_scope and stored_scope == current_scope and stored_generation and stored_generation == completed_generation)
+        if not scope_match:
+            invalidate_candidate_queue_scope(
+                config,
+                "scope_changed" if stored_scope and stored_scope != current_scope else "missing_or_incomplete_scope",
+                old_scope_fingerprint=stored_scope,
+                new_scope_fingerprint=current_scope,
+                old_scope_entries=selected_scope_entries(config),
+                new_scope_entries=selected_scope_entries(config, folders),
+            )
+            ensure_fast_inventory_scan(config, folders, force=True)
+            scope_match = True
+        else:
+            ensure_fast_inventory_scan(config, folders)
+        return cached_candidate_paths(config, folders, scope_match=scope_match)
     return uncached_scan_candidates(folders, config)
 
 
@@ -2344,9 +2451,14 @@ class SimpleRipperApp:
                 "recent_log_lines": tail_text_lines(app_log_path(self.config), 60),
             }
 
-    def persist_selected_folders(self) -> None:
+    def persist_selected_folders(self, previous_entries: list[dict[str, str]] | None = None) -> None:
+        old_entries = list(previous_entries or [])
+        old_scope = scan_scope_fingerprint(self.config, [Path(item["path"]) for item in old_entries]) if old_entries else scan_state_get(self.config, "candidate_queue_scope_fingerprint")
         write_json(selected_folders_path(self.config), {"selected_folders": self.selected_folder_entries, "custom_folders": self.custom_folder_entries, "updated_at": utc_now()})
         persist_selected_folders_in_config(self.config, self.selected_folder_entries)
+        new_scope = scan_scope_fingerprint(self.config, [Path(item["path"]) for item in self.selected_folder_entries]) if self.selected_folder_entries else scan_scope_fingerprint(self.config, [])
+        if old_scope != new_scope:
+            invalidate_candidate_queue_scope(self.config, "selected_folders_changed", old_scope_fingerprint=old_scope, new_scope_fingerprint=new_scope, old_scope_entries=old_entries, new_scope_entries=list(self.selected_folder_entries))
         log_event(self.config, "selected_folders_updated", selected_folders=self.selected_folder_entries, custom_folders=self.custom_folder_entries)
 
     def _sync_folder_views(self) -> None:
@@ -2420,28 +2532,31 @@ class SimpleRipperApp:
     def set_selected_folders(self, folders: list[Any]) -> None:
         normalized = normalize_selected_folder_entries(folders)
         with self._lock:
+            previous_entries = list(self.selected_folder_entries)
             existing_custom_paths = {str(item["path"]) for item in self.custom_folder_entries}
             self.selected_folder_entries = normalized
             self.custom_folder_entries = [item for item in normalized if item["path"] in existing_custom_paths]
             self._sync_folder_views()
-            self.persist_selected_folders()
+            self.persist_selected_folders(previous_entries)
 
     def add_custom_folder(self, folder: str, media_type: str = "auto") -> None:
         path = Path(folder)
         with self._lock:
+            previous_entries = list(self.selected_folder_entries)
             entry = {"path": str(path), "media_type": media_type_value(media_type)}
             self.custom_folder_entries = [item for item in self.custom_folder_entries if item["path"] != entry["path"]] + [entry]
             self.selected_folder_entries = [item for item in self.selected_folder_entries if item["path"] != entry["path"]] + [entry]
             self._sync_folder_views()
-            self.persist_selected_folders()
+            self.persist_selected_folders(previous_entries)
 
     def remove_custom_folder(self, folder: str) -> None:
         path = Path(folder)
         with self._lock:
+            previous_entries = list(self.selected_folder_entries)
             self.custom_folder_entries = [item for item in self.custom_folder_entries if Path(item["path"]) != path]
             self.selected_folder_entries = [item for item in self.selected_folder_entries if Path(item["path"]) != path]
             self._sync_folder_views()
-            self.persist_selected_folders()
+            self.persist_selected_folders(previous_entries)
 
     def start(self) -> None:
         with self._lock:
