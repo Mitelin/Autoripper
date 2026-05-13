@@ -82,6 +82,10 @@ jellyfin:
   server_url: http://127.0.0.1:8096
   api_key: ""
   path_mapping: []
+  path_lookup_enabled: true
+  path_lookup_limit: 1000
+  path_lookup_max_pages: 20
+  sqlite_db_path: ""
 
 verification:
   max_duration_diff_seconds: 2

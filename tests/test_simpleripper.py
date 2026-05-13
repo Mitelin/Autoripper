@@ -869,7 +869,72 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertEqual(result["item_id"], "1")
         self.assertEqual(result["match_type"], "exact_path")
 
-    def test_jellyfin_lookup_item_keeps_fuzzy_ties_ambiguous_without_exact_match(self) -> None:
+    def test_refresh_jellyfin_finds_localized_episode_by_path_lookup(self) -> None:
+        config = self.make_config(Path("."))
+        config["jellyfin"] = {
+            "enabled": True,
+            "server_url": "http://jellyfin.local:8096",
+            "api_key": "secret",
+            "path_mapping": [{"fs_prefix": r"\\192.168.50.23\admin", "jellyfin_prefix": "/mnt/nas/filmy"}],
+        }
+        source = Path(r"\\192.168.50.23\admin\SERIALY\English\Futurama\Season 10\Futurama - S10E05 - Scared Screenless WEBDL-1080p.mkv")
+        target_path = "/mnt/nas/filmy/SERIALY/English/Futurama/Season 10/Futurama - S10E05 - Scared Screenless WEBDL-1080p.mkv"
+        search_items = [{"Id": "s09e09", "Path": "/mnt/nas/filmy/SERIALY/English/Futurama/Season 09/Futurama - S09E09.mkv", "Name": "Unrelated"}]
+        path_items = [
+            {"Id": "92EB0B39-2C74-FE6E-1F2D-ED2BF27BCB4F", "Path": target_path, "Name": "Posvatny cas bezobrazovek"},
+            {"Id": "extra", "Path": "/mnt/nas/filmy/SERIALY/English/Futurama/Season 10 Extras/Futurama - S10E05 - Scared Screenless WEBDL-1080p.mkv", "Name": "Extra"},
+        ]
+        refresh_urls: list[str] = []
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def fake_urlopen(req: object, timeout: int = 10) -> FakeResponse:
+            refresh_urls.append(req.full_url)  # type: ignore[attr-defined]
+            return FakeResponse()
+
+        with patch("simpleripper.jellyfin_query_items", return_value=search_items), patch("simpleripper.jellyfin_query_path_items", return_value=path_items), patch("simpleripper.request.urlopen", side_effect=fake_urlopen):
+            result = simpleripper.refresh_jellyfin(config, source)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["match_type"], "exact_path")
+        self.assertEqual(result["refreshed_count"], 1)
+        self.assertEqual(result["matches"][0]["item_id"], "92EB0B39-2C74-FE6E-1F2D-ED2BF27BCB4F")
+        self.assertEqual(result["matches"][0]["path"], target_path)
+        self.assertEqual(result["matches"][0]["name"], "Posvatny cas bezobrazovek")
+        self.assertIn(target_path, result["candidate_paths"])
+        self.assertEqual(len(refresh_urls), 1)
+
+    def test_refresh_jellyfin_does_not_refresh_season_extras_without_exact_path(self) -> None:
+        config = self.make_config(Path("."))
+        config["jellyfin"] = {
+            "enabled": True,
+            "server_url": "http://jellyfin.local:8096",
+            "api_key": "secret",
+            "path_mapping": [{"fs_prefix": r"\\192.168.50.23\admin", "jellyfin_prefix": "/mnt/nas/filmy"}],
+        }
+        source = Path(r"\\192.168.50.23\admin\SERIALY\English\Futurama\Season 10\Futurama - S10E05 - Scared Screenless WEBDL-1080p.mkv")
+        extras = [
+            {"Id": "extra1", "Path": "/mnt/nas/filmy/SERIALY/English/Futurama/Season 10 Extras/Futurama - S10E05 - Scared Screenless WEBDL-1080p.mkv", "Name": "Scared Screenless Extra"},
+            {"Id": "extra2", "Path": "/mnt/nas/filmy/SERIALY/English/Futurama/Season 10 Extras/Futurama - S10E05 Behind the Scenes.mkv", "Name": "Season 10"},
+        ]
+
+        with patch("simpleripper.jellyfin_query_items", return_value=extras), patch("simpleripper.jellyfin_query_path_items", return_value=extras), patch("simpleripper.request.urlopen", side_effect=AssertionError("refresh must not be called")):
+            result = simpleripper.refresh_jellyfin(config, source)
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["reason"], "no_exact_path_match")
+        self.assertIn("candidate_paths", result)
+        self.assertIn("search_terms", result)
+
+    def test_jellyfin_lookup_item_reports_not_found_without_exact_match(self) -> None:
         source = Path("Z:/nas-backup/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv")
         candidates = ["K:/filmy/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv"]
         items = [
@@ -880,7 +945,8 @@ class SimpleRipperTests(unittest.TestCase):
         with patch("simpleripper.jellyfin_query_items", return_value=items):
             result = simpleripper.jellyfin_lookup_item("http://jellyfin.local:8096", "secret", source, candidates)
 
-        self.assertEqual(result["status"], "ambiguous")
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["reason"], "no_exact_path_match")
         self.assertEqual(result["candidate_paths"], candidates)
         self.assertTrue(result["search_terms"])
         self.assertEqual(len(result["matches"]), 2)

@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -997,7 +998,7 @@ def refresh_jellyfin(config: dict[str, Any], source: Path) -> dict[str, Any]:
         return {"status": "skipped", "reason": "missing_server_url_or_api_key"}
     mapped_paths = jellyfin_mapped_paths(settings, source)
     try:
-        lookup = jellyfin_lookup_item(server_url, api_key, source, mapped_paths)
+        lookup = jellyfin_lookup_item(server_url, api_key, source, mapped_paths, settings)
         if lookup.get("status") != "ok":
             return lookup
         matches = lookup.get("matches") or []
@@ -1011,7 +1012,7 @@ def refresh_jellyfin(config: dict[str, Any], source: Path) -> dict[str, Any]:
             refresh_req = request.Request(f"{server_url}/Items/{item_id}/Refresh?Recursive=false&MetadataRefreshMode=Default&ImageRefreshMode=Default", headers={"X-Emby-Token": api_key}, method="POST")
             with request.urlopen(refresh_req, timeout=10):
                 pass
-            refreshed.append({"item_id": item_id, "matched_path": match.get("matched_path")})
+            refreshed.append({**match, "item_id": item_id, "matched_path": match.get("matched_path") or match.get("path")})
         return {**lookup, "status": "ok", "matches": refreshed, "refreshed_count": len(refreshed)}
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
@@ -1092,11 +1093,78 @@ def jellyfin_search_terms(source: Path) -> list[str]:
 
 
 def jellyfin_query_items(server_url: str, api_key: str, search_term: str) -> list[dict[str, Any]]:
-    query = parse.urlencode({"Recursive": "true", "SearchTerm": search_term, "Fields": "Path"})
+    query = parse.urlencode({"Recursive": "true", "SearchTerm": search_term, "Fields": "Path,SeriesName,ParentIndexNumber,IndexNumber"})
     req = request.Request(f"{server_url}/Items?{query}", headers={"X-Emby-Token": api_key})
     with request.urlopen(req, timeout=10) as response:
         payload = json.loads(response.read().decode("utf-8"))
     return payload.get("Items") or []
+
+
+def jellyfin_query_path_items(server_url: str, api_key: str, settings: dict[str, Any]) -> list[dict[str, Any]]:
+    if settings.get("path_lookup_enabled", True) is False:
+        return []
+    try:
+        page_limit = max(1, int(settings.get("path_lookup_limit") or 1000))
+    except (TypeError, ValueError):
+        page_limit = 1000
+    try:
+        max_pages = max(1, int(settings.get("path_lookup_max_pages") or 20))
+    except (TypeError, ValueError):
+        max_pages = 20
+    all_items: list[dict[str, Any]] = []
+    for page in range(max_pages):
+        start_index = page * page_limit
+        query = parse.urlencode(
+            {
+                "Recursive": "true",
+                "IncludeItemTypes": "Episode,Movie",
+                "Fields": "Path,SeriesName,ParentIndexNumber,IndexNumber",
+                "StartIndex": str(start_index),
+                "Limit": str(page_limit),
+            }
+        )
+        req = request.Request(f"{server_url}/Items?{query}", headers={"X-Emby-Token": api_key})
+        with request.urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        items = payload.get("Items") or []
+        all_items.extend(items)
+        total = payload.get("TotalRecordCount")
+        if not items or (isinstance(total, int) and len(all_items) >= total) or len(items) < page_limit:
+            break
+    return all_items
+
+
+def jellyfin_query_sqlite_path_items(settings: dict[str, Any], candidate_paths: list[str]) -> list[dict[str, Any]]:
+    db_path = str(settings.get("sqlite_db_path") or "").strip()
+    if not db_path or not Path(db_path).is_file():
+        return []
+    placeholders = ", ".join("?" for _ in candidate_paths)
+    if not placeholders:
+        return []
+    try:
+        with sqlite3.connect(db_path) as connection:
+            rows = connection.execute(f"SELECT Id, Name, Path FROM BaseItems WHERE Path IN ({placeholders})", candidate_paths).fetchall()
+    except sqlite3.Error:
+        return []
+    return [{"Id": str(row[0]), "Name": row[1], "Path": row[2]} for row in rows]
+
+
+def jellyfin_exact_path_matches(items: list[dict[str, Any]], candidate_paths: list[str]) -> list[dict[str, Any]]:
+    candidate_by_norm = {normalize_path_for_match(path): path for path in candidate_paths}
+    exact_matches: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        item_path = str(item.get("Path") or "")
+        candidate_path = candidate_by_norm.get(normalize_path_for_match(item_path))
+        if not candidate_path:
+            continue
+        item_id = str(item.get("Id") or "")
+        key = (item_id, normalize_path_for_match(item_path or candidate_path))
+        if not item_id or key in seen:
+            continue
+        seen.add(key)
+        exact_matches.append({"item_id": item_id, "path": item_path or candidate_path, "matched_path": item_path or candidate_path, "name": item.get("Name")})
+    return exact_matches
 
 
 def jellyfin_item_score(item: dict[str, Any], source: Path, candidate_paths: list[str]) -> int:
@@ -1125,7 +1193,7 @@ def jellyfin_item_score(item: dict[str, Any], source: Path, candidate_paths: lis
     return score
 
 
-def jellyfin_lookup_item(server_url: str, api_key: str, source: Path, candidate_paths: list[str]) -> dict[str, Any]:
+def jellyfin_lookup_item(server_url: str, api_key: str, source: Path, candidate_paths: list[str], settings: dict[str, Any] | None = None) -> dict[str, Any]:
     search_terms = jellyfin_search_terms(source)
     items_by_id: dict[str, dict[str, Any]] = {}
     for search_term in search_terms:
@@ -1133,15 +1201,16 @@ def jellyfin_lookup_item(server_url: str, api_key: str, source: Path, candidate_
             item_id = str(item.get("Id") or "")
             if item_id:
                 items_by_id[item_id] = item
-    if not items_by_id:
-        return {"status": "not_found", "search_terms": search_terms, "candidate_paths": candidate_paths}
-    candidate_by_norm = {normalize_path_for_match(path): path for path in candidate_paths}
-    exact_matches: list[dict[str, Any]] = []
-    for item in items_by_id.values():
-        item_path = str(item.get("Path") or "")
-        candidate_path = candidate_by_norm.get(normalize_path_for_match(item_path))
-        if candidate_path:
-            exact_matches.append({"item_id": item.get("Id"), "matched_path": item_path or candidate_path})
+    exact_matches = jellyfin_exact_path_matches(list(items_by_id.values()), candidate_paths)
+    path_lookup_used = False
+    if not exact_matches and settings is not None:
+        sqlite_matches = jellyfin_exact_path_matches(jellyfin_query_sqlite_path_items(settings, candidate_paths), candidate_paths)
+        path_lookup_used = path_lookup_used or bool(sqlite_matches)
+        exact_matches = sqlite_matches
+    if not exact_matches and settings is not None:
+        path_items = jellyfin_query_path_items(server_url, api_key, settings)
+        path_lookup_used = True
+        exact_matches = jellyfin_exact_path_matches(path_items, candidate_paths)
     if exact_matches:
         result = {
             "status": "ok",
@@ -1150,10 +1219,13 @@ def jellyfin_lookup_item(server_url: str, api_key: str, source: Path, candidate_
             "match_type": "exact_path",
             "search_terms": search_terms,
             "candidate_paths": candidate_paths,
+            "path_lookup_used": path_lookup_used,
         }
         if len(exact_matches) == 1:
-            result.update({"item_id": exact_matches[0]["item_id"], "matched_path": exact_matches[0]["matched_path"]})
+            result.update({"item_id": exact_matches[0]["item_id"], "matched_path": exact_matches[0]["matched_path"], "path": exact_matches[0]["path"], "name": exact_matches[0].get("name")})
         return result
+    if not items_by_id:
+        return {"status": "not_found", "search_terms": search_terms, "candidate_paths": candidate_paths, "reason": "no_exact_path_match", "path_lookup_used": path_lookup_used}
     scored = sorted(
         ((jellyfin_item_score(item, source, candidate_paths), item) for item in items_by_id.values()),
         key=lambda pair: pair[0],
@@ -1161,19 +1233,17 @@ def jellyfin_lookup_item(server_url: str, api_key: str, source: Path, candidate_
     )
     best_score, best_item = scored[0]
     if best_score <= 0:
-        return {"status": "not_found", "search_terms": search_terms, "candidate_paths": candidate_paths}
-    if len(scored) > 1 and scored[1][0] == best_score:
-        top_matches = [
-            {
-                "item_id": item.get("Id"),
-                "path": item.get("Path"),
-                "name": item.get("Name"),
-                "score": score,
-            }
-            for score, item in scored[:10]
-        ]
-        return {"status": "ambiguous", "match_count": len(scored), "top_score": best_score, "candidate_paths": candidate_paths, "search_terms": search_terms, "matches": top_matches}
-    return {"status": "ok", "item_id": best_item.get("Id"), "matched_path": best_item.get("Path"), "score": best_score, "search_terms": search_terms, "candidate_paths": candidate_paths, "matched_count": 1, "matches": [{"item_id": best_item.get("Id"), "matched_path": best_item.get("Path")}], "match_type": "single_best"}
+        return {"status": "not_found", "search_terms": search_terms, "candidate_paths": candidate_paths, "reason": "no_exact_path_match", "path_lookup_used": path_lookup_used}
+    top_matches = [
+        {
+            "item_id": item.get("Id"),
+            "path": item.get("Path"),
+            "name": item.get("Name"),
+            "score": score,
+        }
+        for score, item in scored[:10]
+    ]
+    return {"status": "not_found", "reason": "no_exact_path_match", "match_count": len(scored), "top_score": best_score, "candidate_paths": candidate_paths, "search_terms": search_terms, "matches": top_matches, "path_lookup_used": path_lookup_used}
 
 
 def safe_unlink(path: Path) -> None:
