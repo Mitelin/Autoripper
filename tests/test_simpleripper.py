@@ -19,7 +19,7 @@ class SimpleRipperTests(unittest.TestCase):
             "paths": {"local_work_dir": str(root / "work"), "history_dir": str(root / "history"), "log_dir": str(root / "logs"), "quarantine_dir": str(root / "quarantine"), "inspection_dir": str(root / "inspection"), "keep_failed_output_for_inspection": True},
             "tools": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
             "libraries": {"roots": [str(root / "library")]},
-            "scan": {"file_extensions": [".mkv"], "processed_marker_suffix": ".simpleripper.done.json", "lock_suffix": ".simpleripper.lock"},
+            "scan": {"file_extensions": [".mkv"], "processed_marker_suffix": ".simpleripper.done.json", "lock_suffix": ".simpleripper.lock", "write_sidecar_markers": False},
             "verification": {"max_duration_diff_seconds": 2, "max_output_source_ratio": 0.95, "low_ratio_warning": 0.15},
             "track_policy": {"enabled": True, "target_audio_languages": ["cze"], "drop_other_audio_if_target_found": True, "keep_subtitles": True},
         }
@@ -56,6 +56,7 @@ class SimpleRipperTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self.make_config(root)
+            config["scan"]["write_sidecar_markers"] = True
             library = root / "library"
             library.mkdir()
             ready = library / "ready.mkv"
@@ -69,6 +70,14 @@ class SimpleRipperTests(unittest.TestCase):
             candidates = simpleripper.scan_candidates([library], config)
 
             self.assertEqual(candidates, [ready])
+
+    def test_marker_path_is_disabled_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            source = root / "library" / "movie.mkv"
+
+            self.assertIsNone(simpleripper.marker_path(source, config))
 
     def test_scan_skips_history_done_file_with_same_signature(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -584,10 +593,27 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertEqual(source.read_text(encoding="utf-8"), "encoded")
             self.assertFalse(output.exists())
-            self.assertFalse(simpleripper.marker_path(source, config).exists())
+            self.assertIsNone(simpleripper.marker_path(source, config))
             quarantine = Path(result["quarantine_path"])
             self.assertTrue(quarantine.exists())
             self.assertIn(str(root / "quarantine" / "Movies" / "A"), str(quarantine))
+            self.assertIsNone(result["processed_marker_path"])
+
+    def test_replace_can_return_sidecar_marker_path_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan"]["write_sidecar_markers"] = True
+            library = root / "library"
+            library.mkdir()
+            source = library / "movie.mkv"
+            output = library / ".movie.mkv.simpleripper.tmp"
+            source.write_text("original", encoding="utf-8")
+            output.write_text("encoded", encoding="utf-8")
+
+            result = simpleripper.replace_source_with_output(source, output, config, {"job_id": "job-1"})
+
+            self.assertEqual(result["processed_marker_path"], str(source.with_name(source.name + ".simpleripper.done.json")))
 
     def test_quarantine_path_can_use_configured_relative_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

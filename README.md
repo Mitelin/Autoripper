@@ -48,6 +48,8 @@ The web UI folder browser is limited to `libraries.roots`, shows those roots fir
 
 Folder selections are persisted both to local runtime state and back into `scan.selected_folders` in the configured YAML file.
 
+By default, SimpleRipper does not create sidecar `.simpleripper.done` files in media folders; it uses central history instead.
+
 By default, existing HEVC files are skipped, but very large HEVC files with still-suspicious bitrate can be considered again through `skip_rules.hevc_reprocess_*` thresholds.
 
 `STOP` means finish the current safe job and then stop. `FORCE STOP` terminates the local encode and cleans local work files without intentionally touching the original media unless the app is already inside the protected swap/rollback phase.
@@ -59,6 +61,7 @@ Copy `config.example.yaml` to `config.yaml` and edit:
 - `libraries.roots`: allowed base folders shown in the GUI.
 - `libraries.roots`: allowed base folders shown in the GUI and exposed by the web folder browser.
 - `scan.selected_folders`: optional persisted `path + media_type` entries.
+- `scan.write_sidecar_markers`: default `false`; when enabled, SimpleRipper also writes legacy `.simpleripper.done*` sidecar markers beside source files.
 - `scan.priority_probe_limit`: how many of the largest current candidates get ffprobe-based ranking before the next job is chosen.
 - `paths.local_work_dir`: local temporary processing area.
 - `paths.history_dir`: local job history JSON and JSONL records.

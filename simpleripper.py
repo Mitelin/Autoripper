@@ -658,7 +658,13 @@ def source_lock_path(source: Path, config: dict[str, Any]) -> Path:
     return lock_dir / f"{file_lock_id(source)}.json"
 
 
-def marker_path(source: Path, config: dict[str, Any]) -> Path:
+def write_sidecar_markers_enabled(config: dict[str, Any]) -> bool:
+    return bool((config.get("scan") or {}).get("write_sidecar_markers", False))
+
+
+def marker_path(source: Path, config: dict[str, Any]) -> Path | None:
+    if not write_sidecar_markers_enabled(config):
+        return None
     suffix = str(((config.get("scan") or {}).get("processed_marker_suffix")) or ".simpleripper.done.json")
     return source.with_name(source.name + suffix)
 
@@ -756,7 +762,8 @@ def scan_candidates(folders: list[Path], config: dict[str, Any]) -> list[Path]:
                 continue
             if any(token in path.name.lower() for token in (".sample.", "trailer", "extras", "behind the scenes")):
                 continue
-            if path.is_file() and path.suffix.lower() in extensions and not marker_path(path, config).exists() and not source_lock_path(path, config).exists() and not is_history_done_for_current_source(config, path) and not path.name.endswith((".original", ".tmp", ".partial")):
+            marker = marker_path(path, config)
+            if path.is_file() and path.suffix.lower() in extensions and (marker is None or not marker.exists()) and not source_lock_path(path, config).exists() and not is_history_done_for_current_source(config, path) and not path.name.endswith((".original", ".tmp", ".partial")):
                 candidates.append(path)
     return sorted(candidates, key=lambda item: item.stat().st_size, reverse=True)
 
@@ -1535,7 +1542,9 @@ class SimpleRipperApp:
             reason = skip_reason(self.config, source_meta)
             if reason:
                 job_summary.update({"status": "skipped", "skip_reason": reason, "finished_at": utc_now(), "source": source_meta})
-                write_json(marker_path(source, self.config), job_summary)
+                marker = marker_path(source, self.config)
+                if marker is not None:
+                    write_json(marker, job_summary)
                 append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
                 history_payload = {"status": "skipped", "source_signature": source_signature(source), "job_id": job_id, "updated_at": utc_now(), "reason": reason}
                 write_history_index(self.config, source, history_payload)
@@ -1611,7 +1620,9 @@ class SimpleRipperApp:
             quarantine_cleanup = finalize_quarantined_original(Path(str(final_payload["quarantine_path"])), self.config)
             final_payload.update(quarantine_cleanup)
             write_json(metadata_dir / "final.ffprobe.json", {"probe": final_probe, "metadata": final_meta})
-            write_json(marker_path(source, self.config), {"source": source_meta, "output": final_meta, "verification": final_verification, "track_policy": stream_policy, "job_id": job_id, **final_payload, "processed_at": utc_now()})
+            marker = marker_path(source, self.config)
+            if marker is not None:
+                write_json(marker, {"source": source_meta, "output": final_meta, "verification": final_verification, "track_policy": stream_policy, "job_id": job_id, **final_payload, "processed_at": utc_now()})
             history_payload = {"status": "done", "job_id": job_id, "source_signature": source_signature(source), "updated_at": utc_now(), "video_codec_after": final_meta.get("video_codec")}
             write_history_index(self.config, source, history_payload)
             write_shared_worker_history(self.config, source, history_payload)
@@ -1668,7 +1679,8 @@ def replace_source_with_output(source: Path, output: Path, config: dict[str, Any
         raise
     marker = {**marker, "source_path": str(source), "quarantine_path": str(quarantine_path), "processed_at": utc_now()}
     write_json(history_dir(config) / "quarantine_index" / f"{file_lock_id(source)}.json", marker)
-    return {"quarantine_path": str(quarantine_path), "replacement_path": str(source), "processed_marker_path": str(marker_path(source, config))}
+    sidecar_marker = marker_path(source, config)
+    return {"quarantine_path": str(quarantine_path), "replacement_path": str(source), "processed_marker_path": str(sidecar_marker) if sidecar_marker is not None else None}
 
 
 def rollback_replacement(source: Path, quarantine_path: Path, config: dict[str, Any]) -> None:

@@ -25,6 +25,7 @@ libraries:
 scan:
   selected_folders: []
   priority_probe_limit: 12
+  write_sidecar_markers: false
   file_extensions:
     - .mkv
     - .mp4
