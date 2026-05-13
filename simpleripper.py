@@ -577,10 +577,12 @@ def select_streams(config: dict[str, Any], source: dict[str, Any]) -> dict[str, 
     args = ["-map", "0:v:0"]
     for stream in target_audio:
         args.extend(["-map", f"0:{stream['index']}"])
+    expected_subtitle_count = 0
     if policy.get("keep_subtitles", True):
         args.extend(["-map", "0:s?"])
+        expected_subtitle_count = source.get("subtitle_stream_count")
     args.extend(["-map", "0:t?"])
-    return {"applied": True, "map_arguments": args, "expected_audio_stream_count": len(target_audio), "expected_subtitle_stream_count": source.get("subtitle_stream_count")}
+    return {"applied": True, "map_arguments": args, "expected_audio_stream_count": len(target_audio), "expected_subtitle_stream_count": expected_subtitle_count}
 
 
 def build_ffmpeg_command(config: dict[str, Any], source: Path, output: Path, metadata: dict[str, Any], stream_policy: dict[str, Any]) -> list[str]:
@@ -933,11 +935,17 @@ def inspect_candidate(config: dict[str, Any], source: Path, media_type: str) -> 
     if not ok:
         return {"path": source, "status": "ffprobe_failed", "error": error}
     metadata = extract_metadata(source, probe, media_type)
-    reason = skip_reason(config, metadata)
+    stream_policy = select_streams(config, metadata)
+    profile_matches, profile_mismatch_reasons = source_matches_target_profile(config, metadata, media_type, stream_policy)
+    reason = skip_reason(config, metadata, stream_policy)
     score = candidate_priority_score(metadata)
     if should_reprocess_hevc(config, metadata):
         score += 35.0
-    return {"path": source, "status": "ok", "metadata": metadata, "skip_reason": reason, "score": score}
+    codec = str(metadata.get("video_codec") or "").lower()
+    candidate_reason = "hevc_not_normalized" if codec in {"hevc", "h265"} and not profile_matches else None
+    if candidate_reason:
+        score += 20.0
+    return {"path": source, "status": "ok", "metadata": metadata, "skip_reason": reason, "score": score, "track_policy": stream_policy, "target_profile_matches": profile_matches, "profile_mismatch_reasons": profile_mismatch_reasons, "candidate_reason": candidate_reason}
 
 
 def candidate_selection_key(candidate: dict[str, Any]) -> tuple[int, float]:
@@ -946,19 +954,21 @@ def candidate_selection_key(candidate: dict[str, Any]) -> tuple[int, float]:
     return (size_bytes, float(candidate.get("score") or 0.0))
 
 
-def skip_reason(config: dict[str, Any], metadata: dict[str, Any]) -> str | None:
+def skip_reason(config: dict[str, Any], metadata: dict[str, Any], track_policy_result: dict[str, Any] | None = None) -> str | None:
     rules = config.get("skip_rules") or {}
-    if str(metadata.get("encoded_by") or "").casefold() == APP_NAME.casefold():
-        return "already_simpleripper"
     codec = str(metadata.get("video_codec") or "").lower()
-    if rules.get("skip_hevc", True) and codec in {"hevc", "h265"} and not should_reprocess_hevc(config, metadata):
-        return "already_hevc"
-    if rules.get("skip_av1", True) and codec == "av1":
-        return "already_av1"
     if rules.get("skip_4k", True) and int(metadata.get("video_height") or 0) >= 1800:
         return "skip_4k"
     if rules.get("skip_hdr", True) and metadata.get("is_hdr"):
         return "skip_hdr"
+    media_type = str(metadata.get("media_type") or "default")
+    profile_matches, _profile_mismatch_reasons = source_matches_target_profile(config, metadata, media_type, track_policy_result)
+    if profile_matches and str(metadata.get("encoded_by") or "").casefold() == APP_NAME.casefold():
+        return "already_simpleripper"
+    if rules.get("skip_hevc", True) and codec in {"hevc", "h265"} and profile_matches:
+        return "already_normalized"
+    if rules.get("skip_av1", True) and codec == "av1" and profile_matches:
+        return "already_normalized"
     min_duration = rules.get("min_duration_seconds")
     if min_duration is not None and (metadata.get("duration_seconds") or 0) < float(min_duration):
         return "below_min_duration"
@@ -966,6 +976,40 @@ def skip_reason(config: dict[str, Any], metadata: dict[str, Any]) -> str | None:
     if min_size_mb is not None and int(metadata.get("file_size_bytes") or 0) < int(min_size_mb) * 1024 * 1024:
         return "below_min_size"
     return None
+
+
+def source_matches_target_profile(config: dict[str, Any], source_meta: dict[str, Any], media_type: str, track_policy_result: dict[str, Any] | None = None) -> tuple[bool, list[str]]:
+    settings = (config.get("quality_profiles") or {}).get(media_type or "default") or (config.get("quality_profiles") or {}).get("default") or {}
+    reasons: list[str] = []
+    expected_codecs = expected_video_codecs(settings.get("encoder"))
+    codec = str(source_meta.get("video_codec") or "").lower()
+    if expected_codecs and codec not in expected_codecs:
+        reasons.append(f"video_codec_mismatch:{codec or 'none'}!={','.join(sorted(expected_codecs))}")
+    target_pix_fmt = str(settings.get("pix_fmt") or "").strip()
+    source_pix_fmt = str(source_meta.get("video_pix_fmt") or "").strip()
+    if target_pix_fmt and source_pix_fmt != target_pix_fmt:
+        reasons.append(f"pix_fmt_mismatch:{source_pix_fmt or 'none'}!={target_pix_fmt}")
+    stream_policy = track_policy_result if track_policy_result is not None else select_streams(config, source_meta)
+    if stream_policy.get("applied"):
+        expected_audio = int(stream_policy.get("expected_audio_stream_count") or 0)
+        actual_audio = int(source_meta.get("audio_stream_count") or 0)
+        if actual_audio != expected_audio:
+            target_languages = set((config.get("track_policy") or {}).get("target_audio_languages") or ["cze"])
+            extra_languages: list[str] = []
+            for stream in source_meta.get("audio_streams") or []:
+                language = detect_language(stream)[0]
+                if language not in target_languages:
+                    extra_languages.append(language)
+            if extra_languages:
+                for language in sorted(set(extra_languages)):
+                    reasons.append(f"audio_policy_mismatch:extra_{language}_audio")
+            else:
+                reasons.append(f"audio_policy_mismatch:expected_{expected_audio}_actual_{actual_audio}")
+        expected_subtitles = stream_policy.get("expected_subtitle_stream_count")
+        actual_subtitles = source_meta.get("subtitle_stream_count")
+        if expected_subtitles is not None and actual_subtitles != expected_subtitles:
+            reasons.append(f"subtitle_policy_mismatch:expected_{expected_subtitles}_actual_{actual_subtitles}")
+    return not reasons, reasons
 
 
 def ensure_local_free_space(config: dict[str, Any], source_size: int) -> None:
@@ -1646,7 +1690,7 @@ class SimpleRipperApp:
         if inspected:
             inspected.sort(key=candidate_selection_key, reverse=True)
             best = inspected[0]
-            log_event(self.config, "candidate_ranked", source_path=str(best["path"]), score=best.get("score"), codec=(best.get("metadata") or {}).get("video_codec"))
+            log_event(self.config, "candidate_ranked", source_path=str(best["path"]), score=best.get("score"), codec=(best.get("metadata") or {}).get("video_codec"), candidate_reason=best.get("candidate_reason"), profile_mismatch_reasons=best.get("profile_mismatch_reasons"))
             return Path(best["path"])
         for candidate in candidates[probe_limit:]:
             details = inspect_candidate(self.config, candidate, self.media_type_for_source(candidate))
@@ -1656,7 +1700,7 @@ class SimpleRipperApp:
             if details.get("skip_reason"):
                 log_event(self.config, "candidate_scan_skipped", source_path=str(candidate), reason=details.get("skip_reason"))
                 continue
-            log_event(self.config, "candidate_ranked_fallback", source_path=str(details["path"]), score=details.get("score"), codec=(details.get("metadata") or {}).get("video_codec"))
+            log_event(self.config, "candidate_ranked_fallback", source_path=str(details["path"]), score=details.get("score"), codec=(details.get("metadata") or {}).get("video_codec"), candidate_reason=details.get("candidate_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"))
             return Path(details["path"])
         return None
 
@@ -1730,9 +1774,14 @@ class SimpleRipperApp:
             source_meta["file_size_bytes"] = source.stat().st_size
             write_json(metadata_dir / "source.ffprobe.json", {"probe": source_probe, "metadata": source_meta})
             recovery_context = {"source_metadata": source_meta}
-            reason = skip_reason(self.config, source_meta)
+            stream_policy = select_streams(self.config, source_meta)
+            profile_matches, profile_mismatch_reasons = source_matches_target_profile(self.config, source_meta, str(source_meta.get("media_type") or "default"), stream_policy)
+            recovery_context["track_policy"] = stream_policy
+            recovery_context["target_profile_matches"] = profile_matches
+            recovery_context["profile_mismatch_reasons"] = profile_mismatch_reasons
+            reason = skip_reason(self.config, source_meta, stream_policy)
             if reason:
-                job_summary.update({"status": "skipped", "skip_reason": reason, "finished_at": utc_now(), "source": source_meta})
+                job_summary.update({"status": "skipped", "skip_reason": reason, "finished_at": utc_now(), "source": source_meta, "target_profile_matches": profile_matches, "profile_mismatch_reasons": profile_mismatch_reasons, "track_policy": stream_policy})
                 marker = marker_path(source, self.config)
                 if marker is not None:
                     write_json(marker, job_summary)
@@ -1740,13 +1789,13 @@ class SimpleRipperApp:
                 history_payload = {"status": "skipped", "source_signature": source_signature(source), "job_id": job_id, "updated_at": utc_now(), "reason": reason}
                 write_history_index(self.config, source, history_payload)
                 write_shared_worker_history(self.config, source, history_payload)
-                log_event(self.config, "candidate_skipped", job_id=job_id, source_path=str(source), reason=reason)
+                log_event(self.config, "candidate_skipped", job_id=job_id, source_path=str(source), reason=reason, profile_mismatch_reasons=profile_mismatch_reasons)
                 with self._lock:
                     self.state.last_processed = ([{"source_path": str(source), "finished_at": utc_now(), "status": "skipped", "reason": reason}] + (self.state.last_processed or []))[:20]
                 succeeded = True
                 return
-            stream_policy = select_streams(self.config, source_meta)
-            recovery_context["track_policy"] = stream_policy
+            if profile_mismatch_reasons:
+                log_event(self.config, "candidate_profile_mismatch", job_id=job_id, source_path=str(source), reasons=profile_mismatch_reasons)
             self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
             command = build_ffmpeg_command(self.config, copied_source, output, source_meta, stream_policy)
             job_summary["ffmpeg_command"] = command
