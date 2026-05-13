@@ -278,6 +278,7 @@ def initialize_worker_cache(connection: sqlite3.Connection) -> None:
             policy_hash TEXT,
             failure_count INTEGER DEFAULT 0,
             last_error TEXT,
+            last_failure_at TEXT,
             retry_after TEXT,
             next_check_after TEXT,
             last_seen_at TEXT,
@@ -287,6 +288,12 @@ def initialize_worker_cache(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    file_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(file_index)").fetchall()}
+    for column_name, definition in {
+        "last_failure_at": "TEXT",
+    }.items():
+        if column_name not in file_columns:
+            connection.execute(f"ALTER TABLE file_index ADD COLUMN {column_name} {definition}")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS scan_state (
@@ -367,7 +374,7 @@ def clear_worker_cache(config: dict[str, Any]) -> None:
 def clear_worker_failures(config: dict[str, Any]) -> None:
     with open_worker_cache(config) as connection:
         connection.execute(
-            "UPDATE file_index SET decision = NULL, decision_reason = NULL, failure_count = 0, last_error = NULL, retry_after = NULL, next_check_after = NULL WHERE decision IN ('failed', 'blocked')"
+            "UPDATE file_index SET decision = NULL, decision_reason = NULL, failure_count = 0, last_error = NULL, last_failure_at = NULL, retry_after = NULL, next_check_after = NULL WHERE decision IN ('failed', 'blocked')"
         )
         connection.execute("UPDATE folder_index SET state = 'dirty', reason = 'failures_cleared', checked_at = ?, updated_at = ?", (utc_now(), utc_now()))
 
@@ -1602,12 +1609,11 @@ def cached_candidate_paths(config: dict[str, Any], folders: list[Path] | None = 
                 OR decision = 'encode_candidate'
                 OR policy_hash IS NULL
                 OR policy_hash != ?
-                OR (decision = 'failed' AND (retry_after IS NULL OR retry_after <= ?))
-                OR (decision = 'blocked' AND (next_check_after IS NULL OR next_check_after <= ?))
+                OR (decision = 'failed' AND retry_after IS NOT NULL AND retry_after <= ?)
             ORDER BY COALESCE(score, size_bytes) DESC, size_bytes DESC
             LIMIT ?
             """,
-            (current_policy_hash, now, now, queue_size),
+            (current_policy_hash, now, queue_size),
         ).fetchall()
         for row in rows:
             path = cache_path_row(row)
@@ -1653,21 +1659,34 @@ def update_cache_deep_check(config: dict[str, Any], details: dict[str, Any]) -> 
     metadata = details.get("metadata") or {}
     decision = "encode_candidate"
     decision_reason = details.get("candidate_reason") or "needs_encode"
+    settings = scan_cache_settings(config)
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat(timespec="seconds")
+    failure_count = 0
+    last_error = None
+    last_failure_at = None
+    retry_after = None
+    next_check_after = None
     if details.get("status") != "ok":
-        decision = "failed"
-        decision_reason = str(details.get("status") or "deep_check_failed")
+        with open_worker_cache(config) as connection:
+            row = connection.execute("SELECT failure_count FROM file_index WHERE path = ?", (str(source),)).fetchone()
+        failure_count = int(row["failure_count"] or 0) + 1 if row else 1
+        decision = "blocked" if failure_count >= int(settings["max_failures_before_block"]) else "failed"
+        decision_reason = "deep_check_blocked" if decision == "blocked" else str(details.get("status") or "deep_check_failed")
+        last_error = str(details.get("error") or details.get("status") or "deep_check_failed")
+        last_failure_at = now
+        retry_after = datetime.fromtimestamp(now_dt.timestamp() + float(settings["failed_retry_hours"]) * 3600, timezone.utc).isoformat(timespec="seconds") if decision == "failed" else None
     elif details.get("skip_reason"):
         decision = "skip"
         decision_reason = str(details.get("skip_reason"))
     stat = source.stat()
-    now = utc_now()
     with open_worker_cache(config) as connection:
         connection.execute(
             """
             UPDATE file_index SET
                 media_type = ?, size_bytes = ?, mtime_ns = ?, duration_seconds = ?, video_codec = ?, video_pix_fmt = ?, width = ?, height = ?,
                 overall_bitrate_kbps = ?, audio_stream_count = ?, subtitle_stream_count = ?, decision = ?, decision_reason = ?, score = ?,
-                estimated_saved_bytes = ?, policy_hash = ?, last_deep_checked_at = ?, updated_at = ?
+                estimated_saved_bytes = ?, policy_hash = ?, failure_count = ?, last_error = ?, last_failure_at = ?, retry_after = ?, next_check_after = ?, last_deep_checked_at = ?, updated_at = ?
             WHERE path = ?
             """,
             (
@@ -1687,12 +1706,23 @@ def update_cache_deep_check(config: dict[str, Any], details: dict[str, Any]) -> 
                 float(details.get("score") or 0),
                 estimated_saved_bytes_from_details(details),
                 policy_hash(config),
+                failure_count,
+                last_error,
+                last_failure_at,
+                retry_after,
+                next_check_after,
                 now,
                 now,
                 str(source),
             ),
         )
     log_event(config, "file_state_updated", source_path=str(source), state=decision, reason=decision_reason)
+    if details.get("status") != "ok":
+        log_event(config, "candidate_deep_check_failed", source_path=str(source), error=last_error, failure_count=failure_count, decision=decision)
+        if decision == "blocked":
+            log_event(config, "candidate_blocked", source_path=str(source), error=last_error, failure_count=failure_count)
+        else:
+            log_event(config, "candidate_retry_scheduled", source_path=str(source), error=last_error, failure_count=failure_count, retry_after=retry_after)
     refresh_folder_state_upwards(config, source)
 
 
@@ -1702,18 +1732,18 @@ def update_cache_job_success(config: dict[str, Any], source: Path, replacement: 
     now = utc_now()
     with open_worker_cache(config) as connection:
         connection.execute(
-            "UPDATE file_index SET decision = 'done', decision_reason = 'job_done', failure_count = 0, last_error = NULL, retry_after = NULL, next_check_after = NULL, policy_hash = ?, updated_at = ? WHERE path = ?",
+            "UPDATE file_index SET decision = 'done', decision_reason = 'job_done', failure_count = 0, last_error = NULL, last_failure_at = NULL, retry_after = NULL, next_check_after = NULL, policy_hash = ?, updated_at = ? WHERE path = ?",
             (policy_hash(config), now, str(source)),
         )
         if replacement is not None:
             replacement_stat = replacement.stat() if replacement.exists() else None
             connection.execute(
                 """
-                INSERT INTO file_index(path, normalized_path, media_type, size_bytes, mtime_ns, suffix, parent_dir, decision, decision_reason, policy_hash, failure_count, last_error, retry_after, next_check_after, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, 'done', 'job_done', ?, 0, NULL, NULL, NULL, ?)
+                INSERT INTO file_index(path, normalized_path, media_type, size_bytes, mtime_ns, suffix, parent_dir, decision, decision_reason, policy_hash, failure_count, last_error, last_failure_at, retry_after, next_check_after, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, 'done', 'job_done', ?, 0, NULL, NULL, NULL, NULL, ?)
                 ON CONFLICT(path) DO UPDATE SET decision = 'done', decision_reason = 'job_done', policy_hash = excluded.policy_hash,
                     size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns, suffix = excluded.suffix, parent_dir = excluded.parent_dir,
-                    failure_count = 0, last_error = NULL, retry_after = NULL, next_check_after = NULL, updated_at = excluded.updated_at
+                    failure_count = 0, last_error = NULL, last_failure_at = NULL, retry_after = NULL, next_check_after = NULL, updated_at = excluded.updated_at
                 """,
                 (
                     str(replacement),
@@ -1750,12 +1780,12 @@ def update_cache_job_failure(config: dict[str, Any], source: Path, error: str) -
         retry_text = datetime.fromtimestamp(retry_after, timezone.utc).isoformat(timespec="seconds") if decision == "failed" else None
         connection.execute(
             """
-            INSERT INTO file_index(path, normalized_path, media_type, size_bytes, mtime_ns, suffix, parent_dir, decision, decision_reason, policy_hash, failure_count, last_error, retry_after, next_check_after, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO file_index(path, normalized_path, media_type, size_bytes, mtime_ns, suffix, parent_dir, decision, decision_reason, policy_hash, failure_count, last_error, last_failure_at, retry_after, next_check_after, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET decision = excluded.decision, decision_reason = excluded.decision_reason, policy_hash = excluded.policy_hash,
-                failure_count = excluded.failure_count, last_error = excluded.last_error, retry_after = excluded.retry_after, next_check_after = excluded.next_check_after, updated_at = excluded.updated_at
+                failure_count = excluded.failure_count, last_error = excluded.last_error, last_failure_at = excluded.last_failure_at, retry_after = excluded.retry_after, next_check_after = excluded.next_check_after, updated_at = excluded.updated_at
             """,
-            (str(source), normalize_path_for_match(source), guess_media_type(source), source.stat().st_size if source.exists() else 0, source.stat().st_mtime_ns if source.exists() else 0, source.suffix.lower(), str(source.parent), decision, "repeated_ffmpeg_failure" if decision == "blocked" else "ffmpeg_failed", policy_hash(config), failure_count, error, retry_text, next_check_after, now),
+            (str(source), normalize_path_for_match(source), guess_media_type(source), source.stat().st_size if source.exists() else 0, source.stat().st_mtime_ns if source.exists() else 0, source.suffix.lower(), str(source.parent), decision, "repeated_ffmpeg_failure" if decision == "blocked" else "ffmpeg_failed", policy_hash(config), failure_count, error, now, retry_text, next_check_after, now),
         )
     log_event(config, "file_state_updated", source_path=str(source), state=decision, reason="repeated_ffmpeg_failure" if decision == "blocked" else "ffmpeg_failed")
     refresh_folder_state_upwards(config, source)
@@ -2765,34 +2795,28 @@ class SimpleRipperApp:
     def pick_next_candidate(self, candidates: list[Path]) -> Path | None:
         if not candidates:
             return None
-        probe_limit = int((scan_cache_settings(self.config).get("max_deep_checks_per_cycle") if scan_cache_enabled(self.config) else None) or ((self.config.get("scan") or {}).get("priority_probe_limit") or 12))
-        probe_limit = max(1, probe_limit)
-        inspected: list[dict[str, Any]] = []
-        for candidate in candidates[:probe_limit]:
+        for candidate in candidates:
+            self.set_phase("probing_candidate", candidate)
+            log_event(self.config, "candidate_selected", source_path=str(candidate))
+            log_event(self.config, "candidate_probe_start", source_path=str(candidate))
             details = inspect_candidate(self.config, candidate, self.media_type_for_source(candidate))
             update_cache_deep_check(self.config, details)
+            log_event(
+                self.config,
+                "candidate_probe_done",
+                source_path=str(candidate),
+                status=details.get("status"),
+                skip_reason=details.get("skip_reason"),
+                candidate_reason=details.get("candidate_reason"),
+                score=details.get("score"),
+            )
             if details.get("status") != "ok":
                 log_event(self.config, "candidate_probe_failed", source_path=str(candidate), error=details.get("error"))
                 continue
             if details.get("skip_reason"):
                 log_event(self.config, "candidate_scan_skipped", source_path=str(candidate), reason=details.get("skip_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"), retention_size_policy=details.get("retention_size_policy"))
                 continue
-            inspected.append(details)
-        if inspected:
-            inspected.sort(key=candidate_selection_key, reverse=True)
-            best = inspected[0]
-            log_event(self.config, "candidate_ranked", source_path=str(best["path"]), score=best.get("score"), codec=(best.get("metadata") or {}).get("video_codec"), candidate_reason=best.get("candidate_reason"), profile_mismatch_reasons=best.get("profile_mismatch_reasons"), retention_size_policy=best.get("retention_size_policy"))
-            return Path(best["path"])
-        for candidate in candidates[probe_limit:]:
-            details = inspect_candidate(self.config, candidate, self.media_type_for_source(candidate))
-            update_cache_deep_check(self.config, details)
-            if details.get("status") != "ok":
-                log_event(self.config, "candidate_probe_failed", source_path=str(candidate), error=details.get("error"))
-                continue
-            if details.get("skip_reason"):
-                log_event(self.config, "candidate_scan_skipped", source_path=str(candidate), reason=details.get("skip_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"), retention_size_policy=details.get("retention_size_policy"))
-                continue
-            log_event(self.config, "candidate_ranked_fallback", source_path=str(details["path"]), score=details.get("score"), codec=(details.get("metadata") or {}).get("video_codec"), candidate_reason=details.get("candidate_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"), retention_size_policy=details.get("retention_size_policy"))
+            log_event(self.config, "candidate_ready", source_path=str(details["path"]), score=details.get("score"), codec=(details.get("metadata") or {}).get("video_codec"), candidate_reason=details.get("candidate_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"), retention_size_policy=details.get("retention_size_policy"))
             return Path(details["path"])
         return None
 
@@ -2806,12 +2830,15 @@ class SimpleRipperApp:
                     self.reset_runtime_state(clear_errors=False)
                     break
                 log_event(self.config, "scan_start", folders=[str(path) for path in folders])
+                self.set_phase("scanning_inventory")
                 candidates = scan_candidates(folders, self.config)
+                self.set_phase("loading_queue")
                 log_event(self.config, "scan_end", candidates=len(candidates))
                 if not candidates:
                     if not self.schedule_rescan_wait(3600, "no_candidates"):
                         break
                     continue
+                self.set_phase("selecting_candidate")
                 candidate = self.pick_next_candidate(candidates)
                 if candidate is None:
                     if scan_cache_enabled(self.config) and cached_candidate_paths(self.config):
@@ -2930,7 +2957,7 @@ class SimpleRipperApp:
                     self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "ffmpeg_pid": self._ffmpeg.pid, **recovery_context})
                     if force:
                         terminate_process_gracefully(self._ffmpeg)
-                        raise RuntimeError("force stop requested")
+                        raise ForceStopRequested("force stop requested")
                     time.sleep(0.5)
                 progress_thread.join(timeout=1)
                 if self._ffmpeg.returncode != 0:

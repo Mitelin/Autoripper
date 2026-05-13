@@ -662,6 +662,55 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertFalse(simpleripper.current_job_path(config).exists())
             self.assertFalse((Path(config["paths"]["local_work_dir"]) / "current").exists())
 
+    def test_process_one_force_stop_during_encoding_cleans_current_job_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 4096)
+
+            class FakeProcess:
+                def __init__(self, command: list[str]) -> None:
+                    self.stdout = io.StringIO("")
+                    self.pid = 4242
+                    self.returncode = 0
+                    self._terminated = False
+                    Path(command[-1]).write_bytes(b"encoded-output")
+
+                def poll(self) -> int | None:
+                    app.state.force_stop = True
+                    return None if not self._terminated else 0
+
+                def terminate(self) -> None:
+                    self._terminated = True
+
+                def wait(self, timeout: float | None = None) -> int:
+                    self._terminated = True
+                    return 0
+
+                def kill(self) -> None:
+                    self._terminated = True
+
+            def fake_popen(command: list[str], stdout: object = None, stderr: object = None, text: bool = True, encoding: str = "utf-8", errors: str = "replace") -> FakeProcess:
+                return FakeProcess(command)
+
+            def fake_probe(test_config: dict, path: Path, media_type: str) -> tuple[dict, dict]:
+                return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "h264", "video_pix_fmt": "yuv420p", "overall_bitrate_kbps": 4000}
+
+            with patch("simpleripper.subprocess.Popen", side_effect=fake_popen), patch("simpleripper.ffprobe_metadata", side_effect=fake_probe):
+                app.process_one(source)
+
+            status = app.status()
+            self.assertEqual(status["current_phase"], "idle")
+            self.assertFalse(status["force_stop"])
+            self.assertEqual(status["errors"], [])
+            self.assertFalse(simpleripper.current_job_path(config).exists())
+            self.assertFalse((Path(config["paths"]["local_work_dir"]) / "current").exists())
+            self.assertFalse(Path(config["paths"]["inspection_dir"]).exists())
+            self.assertFalse(simpleripper.temp_upload_path(simpleripper.target_output_path(source)).exists())
+
     def test_run_loop_waits_one_hour_when_no_usable_job_is_found(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -862,6 +911,98 @@ class SimpleRipperTests(unittest.TestCase):
                 selected = app.pick_next_candidate([large, small])
 
             self.assertEqual(selected, large)
+
+    def test_pick_next_candidate_stops_after_first_usable_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            first = root / "library" / "first.mkv"
+            second = root / "library" / "second.mkv"
+            first.parent.mkdir(parents=True, exist_ok=True)
+            first.write_bytes(b"x" * 20)
+            second.write_bytes(b"x" * 10)
+            inspected: list[Path] = []
+
+            def fake_inspect(_config: dict, source: Path, _media_type: str) -> dict:
+                inspected.append(source)
+                return {"path": source, "status": "ok", "metadata": {"file_size_bytes": source.stat().st_size, "video_codec": "h264"}, "score": 1.0, "skip_reason": None}
+
+            with patch("simpleripper.inspect_candidate", side_effect=fake_inspect):
+                selected = app.pick_next_candidate([first, second])
+
+            self.assertEqual(selected, first)
+            self.assertEqual(inspected, [first])
+
+    def test_pick_next_candidate_lazily_skips_invalid_first_then_returns_second(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            first = root / "library" / "first.mkv"
+            second = root / "library" / "second.mkv"
+            third = root / "library" / "third.mkv"
+            first.parent.mkdir(parents=True, exist_ok=True)
+            first.write_bytes(b"x" * 30)
+            second.write_bytes(b"x" * 20)
+            third.write_bytes(b"x" * 10)
+            inspected: list[Path] = []
+
+            def fake_inspect(_config: dict, source: Path, _media_type: str) -> dict:
+                inspected.append(source)
+                if source == first:
+                    return {"path": source, "status": "ok", "metadata": {"file_size_bytes": source.stat().st_size}, "score": 0.0, "skip_reason": "already ok"}
+                return {"path": source, "status": "ok", "metadata": {"file_size_bytes": source.stat().st_size, "video_codec": "h264"}, "score": 5.0, "skip_reason": None}
+
+            with patch("simpleripper.inspect_candidate", side_effect=fake_inspect):
+                selected = app.pick_next_candidate([first, second, third])
+
+            self.assertEqual(selected, second)
+            self.assertEqual(inspected, [first, second])
+
+    def test_lazy_deep_check_failure_uses_cooldown_then_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "broken.mkv"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(b"x" * 20)
+            simpleripper.fast_inventory_scan([source.parent], config)
+
+            with patch("simpleripper.inspect_candidate", return_value={"path": source, "status": "ffprobe_failed", "error": "probe crashed"}):
+                selected = app.pick_next_candidate([source])
+
+            self.assertIsNone(selected)
+            with simpleripper.open_worker_cache(config) as connection:
+                row = connection.execute("SELECT decision, failure_count, last_error, last_failure_at, retry_after FROM file_index WHERE path = ?", (str(source),)).fetchone()
+            self.assertEqual(row["decision"], "failed")
+            self.assertEqual(row["failure_count"], 1)
+            self.assertEqual(row["last_error"], "probe crashed")
+            self.assertTrue(row["last_failure_at"])
+            self.assertTrue(row["retry_after"])
+            self.assertEqual(simpleripper.cached_candidate_paths(config, [source.parent]), [])
+
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET retry_after = ?, failure_count = 1 WHERE path = ?", ("2000-01-01T00:00:00+00:00", str(source)))
+
+            self.assertEqual(simpleripper.cached_candidate_paths(config, [source.parent]), [source])
+
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET retry_after = ?, failure_count = 2 WHERE path = ?", ("2000-01-01T00:00:00+00:00", str(source)))
+
+            with patch("simpleripper.inspect_candidate", return_value={"path": source, "status": "ffprobe_failed", "error": "probe crashed again"}):
+                selected = app.pick_next_candidate([source])
+
+            self.assertIsNone(selected)
+            with simpleripper.open_worker_cache(config) as connection:
+                blocked_row = connection.execute("SELECT decision, failure_count, last_error, retry_after FROM file_index WHERE path = ?", (str(source),)).fetchone()
+            self.assertEqual(blocked_row["decision"], "blocked")
+            self.assertEqual(blocked_row["failure_count"], 3)
+            self.assertEqual(blocked_row["last_error"], "probe crashed again")
+            self.assertIsNone(blocked_row["retry_after"])
+            self.assertEqual(simpleripper.cached_candidate_paths(config, [source.parent]), [])
 
     def test_pick_next_candidate_returns_none_when_no_usable_job_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
