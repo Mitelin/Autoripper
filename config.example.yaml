@@ -36,6 +36,7 @@ scan:
     - .mov
   processed_marker_suffix: .simpleripper.done.json
   lock_suffix: .simpleripper.lock
+  folder_clean_requires_full_inventory: true
   exclude_paths:
     - /.ripper_state/
     - /.ripper_quarantine/
@@ -49,6 +50,7 @@ scan_cache:
   fast_inventory_rescan_hours: 24
   folder_state_cache_enabled: true
   skip_clean_folders: true
+  folder_clean_requires_full_inventory: true
   max_deep_checks_per_cycle: 50
   queue_size: 25
   failed_retry_hours: 24

@@ -252,13 +252,88 @@ class SimpleRipperTests(unittest.TestCase):
             simpleripper.fast_inventory_scan([root / "library"], config)
             with simpleripper.open_worker_cache(config) as connection:
                 connection.execute("UPDATE file_index SET decision = 'skip', decision_reason = 'already_hevc', policy_hash = ? WHERE path = ?", (simpleripper.policy_hash(config), str(episode)))
-            simpleripper.refresh_folder_state_upwards(config, episode)
+            simpleripper.fast_inventory_scan([root / "library"], config)
 
             with patch("simpleripper.direct_video_files", side_effect=AssertionError("clean season should not be opened")):
                 result = simpleripper.fast_inventory_scan([season], config)
 
             self.assertEqual(result["skipped_folders"], 1)
             self.assertEqual(simpleripper.worker_cache_summary(config)["folder_states"]["clean"], 4)
+
+    def test_parent_not_clean_when_child_folder_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30, "folder_clean_requires_full_inventory": True}
+            serialy = root / "library" / "SERIALY"
+            folder_a = serialy / "A"
+            folder_b = serialy / "B"
+            folder_a.mkdir(parents=True)
+            folder_b.mkdir(parents=True)
+            file_a = folder_a / "a.mkv"
+            file_b = folder_b / "b.mkv"
+            file_a.write_bytes(b"a" * 10)
+            file_b.write_bytes(b"b" * 10)
+            simpleripper.fast_inventory_scan([folder_a], config)
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET decision = 'skip', decision_reason = 'already_hevc', policy_hash = ? WHERE path = ?", (simpleripper.policy_hash(config), str(file_a)))
+            simpleripper.fast_inventory_scan([folder_a], config)
+
+            with simpleripper.open_worker_cache(config) as connection:
+                simpleripper.refresh_folder_state(connection, serialy, config, "test-generation")
+                row = connection.execute("SELECT state, unknown_files, child_folders_unknown, scan_complete FROM folder_index WHERE path = ?", (str(serialy),)).fetchone()
+
+            self.assertEqual(row["state"], "partial")
+            self.assertGreaterEqual(row["child_folders_unknown"], 1)
+            self.assertEqual(row["scan_complete"], 0)
+
+            simpleripper.fast_inventory_scan([folder_b], config)
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET decision = 'skip', decision_reason = 'already_hevc', policy_hash = ? WHERE path = ?", (simpleripper.policy_hash(config), str(file_b)))
+            simpleripper.fast_inventory_scan([serialy], config)
+
+            with simpleripper.open_worker_cache(config) as connection:
+                row = connection.execute("SELECT state, child_folders_clean, child_folders_total, scan_complete FROM folder_index WHERE path = ?", (str(serialy),)).fetchone()
+
+            self.assertEqual(row["state"], "clean")
+            self.assertEqual(row["child_folders_clean"], 2)
+            self.assertEqual(row["child_folders_total"], 2)
+            self.assertEqual(row["scan_complete"], 1)
+
+    def test_interrupted_inventory_does_not_promote_ancestors_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30, "folder_clean_requires_full_inventory": True}
+            serialy = root / "library" / "SERIALY"
+            folder_a = serialy / "A"
+            folder_b = serialy / "B"
+            folder_a.mkdir(parents=True)
+            folder_b.mkdir(parents=True)
+            file_a = folder_a / "a.mkv"
+            file_b = folder_b / "b.mkv"
+            file_a.write_bytes(b"a" * 10)
+            file_b.write_bytes(b"b" * 10)
+            simpleripper.fast_inventory_scan([serialy], config)
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET decision = 'skip', decision_reason = 'already_hevc', policy_hash = ?", (simpleripper.policy_hash(config),))
+
+            original_direct_video_files = simpleripper.direct_video_files
+
+            def fail_on_b(folder: Path, test_config: dict) -> list[Path]:
+                if folder == folder_b:
+                    raise RuntimeError("scan interrupted")
+                return original_direct_video_files(folder, test_config)
+
+            with patch("simpleripper.direct_video_files", side_effect=fail_on_b):
+                with self.assertRaises(RuntimeError):
+                    simpleripper.fast_inventory_scan([serialy], config)
+
+            with simpleripper.open_worker_cache(config) as connection:
+                row = connection.execute("SELECT state, scan_complete FROM folder_index WHERE path = ?", (str(serialy),)).fetchone()
+
+            self.assertNotEqual(row["state"], "clean")
+            self.assertEqual(row["scan_complete"], 0)
 
     def test_new_file_invalidates_clean_folder_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

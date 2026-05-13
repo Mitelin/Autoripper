@@ -143,6 +143,7 @@ def scan_cache_settings(config: dict[str, Any]) -> dict[str, Any]:
         "blocked_retry_days": float(settings.get("blocked_retry_days", 30)),
         "folder_state_cache_enabled": bool(settings.get("folder_state_cache_enabled", scan_settings.get("folder_state_cache_enabled", True))),
         "skip_clean_folders": bool(settings.get("skip_clean_folders", scan_settings.get("skip_clean_folders", True))),
+        "folder_clean_requires_full_inventory": bool(settings.get("folder_clean_requires_full_inventory", scan_settings.get("folder_clean_requires_full_inventory", True))),
     }
 
 
@@ -237,12 +238,37 @@ def initialize_worker_cache(connection: sqlite3.Connection) -> None:
             direct_latest_mtime_ns INTEGER NOT NULL DEFAULT 0,
             child_dir_count INTEGER NOT NULL DEFAULT 0,
             children_clean INTEGER NOT NULL DEFAULT 0,
+            total_relevant_files INTEGER NOT NULL DEFAULT 0,
+            terminal_files INTEGER NOT NULL DEFAULT 0,
+            unknown_files INTEGER NOT NULL DEFAULT 0,
+            failed_retry_blocked_files INTEGER NOT NULL DEFAULT 0,
+            child_folders_total INTEGER NOT NULL DEFAULT 0,
+            child_folders_clean INTEGER NOT NULL DEFAULT 0,
+            child_folders_unknown INTEGER NOT NULL DEFAULT 0,
+            scan_complete INTEGER NOT NULL DEFAULT 0,
+            inventory_generation_id TEXT,
+            last_error TEXT,
             policy_hash TEXT,
             checked_at TEXT,
             updated_at TEXT
         )
         """
     )
+    existing_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(folder_index)").fetchall()}
+    for column_name, definition in {
+        "total_relevant_files": "INTEGER NOT NULL DEFAULT 0",
+        "terminal_files": "INTEGER NOT NULL DEFAULT 0",
+        "unknown_files": "INTEGER NOT NULL DEFAULT 0",
+        "failed_retry_blocked_files": "INTEGER NOT NULL DEFAULT 0",
+        "child_folders_total": "INTEGER NOT NULL DEFAULT 0",
+        "child_folders_clean": "INTEGER NOT NULL DEFAULT 0",
+        "child_folders_unknown": "INTEGER NOT NULL DEFAULT 0",
+        "scan_complete": "INTEGER NOT NULL DEFAULT 0",
+        "inventory_generation_id": "TEXT",
+        "last_error": "TEXT",
+    }.items():
+        if column_name not in existing_columns:
+            connection.execute(f"ALTER TABLE folder_index ADD COLUMN {column_name} {definition}")
 
 
 def scan_state_get(config: dict[str, Any], key: str) -> str | None:
@@ -274,6 +300,26 @@ def clear_worker_failures(config: dict[str, Any]) -> None:
             "UPDATE file_index SET decision = NULL, decision_reason = NULL, failure_count = 0, last_error = NULL, retry_after = NULL, next_check_after = NULL WHERE decision IN ('failed', 'blocked')"
         )
         connection.execute("UPDATE folder_index SET state = 'dirty', reason = 'failures_cleared', checked_at = ?, updated_at = ?", (utc_now(), utc_now()))
+
+
+def clear_worker_folder_cache(config: dict[str, Any]) -> None:
+    with open_worker_cache(config) as connection:
+        connection.execute("DELETE FROM folder_index")
+        for key in ("last_skipped_folder", "last_completed_inventory_generation_id", "current_inventory_generation_id"):
+            connection.execute("DELETE FROM scan_state WHERE key = ?", (key,))
+
+
+def clear_worker_file_cache(config: dict[str, Any]) -> None:
+    with open_worker_cache(config) as connection:
+        connection.execute("DELETE FROM file_index")
+        connection.execute("DELETE FROM folder_index")
+        for key in ("last_fast_inventory_scan_at", "last_policy_hash", "last_skipped_folder", "last_completed_inventory_generation_id", "current_inventory_generation_id"):
+            connection.execute("DELETE FROM scan_state WHERE key = ?", (key,))
+
+
+def clear_worker_candidate_queue(config: dict[str, Any]) -> None:
+    with open_worker_cache(config) as connection:
+        connection.execute("UPDATE file_index SET decision = NULL, decision_reason = NULL, estimated_saved_bytes = NULL, updated_at = ? WHERE decision = 'encode_candidate'", (utc_now(),))
 
 
 def worker_cache_summary(config: dict[str, Any]) -> dict[str, Any]:
@@ -1017,7 +1063,7 @@ def direct_folder_signature(folder: Path, config: dict[str, Any]) -> dict[str, i
     try:
         children = list(folder.iterdir())
     except OSError:
-        return {"direct_file_count": 0, "direct_total_size": 0, "direct_latest_mtime_ns": 0, "child_dir_count": 0}
+        return {"direct_file_count": 0, "direct_total_size": 0, "direct_latest_mtime_ns": 0, "child_dir_count": 0, "listing_error": 1}
     for child in children:
         if path_is_scan_excluded(child, config):
             continue
@@ -1040,13 +1086,35 @@ def direct_folder_signature(folder: Path, config: dict[str, Any]) -> dict[str, i
         "direct_total_size": direct_total_size,
         "direct_latest_mtime_ns": direct_latest_mtime_ns,
         "child_dir_count": child_dir_count,
+        "listing_error": 0,
     }
 
 
 def folder_signature_matches(row: sqlite3.Row | None, signature: dict[str, int], current_policy_hash: str) -> bool:
-    if not row or str(row["state"]) != "clean" or str(row["policy_hash"] or "") != current_policy_hash:
+    if signature.get("listing_error") or not row or str(row["state"]) != "clean" or str(row["policy_hash"] or "") != current_policy_hash:
         return False
     return all(int(row[key]) == int(signature[key]) for key in ("direct_file_count", "direct_total_size", "direct_latest_mtime_ns", "child_dir_count"))
+
+
+def folder_cache_valid_for_skip(config: dict[str, Any], row: sqlite3.Row | None, signature: dict[str, int], current_policy_hash: str, completed_generation_id: str | None) -> bool:
+    if not folder_signature_matches(row, signature, current_policy_hash) or not row or int(row["scan_complete"] or 0) != 1:
+        return False
+    if scan_cache_settings(config).get("folder_clean_requires_full_inventory") and str(row["inventory_generation_id"] or "") != str(completed_generation_id or ""):
+        return False
+    return True
+
+
+def folder_summary_from_row(row: sqlite3.Row) -> dict[str, int | bool]:
+    return {
+        "total_relevant_files": int(row["total_relevant_files"] or 0),
+        "terminal_files": int(row["terminal_files"] or 0),
+        "unknown_files": int(row["unknown_files"] or 0),
+        "failed_retry_blocked_files": int(row["failed_retry_blocked_files"] or 0),
+        "child_folders_total": int(row["child_folders_total"] or 0),
+        "child_folders_clean": int(row["child_folders_clean"] or 0),
+        "child_folders_unknown": int(row["child_folders_unknown"] or 0),
+        "scan_complete": bool(row["scan_complete"]),
+    }
 
 
 def direct_child_dirs(folder: Path, config: dict[str, Any]) -> list[Path]:
@@ -1065,22 +1133,23 @@ def direct_video_files(folder: Path, config: dict[str, Any]) -> list[Path]:
     return sorted(files, key=lambda item: item.name.casefold())
 
 
-def child_folder_cache_clean(connection: sqlite3.Connection, folder: Path, config: dict[str, Any], current_policy_hash: str) -> bool:
+def child_folder_cache_clean(connection: sqlite3.Connection, folder: Path, config: dict[str, Any], current_policy_hash: str, completed_generation_id: str | None) -> bool:
     for child in direct_child_dirs(folder, config):
         row = connection.execute("SELECT * FROM folder_index WHERE path = ?", (str(child),)).fetchone()
-        if not folder_signature_matches(row, direct_folder_signature(child, config), current_policy_hash):
+        if not folder_cache_valid_for_skip(config, row, direct_folder_signature(child, config), current_policy_hash, completed_generation_id):
             return False
-        if not child_folder_cache_clean(connection, child, config, current_policy_hash):
+        if not child_folder_cache_clean(connection, child, config, current_policy_hash, completed_generation_id):
             return False
     return True
 
 
-def update_folder_state_row(connection: sqlite3.Connection, folder: Path, config: dict[str, Any], state: str, reason: str, signature: dict[str, int], children_clean: bool) -> None:
+def update_folder_state_row(connection: sqlite3.Connection, folder: Path, config: dict[str, Any], state: str, reason: str, signature: dict[str, int], children_clean: bool, summary: dict[str, int | bool] | None = None, inventory_generation_id: str | None = None, last_error: str | None = None) -> None:
     now = utc_now()
+    summary = summary or {}
     connection.execute(
         """
-        INSERT INTO folder_index(path, normalized_path, state, reason, direct_file_count, direct_total_size, direct_latest_mtime_ns, child_dir_count, children_clean, policy_hash, checked_at, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO folder_index(path, normalized_path, state, reason, direct_file_count, direct_total_size, direct_latest_mtime_ns, child_dir_count, children_clean, total_relevant_files, terminal_files, unknown_files, failed_retry_blocked_files, child_folders_total, child_folders_clean, child_folders_unknown, scan_complete, inventory_generation_id, last_error, policy_hash, checked_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             normalized_path = excluded.normalized_path,
             state = excluded.state,
@@ -1090,51 +1159,102 @@ def update_folder_state_row(connection: sqlite3.Connection, folder: Path, config
             direct_latest_mtime_ns = excluded.direct_latest_mtime_ns,
             child_dir_count = excluded.child_dir_count,
             children_clean = excluded.children_clean,
+            total_relevant_files = excluded.total_relevant_files,
+            terminal_files = excluded.terminal_files,
+            unknown_files = excluded.unknown_files,
+            failed_retry_blocked_files = excluded.failed_retry_blocked_files,
+            child_folders_total = excluded.child_folders_total,
+            child_folders_clean = excluded.child_folders_clean,
+            child_folders_unknown = excluded.child_folders_unknown,
+            scan_complete = excluded.scan_complete,
+            inventory_generation_id = excluded.inventory_generation_id,
+            last_error = excluded.last_error,
             policy_hash = excluded.policy_hash,
             checked_at = excluded.checked_at,
             updated_at = excluded.updated_at
         """,
-        (str(folder), normalize_path_for_match(folder), state, reason, int(signature["direct_file_count"]), int(signature["direct_total_size"]), int(signature["direct_latest_mtime_ns"]), int(signature["child_dir_count"]), 1 if children_clean else 0, policy_hash(config), now, now),
+        (
+            str(folder), normalize_path_for_match(folder), state, reason, int(signature["direct_file_count"]), int(signature["direct_total_size"]), int(signature["direct_latest_mtime_ns"]), int(signature["child_dir_count"]), 1 if children_clean else 0,
+            int(summary.get("total_relevant_files") or 0), int(summary.get("terminal_files") or 0), int(summary.get("unknown_files") or 0), int(summary.get("failed_retry_blocked_files") or 0), int(summary.get("child_folders_total") or 0), int(summary.get("child_folders_clean") or 0), int(summary.get("child_folders_unknown") or 0), 1 if summary.get("scan_complete") else 0,
+            inventory_generation_id, last_error, policy_hash(config), now, now,
+        ),
     )
-    log_event(config, "folder_state_updated", folder=str(folder), state=state, reason=reason)
+    if state == "clean":
+        log_event(config, "folder_state_updated", folder=str(folder), state=state, reason=reason, total_files=int(summary.get("total_relevant_files") or 0), terminal_files=int(summary.get("terminal_files") or 0), child_folders_clean=int(summary.get("child_folders_clean") or 0), child_folders_total=int(summary.get("child_folders_total") or 0), generation_id=inventory_generation_id)
+    else:
+        log_event(config, "folder_state_updated", folder=str(folder), state=state, reason=reason, unknown_files=int(summary.get("unknown_files") or 0), unclean_child_count=int(summary.get("child_folders_unknown") or 0), scan_complete=bool(summary.get("scan_complete")), generation_id=inventory_generation_id)
 
 
-def direct_files_are_terminal(connection: sqlite3.Connection, folder: Path, config: dict[str, Any]) -> bool:
+def direct_file_state_summary(connection: sqlite3.Connection, folder: Path, config: dict[str, Any]) -> dict[str, int]:
     current_policy_hash = policy_hash(config)
+    now = utc_now()
+    summary = {"total_relevant_files": 0, "terminal_files": 0, "unknown_files": 0, "failed_retry_blocked_files": 0}
     for file_path in direct_video_files(folder, config):
+        summary["total_relevant_files"] += 1
         marker = marker_path(file_path, config)
         if marker is not None and marker.exists():
+            summary["terminal_files"] += 1
             continue
         if source_lock_path(file_path, config).exists():
-            return False
-        if is_history_done_for_current_source(config, file_path):
+            summary["unknown_files"] += 1
             continue
-        row = connection.execute("SELECT decision, policy_hash FROM file_index WHERE path = ?", (str(file_path),)).fetchone()
-        if not row or str(row["policy_hash"] or "") != current_policy_hash:
-            return False
-        if str(row["decision"] or "") not in {"done", "skip", "blocked"}:
-            return False
-    return True
+        if is_history_done_for_current_source(config, file_path):
+            summary["terminal_files"] += 1
+            continue
+        row = connection.execute("SELECT decision, policy_hash, size_bytes, mtime_ns, retry_after, next_check_after FROM file_index WHERE path = ?", (str(file_path),)).fetchone()
+        try:
+            stat = file_path.stat()
+        except OSError:
+            summary["unknown_files"] += 1
+            continue
+        if not row or str(row["policy_hash"] or "") != current_policy_hash or int(row["size_bytes"] or -1) != int(stat.st_size) or int(row["mtime_ns"] or -1) != int(stat.st_mtime_ns):
+            summary["unknown_files"] += 1
+            continue
+        decision = str(row["decision"] or "")
+        if decision in {"done", "skip"}:
+            summary["terminal_files"] += 1
+        elif decision == "failed" and str(row["retry_after"] or "") > now:
+            summary["terminal_files"] += 1
+            summary["failed_retry_blocked_files"] += 1
+        elif decision == "blocked" and (not row["next_check_after"] or str(row["next_check_after"]) > now):
+            summary["terminal_files"] += 1
+            summary["failed_retry_blocked_files"] += 1
+        else:
+            summary["unknown_files"] += 1
+    return summary
 
 
-def refresh_folder_state(connection: sqlite3.Connection, folder: Path, config: dict[str, Any]) -> str:
+def refresh_folder_state(connection: sqlite3.Connection, folder: Path, config: dict[str, Any], inventory_generation_id: str | None = None) -> str:
     signature = direct_folder_signature(folder, config)
-    child_states = []
+    child_folders = direct_child_dirs(folder, config)
+    child_folders_clean = 0
+    child_folders_unknown = 0
     for child in direct_child_dirs(folder, config):
-        row = connection.execute("SELECT state, policy_hash FROM folder_index WHERE path = ?", (str(child),)).fetchone()
-        child_states.append(str(row["state"] or "") if row and str(row["policy_hash"] or "") == policy_hash(config) else "dirty")
-    children_clean = all(state == "clean" for state in child_states)
-    direct_terminal = direct_files_are_terminal(connection, folder, config)
-    if direct_terminal and children_clean:
+        row = connection.execute("SELECT * FROM folder_index WHERE path = ?", (str(child),)).fetchone()
+        child_signature = direct_folder_signature(child, config)
+        child_current_generation = bool(row) and (not inventory_generation_id or str(row["inventory_generation_id"] or "") == str(inventory_generation_id))
+        if row and child_current_generation and folder_signature_matches(row, child_signature, policy_hash(config)) and int(row["scan_complete"] or 0) == 1:
+            child_folders_clean += 1
+        else:
+            child_folders_unknown += 1
+    file_summary = direct_file_state_summary(connection, folder, config)
+    scan_complete = not bool(signature.get("listing_error")) and child_folders_unknown == 0
+    summary: dict[str, int | bool] = {
+        **file_summary,
+        "child_folders_total": len(child_folders),
+        "child_folders_clean": child_folders_clean,
+        "child_folders_unknown": child_folders_unknown,
+        "scan_complete": scan_complete,
+    }
+    children_clean = child_folders_unknown == 0 and child_folders_clean == len(child_folders)
+    has_required_generation = bool(inventory_generation_id) or not scan_cache_settings(config).get("folder_clean_requires_full_inventory")
+    if has_required_generation and scan_complete and int(summary["unknown_files"]) == 0 and int(summary["terminal_files"]) == int(summary["total_relevant_files"]) and children_clean:
         state = "clean"
         reason = "all_files_done_or_skipped"
-    elif any(state == "blocked" for state in child_states):
-        state = "blocked"
-        reason = "contains_blocked_child"
     else:
         state = "partial"
-        reason = "has_pending_candidates"
-    update_folder_state_row(connection, folder, config, state, reason, signature, children_clean)
+        reason = "requires_full_inventory" if not has_required_generation else "unknown_or_incomplete"
+    update_folder_state_row(connection, folder, config, state, reason, signature, children_clean, summary, inventory_generation_id, "listing_error" if signature.get("listing_error") else None)
     return state
 
 
@@ -1174,13 +1294,15 @@ def refresh_folder_state_upwards(config: dict[str, Any], source: Path) -> None:
 
 def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str, Any]:
     now = utc_now()
+    generation_id = f"{now}-{os.getpid()}"
     seen = 0
     changed = 0
     skipped_folders = 0
     queue_count = 0
     current_policy_hash = policy_hash(config)
     settings = scan_cache_settings(config)
-    log_event(config, "inventory_refresh_started", folders=[str(folder) for folder in folders], cache_path=str(worker_cache_path(config)))
+    completed_generation_id = scan_state_get(config, "last_completed_inventory_generation_id")
+    log_event(config, "inventory_refresh_started", folders=[str(folder) for folder in folders], generation_id=generation_id, cache_path=str(worker_cache_path(config)))
 
     def scan_folder(connection: sqlite3.Connection, folder: Path) -> None:
         nonlocal seen, changed, skipped_folders
@@ -1188,16 +1310,18 @@ def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str
             return
         signature = direct_folder_signature(folder, config)
         row = connection.execute("SELECT * FROM folder_index WHERE path = ?", (str(folder),)).fetchone()
-        if settings.get("skip_clean_folders") and folder_signature_matches(row, signature, current_policy_hash) and child_folder_cache_clean(connection, folder, config, current_policy_hash):
+        if settings.get("skip_clean_folders") and folder_cache_valid_for_skip(config, row, signature, current_policy_hash, completed_generation_id) and child_folder_cache_clean(connection, folder, config, current_policy_hash, completed_generation_id):
             skipped_folders += 1
+            assert row is not None
+            update_folder_state_row(connection, folder, config, "clean", "folder_state_clean", signature, True, folder_summary_from_row(row), generation_id)
             connection.execute(
                 "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 ("last_skipped_folder", str(folder), utc_now()),
             )
-            log_event(config, "folder_scan_skipped", folder=str(folder), reason="folder_state_clean")
+            log_event(config, "folder_scan_skipped", folder=str(folder), reason="folder_state_clean", generation_id=generation_id)
             return
         if row and str(row["state"] or "") == "clean":
-            update_folder_state_row(connection, folder, config, "stale", "signature_or_policy_changed", signature, False)
+            update_folder_state_row(connection, folder, config, "stale", "signature_or_policy_changed", signature, False, {"scan_complete": False}, generation_id)
         for child_dir in direct_child_dirs(folder, config):
             scan_folder(connection, child_dir)
         for path in direct_video_files(folder, config):
@@ -1291,25 +1415,39 @@ def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str
                 (path_text, normalize_path_for_match(path), guess_media_type(path), int(stat.st_size), int(stat.st_mtime_ns), path.suffix.lower(), str(path.parent), float(stat.st_size), decision, decision_reason, decision_policy_hash, failure_count, last_error, retry_after, now, now, now),
             )
             seen += 1
-        refresh_folder_state(connection, folder, config)
+        refresh_folder_state(connection, folder, config, generation_id)
 
-    with open_worker_cache(config) as connection:
-        for folder in folders:
-            scan_folder(connection, folder)
-        connection.execute(
-            "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            ("last_fast_inventory_scan_at", now, now),
-        )
-        connection.execute(
-            "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            ("last_policy_hash", policy_hash(config), now),
-        )
-        queue_row = connection.execute("SELECT COUNT(*) AS count FROM file_index WHERE decision IS NULL OR decision = 'encode_candidate'").fetchone()
-        queue_count = int(queue_row["count"] or 0) if queue_row else 0
-    log_event(config, "inventory_refresh_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, cache_path=str(worker_cache_path(config)))
+    try:
+        with open_worker_cache(config) as connection:
+            connection.execute(
+                "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                ("current_inventory_generation_id", generation_id, now),
+            )
+            for folder in folders:
+                scan_folder(connection, folder)
+            connection.execute(
+                "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                ("last_fast_inventory_scan_at", now, now),
+            )
+            connection.execute(
+                "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                ("last_completed_inventory_generation_id", generation_id, now),
+            )
+            connection.execute(
+                "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                ("last_policy_hash", policy_hash(config), now),
+            )
+            queue_row = connection.execute("SELECT COUNT(*) AS count FROM file_index WHERE decision IS NULL OR decision = 'encode_candidate'").fetchone()
+            queue_count = int(queue_row["count"] or 0) if queue_row else 0
+    except Exception:
+        with open_worker_cache(config) as connection:
+            connection.execute("UPDATE folder_index SET state = 'partial', reason = 'inventory_incomplete', scan_complete = 0, updated_at = ? WHERE inventory_generation_id = ? AND state = 'clean'", (utc_now(), generation_id))
+        log_event(config, "inventory_refresh_incomplete", generation_id=generation_id)
+        raise
+    log_event(config, "inventory_refresh_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, generation_id=generation_id, cache_path=str(worker_cache_path(config)))
     log_event(config, "candidate_queue_refreshed", count=queue_count)
     log_event(config, "fast_inventory_scan_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, cache_path=str(worker_cache_path(config)))
-    return {"indexed_files": seen, "changed_files": changed, "skipped_folders": skipped_folders, "last_fast_inventory_scan_at": now}
+    return {"indexed_files": seen, "changed_files": changed, "skipped_folders": skipped_folders, "generation_id": generation_id, "last_fast_inventory_scan_at": now}
 
 
 def fast_inventory_due(config: dict[str, Any]) -> bool:
@@ -3019,7 +3157,7 @@ def run_server(config: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="simpleripper")
-    parser.add_argument("command", choices=["web", "check-config", "rebuild-index", "cache-summary", "clear-failures", "clear-cache"])
+    parser.add_argument("command", choices=["web", "check-config", "rebuild-index", "cache-summary", "clear-failures", "clear-cache", "clear-folder-cache", "clear-file-cache", "clear-candidate-queue"])
     parser.add_argument("--config", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
@@ -3041,6 +3179,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "clear-cache":
             clear_worker_cache(config)
+            print(json.dumps({"ok": True, "cache": worker_cache_summary(config)}, indent=2))
+            return 0
+        if args.command == "clear-folder-cache":
+            clear_worker_folder_cache(config)
+            print(json.dumps({"ok": True, "cache": worker_cache_summary(config)}, indent=2))
+            return 0
+        if args.command == "clear-file-cache":
+            clear_worker_file_cache(config)
+            print(json.dumps({"ok": True, "cache": worker_cache_summary(config)}, indent=2))
+            return 0
+        if args.command == "clear-candidate-queue":
+            clear_worker_candidate_queue(config)
             print(json.dumps({"ok": True, "cache": worker_cache_summary(config)}, indent=2))
             return 0
         run_server(config)
