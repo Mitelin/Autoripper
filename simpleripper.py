@@ -1293,10 +1293,15 @@ class SimpleRipperApp:
         self._ffmpeg: subprocess.Popen[Any] | None = None
         log_event(self.config, "app_initialized", selected_folders=self.selected_folder_entries, custom_folders=self.custom_folder_entries)
 
+    def can_update(self) -> bool:
+        with self._lock:
+            return not self.state.running and self.state.current_phase == "idle"
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {
                 **self.state.snapshot(),
+                "can_update": (not self.state.running and self.state.current_phase == "idle"),
                 "allowed_roots": [str(path) for path in self.roots],
                 "folder_suggestions": list(self.folder_suggestions),
                 "folder_suggestion_mode": self.folder_suggestion_mode,
@@ -1437,6 +1442,52 @@ class SimpleRipperApp:
         with self._lock:
             folders = list(self.selected_folders)
         return clear_stale_locks(folders, self.config)
+
+    def begin_update(self) -> None:
+        with self._lock:
+            if self.state.running or self.state.current_phase != "idle":
+                raise RuntimeError("Update lze provest pouze kdyz je system idle")
+            self.state.current_phase = "updating"
+            self.state.current_file = None
+            self.state.ffmpeg_progress = None
+            self.state.output_size_bytes = 0
+
+    def perform_update(self, server: ThreadingHTTPServer) -> None:
+        repo_root = Path(__file__).resolve().parent
+        config_path = Path(str(self.config.get("__config_path") or "")).resolve() if self.config.get("__config_path") else None
+        if not config_path:
+            raise RuntimeError("Missing config path for restart")
+        log_event(self.config, "update_started", repo_root=str(repo_root), config_path=str(config_path))
+        completed = subprocess.run(
+            ["git", "pull"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        output = (completed.stdout or completed.stderr or "").strip()
+        if completed.returncode != 0:
+            raise RuntimeError(output or f"git pull failed with exit code {completed.returncode}")
+        if output:
+            log_event(self.config, "update_pulled", output=output)
+        command = [sys.executable, str(Path(__file__).resolve()), "web", "--config", str(config_path)]
+        log_event(self.config, "update_restart_scheduled", command=command)
+        server.shutdown()
+        server.server_close()
+        subprocess.Popen(command, cwd=str(repo_root))
+
+    def start_update(self, server: ThreadingHTTPServer) -> None:
+        def run_update() -> None:
+            try:
+                self.perform_update(server)
+            except Exception as exc:
+                with self._lock:
+                    self.state.current_phase = "idle"
+                self.log_error(f"Update failed: {exc}")
+
+        threading.Thread(target=run_update, name="simpleripper-update", daemon=False).start()
 
     def schedule_rescan_wait(self, delay_seconds: int, reason: str) -> bool:
         deadline = time.time() + max(1, int(delay_seconds))
@@ -1796,6 +1847,10 @@ class SimpleRipperHandler(BaseHTTPRequestHandler):
                 self.send_json(self.app.status())
             elif self.path == "/api/clear-stale-locks":
                 self.send_json({"removed": self.app.clear_stale_locks()})
+            elif self.path == "/api/update":
+                self.app.begin_update()
+                self.send_json(self.app.status())
+                self.app.start_update(self.server)
             else:
                 self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except Exception as exc:
@@ -1813,6 +1868,7 @@ button,input,select,textarea{font:inherit}
 button{border:0;border-radius:14px;padding:11px 16px;font-weight:700;letter-spacing:.02em;cursor:pointer;transition:transform .18s ease,box-shadow .18s ease,background .18s ease,color .18s ease}
 button:hover{transform:translateY(-1px);box-shadow:var(--shadow-soft)}
 button:active{transform:translateY(0)}
+button:disabled{opacity:.45;cursor:not-allowed;filter:saturate(.2);transform:none;box-shadow:none}
 input[type=text],select{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:12px;background:#0f1824;color:var(--text)}
 pre{margin:0;padding:16px 18px;border-radius:18px;background:#09111a;color:#dce9f8;overflow:auto;font-family:Consolas,"Cascadia Mono",monospace;font-size:13px;line-height:1.5}
 .shell{max-width:1320px;margin:0 auto;padding:28px 22px 56px}
@@ -1932,8 +1988,10 @@ function lastSelectedFolderPath(){const first=document.querySelector('#selectedF
 function pickFolder(initialDir=''){post('/api/custom-folder',initialDir?{initial_dir:initialDir}:{})}
 function addManualFolder(){const input=document.getElementById('manualFolderPath');const path=(input&&input.value?input.value:'').trim();if(!path){return}post('/api/custom-folder',{path:path,media_type:guessMediaType(path)});if(input){input.value=''}}
 function removeFolder(path){post('/api/folders',{folders:collectSelectedFolders().filter(item=>item.path!==path)})}
+function ensureUpdateButton(){const controls=document.querySelector('.controls');if(!controls||document.getElementById('updateButton')){return}const button=document.createElement('button');button.className='outline';button.id='updateButton';button.textContent='Update';button.onclick=triggerUpdate;const testModeButton=document.getElementById('testModeButton');if(testModeButton&&testModeButton.parentNode===controls){controls.insertBefore(button,testModeButton)}else{controls.appendChild(button)}}
+function triggerUpdate(){const button=document.getElementById('updateButton');if(button&&button.disabled){return}post('/api/update')}
 function toggleTestMode(){const button=document.getElementById('testModeButton');const enable=!(button&&button.getAttribute('data-enabled')==='true');post('/api/test-mode',{enabled:enable})}
-function render(s){lastStatus=s;const selected=s.selected_folders||[];const combinedErrors=uiError?[{at:'UI',message:uiError},...(s.errors||[])]:[...(s.errors||[])];const warningCount=(combinedErrors.length?1:0)+(s.last_result&&s.last_result.warning?1:0);document.getElementById('status').textContent=JSON.stringify(s,null,2);document.getElementById('current').innerHTML=renderCurrent(s.current_summary);document.getElementById('lastResult').innerHTML=renderLastResult(s.last_result);document.getElementById('errors').innerHTML=combinedErrors.length?combinedErrors.map(e=>`<div class="err">${escapeHtml(e.at||'')}<br>${escapeHtml(e.message||e)}</div>`).join(''):'<p class="muted">No recent app-level errors.</p>';document.getElementById('log').textContent=(s.recent_log_lines||[]).join(String.fromCharCode(10));document.getElementById('logMeta').textContent=`${(s.recent_log_lines||[]).length} lines`;document.getElementById('selectedFolders').innerHTML=selected.length?selected.map(item=>`<div class="simple-item" data-path="${escapeHtml(item.path)}"><div class="simple-main"><div class="simple-title">${escapeHtml(item.path)}</div><div class="simple-sub">Selected for scan</div></div>${mediaTypeSelect(item.media_type||guessMediaType(item.path),'onchange="saveSelectedFolders()"')}<button class="ghost" data-path="${escapeHtml(item.path)}" onclick="removeFolder(this.getAttribute('data-path'))">Remove</button></div>`).join(''):'<div class="empty">No folders selected.</div>';document.getElementById('selectedCount').textContent=String(selected.length);document.getElementById('heroPhase').textContent=escapeHtml((s.current_summary&&s.current_summary.status)||s.current_phase||'Idle');document.getElementById('warningCount').textContent=String(warningCount);document.getElementById('heroSummary').textContent=heroSummary(s);document.getElementById('heroBadges').innerHTML=renderBadges(s);document.getElementById('testModeButton').textContent=s.test_mode?'Test mode ON':'Test mode';document.getElementById('testModeButton').setAttribute('data-enabled',s.test_mode?'true':'false');document.getElementById('testModeBanner').innerHTML=s.test_mode?`<div class="callout info" style="margin-top:14px">${escapeHtml(s.test_mode_message||'Bezi v test modu.')}</div>`:'';document.getElementById('folderSuggestionList').innerHTML=(s.folder_suggestions||[]).map(path=>`<option value="${escapeHtml(path)}"></option>`).join('');document.getElementById('folderPickerHint').textContent=s.folder_suggestion_mode==='linux-mounts'?'Explorer fallback pouziva mount navrhy z linux configu. Sit lze zadat primo jako mount cestu.':'Explorer fallback pouziva Windows roots z configu. Kdyz sit v dialogu chybi, vlozte UNC cestu rucne.'}
+function render(s){lastStatus=s;const selected=s.selected_folders||[];const combinedErrors=uiError?[{at:'UI',message:uiError},...(s.errors||[])]:[...(s.errors||[])];const warningCount=(combinedErrors.length?1:0)+(s.last_result&&s.last_result.warning?1:0);document.getElementById('status').textContent=JSON.stringify(s,null,2);document.getElementById('current').innerHTML=renderCurrent(s.current_summary);document.getElementById('lastResult').innerHTML=renderLastResult(s.last_result);document.getElementById('errors').innerHTML=combinedErrors.length?combinedErrors.map(e=>`<div class="err">${escapeHtml(e.at||'')}<br>${escapeHtml(e.message||e)}</div>`).join(''):'<p class="muted">No recent app-level errors.</p>';document.getElementById('log').textContent=(s.recent_log_lines||[]).join(String.fromCharCode(10));document.getElementById('logMeta').textContent=`${(s.recent_log_lines||[]).length} lines`;document.getElementById('selectedFolders').innerHTML=selected.length?selected.map(item=>`<div class="simple-item" data-path="${escapeHtml(item.path)}"><div class="simple-main"><div class="simple-title">${escapeHtml(item.path)}</div><div class="simple-sub">Selected for scan</div></div>${mediaTypeSelect(item.media_type||guessMediaType(item.path),'onchange="saveSelectedFolders()"')}<button class="ghost" data-path="${escapeHtml(item.path)}" onclick="removeFolder(this.getAttribute('data-path'))">Remove</button></div>`).join(''):'<div class="empty">No folders selected.</div>';document.getElementById('selectedCount').textContent=String(selected.length);document.getElementById('heroPhase').textContent=escapeHtml((s.current_summary&&s.current_summary.status)||s.current_phase||'Idle');document.getElementById('warningCount').textContent=String(warningCount);document.getElementById('heroSummary').textContent=heroSummary(s);document.getElementById('heroBadges').innerHTML=renderBadges(s);ensureUpdateButton();document.getElementById('updateButton').disabled=!s.can_update;document.getElementById('updateButton').textContent=s.current_phase==='updating'?'Updating...':'Update';document.getElementById('testModeButton').textContent=s.test_mode?'Test mode ON':'Test mode';document.getElementById('testModeButton').setAttribute('data-enabled',s.test_mode?'true':'false');document.getElementById('testModeBanner').innerHTML=s.test_mode?`<div class="callout info" style="margin-top:14px">${escapeHtml(s.test_mode_message||'Bezi v test modu.')}</div>`:'';document.getElementById('folderSuggestionList').innerHTML=(s.folder_suggestions||[]).map(path=>`<option value="${escapeHtml(path)}"></option>`).join('');document.getElementById('folderPickerHint').textContent=s.folder_suggestion_mode==='linux-mounts'?'Explorer fallback pouziva mount navrhy z linux configu. Sit lze zadat primo jako mount cestu.':'Explorer fallback pouziva Windows roots z configu. Kdyz sit v dialogu chybi, vlozte UNC cestu rucne.'}
 setInterval(getStatus,1500);getStatus();
 </script></body></html>"""
 

@@ -362,9 +362,62 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(status["current_summary"]["status"], "encoding")
             self.assertEqual(status["current_summary"]["progress_time"], "00:10:00")
             self.assertEqual(status["current_summary"]["progress_percent"], 25.0)
+            self.assertFalse(status["can_update"])
             self.assertEqual(status["last_result"]["bytes_saved"], 600)
             self.assertEqual(status["last_result"]["warning"], "warn")
             self.assertEqual(status["last_result"]["jellyfin_status"], "ok")
+
+    def test_status_allows_update_only_when_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+
+            self.assertTrue(app.status()["can_update"])
+
+            app.state.current_phase = "waiting_for_rescan"
+            self.assertFalse(app.status()["can_update"])
+
+    def test_begin_update_requires_idle_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            app.state.running = True
+
+            with self.assertRaises(RuntimeError):
+                app.begin_update()
+
+    def test_perform_update_pulls_and_restarts_server(self) -> None:
+        class FakeServer:
+            def __init__(self) -> None:
+                self.shutdown_called = False
+                self.server_close_called = False
+
+            def shutdown(self) -> None:
+                self.shutdown_called = True
+
+            def server_close(self) -> None:
+                self.server_close_called = True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = root / "config.yaml"
+            config_path.write_text(yaml.safe_dump(self.make_config(root), sort_keys=False), encoding="utf-8")
+            config = simpleripper.load_config(config_path)
+            app = simpleripper.SimpleRipperApp(config)
+            server = FakeServer()
+            pull_result = subprocess.CompletedProcess(args=["git", "pull"], returncode=0, stdout="Already up to date.\n", stderr="")
+
+            with patch("simpleripper.subprocess.run", return_value=pull_result) as mocked_run, patch("simpleripper.subprocess.Popen") as mocked_popen:
+                app.perform_update(server)
+
+            self.assertTrue(server.shutdown_called)
+            self.assertTrue(server.server_close_called)
+            self.assertEqual(mocked_run.call_args.kwargs["cwd"], str(Path(simpleripper.__file__).resolve().parent))
+            restart_command = mocked_popen.call_args.args[0]
+            self.assertEqual(restart_command[0], simpleripper.sys.executable)
+            self.assertEqual(restart_command[2:], ["web", "--config", str(config_path.resolve())])
 
     def test_status_exposes_test_mode_message_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
