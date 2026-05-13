@@ -589,6 +589,23 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertTrue(quarantine.exists())
             self.assertIn(str(root / "quarantine" / "Movies" / "A"), str(quarantine))
 
+    def test_quarantine_path_can_use_configured_relative_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            quarantine_root = root / ".simpleripper_quarantine"
+            relative_root = root / "nas-backup"
+            source = relative_root / "SERIALY" / "Czech" / "Fallout" / "file.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_text("original", encoding="utf-8")
+            config = self.make_config(root)
+            config["paths"]["quarantine_dir"] = str(quarantine_root)
+            config["paths"]["quarantine_relative_root"] = str(relative_root)
+            config["libraries"]["roots"] = [str(relative_root / "SERIALY")]
+
+            quarantine = simpleripper.quarantine_path_for_source(source, config)
+
+            self.assertTrue(str(quarantine).startswith(str(quarantine_root / "SERIALY" / "Czech" / "Fallout" / "file.mkv")))
+
     def test_rollback_replacement_restores_quarantined_original(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

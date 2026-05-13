@@ -928,6 +928,19 @@ def temp_upload_path(source: Path) -> Path:
 
 def quarantine_path_for_source(source: Path, config: dict[str, Any]) -> Path:
     root = Path(str((config.get("paths") or {}).get("quarantine_dir") or "quarantine"))
+    relative_root_text = str((config.get("paths") or {}).get("quarantine_relative_root") or "").strip()
+    if relative_root_text:
+        try:
+            relative_root = Path(relative_root_text).resolve()
+            relative = source.resolve().relative_to(relative_root)
+            return root / relative.with_name(relative.name + f".{int(time.time())}.original")
+        except ValueError:
+            log_event(
+                config,
+                "quarantine_relative_root_outside_source",
+                source_path=str(source),
+                quarantine_relative_root=relative_root_text,
+            )
     for library_root in [Path(item) for item in ((config.get("libraries") or {}).get("roots") or [])]:
         try:
             relative = source.resolve().relative_to(library_root.resolve())

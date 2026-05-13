@@ -8,6 +8,7 @@ paths:
   history_dir: history
   log_dir: logs
   quarantine_dir: quarantine
+  quarantine_relative_root: ""
   inspection_dir: inspection
   keep_quarantine_after_success: false
   keep_failed_output_for_inspection: true
