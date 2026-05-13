@@ -19,7 +19,7 @@ class SimpleRipperTests(unittest.TestCase):
             "paths": {"local_work_dir": str(root / "work"), "history_dir": str(root / "history"), "log_dir": str(root / "logs"), "quarantine_dir": str(root / "quarantine"), "inspection_dir": str(root / "inspection"), "keep_failed_output_for_inspection": True},
             "tools": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
             "libraries": {"roots": [str(root / "library")]},
-            "scan": {"file_extensions": [".mkv"], "processed_marker_suffix": ".simpleripper.done.json", "lock_suffix": ".simpleripper.lock", "write_sidecar_markers": False},
+            "scan": {"file_extensions": [".mkv"], "processed_marker_suffix": ".simpleripper.done.json", "lock_suffix": ".simpleripper.lock", "write_sidecar_markers": False, "failed_retry_cooldown_hours": 24, "max_failures_per_file": 1},
             "verification": {"max_duration_diff_seconds": 2, "max_output_source_ratio": 0.95, "low_ratio_warning": 0.15},
             "track_policy": {"enabled": True, "target_audio_languages": ["cze"], "drop_other_audio_if_target_found": True, "keep_subtitles": True},
         }
@@ -142,6 +142,33 @@ class SimpleRipperTests(unittest.TestCase):
             candidates = simpleripper.scan_candidates([library], config)
 
             self.assertEqual(candidates, [large, medium, small])
+
+    def test_scan_skips_recent_ffmpeg_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            library = root / "library"
+            library.mkdir()
+            failed = library / "failed.mkv"
+            failed.write_bytes(b"x" * 10)
+            simpleripper.write_history_index(
+                config,
+                failed,
+                {
+                    "status": "error",
+                    "failure_type": "ffmpeg",
+                    "failure_count": 1,
+                    "source_signature": simpleripper.source_signature(failed),
+                    "updated_at": simpleripper.utc_now(),
+                    "error": "ffmpeg failed with exit code 1",
+                },
+            )
+
+            with patch("simpleripper.log_event") as log_mock:
+                candidates = simpleripper.scan_candidates([library], config)
+
+            self.assertEqual(candidates, [])
+            log_mock.assert_any_call(config, "candidate_scan_skipped", source_path=str(failed), reason="recent_ffmpeg_failure", failure_count=1, retry_after=unittest.mock.ANY, error="ffmpeg failed with exit code 1")
 
     def test_set_phase_writes_current_job_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -725,6 +752,34 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("-progress", command)
         self.assertIn("pipe:1", command)
         self.assertIn("-nostats", command)
+
+    def test_build_ffmpeg_command_maps_attachments_without_transcoding_cover_images(self) -> None:
+        command = simpleripper.build_ffmpeg_command(
+            self.make_config(Path(".")),
+            Path("input.mkv"),
+            Path("output.mkv"),
+            {"media_type": "default"},
+            {"map_arguments": ["-map", "0"]},
+        )
+
+        map_pairs = [(command[index], command[index + 1]) for index, value in enumerate(command[:-1]) if value == "-map"]
+        self.assertNotIn(("-map", "0"), map_pairs)
+        self.assertIn(("-map", "0:v:0"), map_pairs)
+        self.assertIn(("-map", "0:a?"), map_pairs)
+        self.assertIn(("-map", "0:s?"), map_pairs)
+        self.assertIn(("-map", "0:t?"), map_pairs)
+        self.assertIn("-c:t", command)
+        self.assertEqual(command[command.index("-c:t") + 1], "copy")
+
+    def test_log_error_deduplicates_by_source_and_failure_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = simpleripper.SimpleRipperApp(self.make_config(Path(temp_dir)))
+
+            app.log_error("first", source_path="movie.mkv", failure_type="ffmpeg")
+            app.log_error("second", source_path="movie.mkv", failure_type="ffmpeg")
+
+            self.assertEqual(len(app.state.errors or []), 1)
+            self.assertEqual((app.state.errors or [])[0]["message"], "second")
 
     def test_expected_video_codecs_maps_common_encoders(self) -> None:
         self.assertEqual(simpleripper.expected_video_codecs("libx265"), {"hevc", "h265"})

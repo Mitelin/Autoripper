@@ -38,6 +38,10 @@ class ForceStopRequested(RuntimeError):
     pass
 
 
+class FfmpegFailedError(RuntimeError):
+    pass
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -241,6 +245,43 @@ def is_history_done_for_current_source(config: dict[str, Any], source: Path) -> 
     signature = payload.get("source_signature") or {}
     current = source_signature(source)
     return signature.get("size_bytes") == current["size_bytes"] and signature.get("mtime_ns") == current["mtime_ns"]
+
+
+def parse_utc_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def recent_ffmpeg_failure_info(config: dict[str, Any], source: Path) -> dict[str, Any] | None:
+    payload = load_history_index(config, source)
+    if not payload or payload.get("status") != "error" or payload.get("failure_type") != "ffmpeg":
+        return None
+    signature = payload.get("source_signature") or {}
+    current = source_signature(source)
+    if signature.get("size_bytes") != current["size_bytes"] or signature.get("mtime_ns") != current["mtime_ns"]:
+        return None
+    scan_settings = config.get("scan") or {}
+    try:
+        cooldown_hours = max(0.0, float(scan_settings.get("failed_retry_cooldown_hours", 24)))
+    except (TypeError, ValueError):
+        cooldown_hours = 24.0
+    try:
+        max_failures = max(1, int(scan_settings.get("max_failures_per_file", 1)))
+    except (TypeError, ValueError):
+        max_failures = 1
+    failure_count = int(payload.get("failure_count") or 1)
+    updated_at = parse_utc_datetime(payload.get("updated_at"))
+    if failure_count < max_failures or updated_at is None:
+        return None
+    retry_after = updated_at.timestamp() + cooldown_hours * 3600
+    if time.time() >= retry_after:
+        return None
+    return {"failure_count": failure_count, "retry_after": datetime.fromtimestamp(retry_after, timezone.utc).isoformat(timespec="seconds"), "error": payload.get("error")}
 
 
 def write_history_index(config: dict[str, Any], source: Path, payload: dict[str, Any]) -> None:
@@ -525,13 +566,14 @@ def extract_metadata(path: Path, probe: dict[str, Any], media_type: str = "defau
 
 def select_streams(config: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
     policy = config.get("track_policy") or {}
+    default_maps = ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]
     if not policy.get("enabled", True):
-        return {"applied": False, "map_arguments": ["-map", "0"], "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count")}
+        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count")}
     target_languages = set(policy.get("target_audio_languages") or ["cze"])
     audio_streams = source.get("audio_streams") or []
     target_audio = [stream for stream in audio_streams if detect_language(stream)[0] in target_languages]
     if not target_audio or len(audio_streams) <= 1 or not policy.get("drop_other_audio_if_target_found", True):
-        return {"applied": False, "map_arguments": ["-map", "0"], "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count")}
+        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count")}
     args = ["-map", "0:v:0"]
     for stream in target_audio:
         args.extend(["-map", f"0:{stream['index']}"])
@@ -544,7 +586,11 @@ def select_streams(config: dict[str, Any], source: dict[str, Any]) -> dict[str, 
 def build_ffmpeg_command(config: dict[str, Any], source: Path, output: Path, metadata: dict[str, Any], stream_policy: dict[str, Any]) -> list[str]:
     settings = (config.get("quality_profiles") or {}).get(metadata.get("media_type") or "default") or (config.get("quality_profiles") or {}).get("default") or {}
     command = [str((config.get("tools") or {}).get("ffmpeg") or "ffmpeg"), "-hide_banner", "-nostats", "-progress", "pipe:1", "-y", "-i", str(source)]
-    command.extend(stream_policy.get("map_arguments") or ["-map", "0"])
+    default_maps = ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]
+    map_arguments = list(stream_policy.get("map_arguments") or default_maps)
+    if any(option == "-map" and index + 1 < len(map_arguments) and map_arguments[index + 1] == "0" for index, option in enumerate(map_arguments)):
+        map_arguments = default_maps
+    command.extend(map_arguments)
     command.extend(["-c:v", str(settings.get("encoder", "libx265")), "-preset", str(settings.get("preset", "medium")), "-crf", str(settings.get("crf", 24))])
     if settings.get("pix_fmt"):
         command.extend(["-pix_fmt", str(settings["pix_fmt"])])
@@ -765,6 +811,10 @@ def scan_candidates(folders: list[Path], config: dict[str, Any]) -> list[Path]:
                 continue
             marker = marker_path(path, config)
             if path.is_file() and path.suffix.lower() in extensions and (marker is None or not marker.exists()) and not source_lock_path(path, config).exists() and not is_history_done_for_current_source(config, path) and not path.name.endswith((".original", ".tmp", ".partial")):
+                failure_info = recent_ffmpeg_failure_info(config, path)
+                if failure_info:
+                    log_event(config, "candidate_scan_skipped", source_path=str(path), reason="recent_ffmpeg_failure", **failure_info)
+                    continue
                 candidates.append(path)
     return sorted(candidates, key=lambda item: item.stat().st_size, reverse=True)
 
@@ -1426,10 +1476,13 @@ class SimpleRipperApp:
             payload.update(extra or {})
             write_json(current_job_path(self.config), payload)
 
-    def log_error(self, message: str) -> None:
+    def log_error(self, message: str, source_path: str | None = None, failure_type: str | None = None) -> None:
         with self._lock:
-            self.state.errors = ([{"at": utc_now(), "message": message}] + (self.state.errors or []))[:100]
-        log_event(self.config, "error", message=message)
+            key_source = source_path or ""
+            key_type = failure_type or ""
+            existing = [item for item in (self.state.errors or []) if not (isinstance(item, dict) and str(item.get("source_path") or "") == key_source and str(item.get("failure_type") or "") == key_type)]
+            self.state.errors = ([{"at": utc_now(), "message": message, "source_path": source_path, "failure_type": failure_type}] + existing)[:100]
+        log_event(self.config, "error", message=message, source_path=source_path, failure_type=failure_type)
 
     def reset_runtime_state(self, clear_errors: bool = False) -> None:
         with self._lock:
@@ -1727,7 +1780,7 @@ class SimpleRipperApp:
                     time.sleep(0.5)
                 progress_thread.join(timeout=1)
                 if self._ffmpeg.returncode != 0:
-                    raise RuntimeError(f"ffmpeg failed with exit code {self._ffmpeg.returncode}")
+                    raise FfmpegFailedError(f"ffmpeg failed with exit code {self._ffmpeg.returncode}")
             log_event(self.config, "ffmpeg_done", job_id=job_id, returncode=self._ffmpeg.returncode)
             self.set_phase("probing_output", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
             output_probe, output_meta = ffprobe_metadata(self.config, output, source_meta.get("media_type") or "default")
@@ -1780,12 +1833,19 @@ class SimpleRipperApp:
             log_event(self.config, "force_stop_completed", job_id=job_id, source_path=str(source), phase=self.state.current_phase)
             self.reset_runtime_state(clear_errors=True)
         except Exception as exc:
+            failure_type = "ffmpeg" if isinstance(exc, FfmpegFailedError) else "job"
+            previous_failure_count = 0
+            previous_payload = load_history_index(self.config, source)
+            current_signature = source_signature(source) if source.exists() else None
+            previous_signature = (previous_payload or {}).get("source_signature") or {}
+            if previous_payload and previous_payload.get("failure_type") == failure_type and current_signature and previous_signature.get("size_bytes") == current_signature.get("size_bytes") and previous_signature.get("mtime_ns") == current_signature.get("mtime_ns"):
+                previous_failure_count = int(previous_payload.get("failure_count") or 0)
             job_summary.update({"status": "error", "finished_at": utc_now(), "error": str(exc)})
             append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
-            history_payload = {"status": "error", "job_id": job_id, "source_signature": source_signature(source) if source.exists() else None, "updated_at": utc_now(), "error": str(exc)}
+            history_payload = {"status": "error", "job_id": job_id, "source_signature": current_signature, "updated_at": utc_now(), "error": str(exc), "failure_type": failure_type, "failure_count": previous_failure_count + 1}
             write_history_index(self.config, source, history_payload)
             write_shared_worker_history(self.config, source, history_payload)
-            self.log_error(f"{source}: {exc}")
+            self.log_error(f"{source}: {exc}", source_path=str(source), failure_type=failure_type)
             preserve_failed_output(work_dir_path, source, self.config)
         finally:
             lock_path.unlink(missing_ok=True)

@@ -62,6 +62,7 @@ Copy `config.example.yaml` to `config.yaml` and edit:
 - `libraries.roots`: allowed base folders shown in the GUI and exposed by the web folder browser.
 - `scan.selected_folders`: optional persisted `path + media_type` entries.
 - `scan.write_sidecar_markers`: default `false`; when enabled, SimpleRipper also writes legacy `.simpleripper.done*` sidecar markers beside source files.
+- `scan.failed_retry_cooldown_hours` and `scan.max_failures_per_file`: keep recent ffmpeg failures out of the next scan using central history, so one bad file cannot loop immediately.
 - `scan.priority_probe_limit`: how many of the largest current candidates get ffprobe-based ranking before the next job is chosen.
 - `paths.local_work_dir`: local temporary processing area.
 - `paths.history_dir`: local job history JSON and JSONL records.

@@ -26,6 +26,8 @@ scan:
   selected_folders: []
   priority_probe_limit: 12
   write_sidecar_markers: false
+  failed_retry_cooldown_hours: 24
+  max_failures_per_file: 1
   file_extensions:
     - .mkv
     - .mp4
