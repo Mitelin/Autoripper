@@ -151,47 +151,6 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(payload["job_id"], "job-1")
             self.assertIn("started_at", payload)
 
-    def test_windows_folder_picker_uses_shell_dialog_for_network_paths(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=["powershell.exe"],
-            returncode=0,
-            stdout="\\\\nas\\media\\Movies\r\n",
-            stderr="",
-        )
-
-        with patch("simpleripper.subprocess.run", return_value=completed) as mocked_run:
-            selected = simpleripper._pick_folder_with_windows_dialog("\\\\nas\\media")
-
-        self.assertEqual(selected, "\\\\nas\\media\\Movies")
-        command = mocked_run.call_args.args[0]
-        script = command[-1]
-        self.assertIn("Shell.Application", script)
-        self.assertIn("BrowseForFolder", script)
-        self.assertNotIn("FolderBrowserDialog", script)
-
-    def test_linux_folder_picker_uses_zenity_when_available(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=["zenity"],
-            returncode=0,
-            stdout="/mnt/nas/filmy/SERIALY\n",
-            stderr="",
-        )
-
-        with patch("simpleripper.shutil.which", side_effect=lambda name: "/usr/bin/zenity" if name == "zenity" else None), patch("simpleripper.subprocess.run", return_value=completed) as mocked_run:
-            selected = simpleripper._pick_folder_with_linux_dialog("/mnt/nas/filmy")
-
-        self.assertEqual(selected, "/mnt/nas/filmy/SERIALY")
-        command = mocked_run.call_args.args[0]
-        self.assertEqual(command[0], "zenity")
-        self.assertIn("--directory", command)
-
-    def test_linux_folder_picker_reports_manual_fallback_when_no_dialog_available(self) -> None:
-        with patch("simpleripper.shutil.which", return_value=None):
-            with self.assertRaises(RuntimeError) as raised:
-                simpleripper._pick_folder_with_linux_dialog("/mnt/nas/filmy")
-
-        self.assertIn("manualni vlozeni cesty", str(raised.exception))
-
     def test_configured_folder_suggestions_use_windows_roots(self) -> None:
         config = {
             "libraries": {
@@ -221,6 +180,125 @@ class SimpleRipperTests(unittest.TestCase):
 
         self.assertEqual(mode, "linux-mounts")
         self.assertEqual(suggestions, ["/mnt/nas/filmy/FILMY", "/mnt/nas/filmy/SERIALY"])
+
+    def test_browse_folders_returns_allowed_roots_without_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            library = root / "library"
+            library.mkdir()
+
+            payload = simpleripper.safe_browse_folders(config)
+
+            self.assertEqual(payload["current_path"], None)
+            self.assertEqual(payload["parent_path"], None)
+            self.assertEqual(payload["allowed_roots"], [str(library.resolve())])
+            self.assertEqual(payload["directories"], [{"name": "library", "path": str(library.resolve())}])
+
+    def test_browse_folders_lists_direct_child_directories_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            library = root / "library"
+            czech = library / "Czech"
+            english = library / "English"
+            czech.mkdir(parents=True)
+            english.mkdir(parents=True)
+            (library / "movie.mkv").write_text("x", encoding="utf-8")
+
+            payload = simpleripper.safe_browse_folders(config, str(library))
+
+            self.assertEqual(payload["current_path"], str(library.resolve()))
+            self.assertEqual(payload["parent_path"], None)
+            self.assertEqual(payload["directories"], [
+                {"name": "Czech", "path": str(czech.resolve())},
+                {"name": "English", "path": str(english.resolve())},
+            ])
+
+    def test_browse_folders_rejects_path_outside_allowed_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            (root / "library").mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+
+            with self.assertRaises(PermissionError):
+                simpleripper.safe_browse_folders(config, str(outside))
+
+    def test_browse_folders_skips_symlink_that_resolves_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            library = root / "library"
+            outside = root / "outside"
+            library.mkdir()
+            outside.mkdir()
+            link = library / "escape"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlink creation is not available")
+
+            payload = simpleripper.safe_browse_folders(config, str(library))
+
+            self.assertEqual(payload["directories"], [])
+            self.assertFalse(simpleripper.is_path_inside_roots(outside.resolve(), [library.resolve()]))
+
+    def test_custom_folder_post_without_path_does_not_open_desktop_picker(self) -> None:
+        class FakeHandler:
+            def __init__(self, app: simpleripper.SimpleRipperApp) -> None:
+                self.app = app
+                self.path = "/api/custom-folder"
+                self.responses: list[tuple[object, int]] = []
+
+            def read_payload(self) -> dict:
+                return {}
+
+            def send_json(self, payload: object, status: int = 200) -> None:
+                self.responses.append((payload, status))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            handler = FakeHandler(app)
+
+            simpleripper.SimpleRipperHandler.do_POST(handler)  # type: ignore[arg-type]
+
+            self.assertEqual(handler.responses[0][1], simpleripper.HTTPStatus.BAD_REQUEST)
+            self.assertEqual(handler.responses[0][0], {"error": "Missing folder path. Use /api/browse-folders from the web UI."})
+
+    def test_browse_folders_endpoint_rejects_outside_path_with_403(self) -> None:
+        class FakeHandler:
+            def __init__(self, app: simpleripper.SimpleRipperApp, path: str) -> None:
+                self.app = app
+                self.path = path
+                self.responses: list[tuple[object, int]] = []
+
+            def send_json(self, payload: object, status: int = 200) -> None:
+                self.responses.append((payload, status))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            (root / "library").mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            app = simpleripper.SimpleRipperApp(config)
+            handler = FakeHandler(app, f"/api/browse-folders?path={simpleripper.parse.quote(str(outside))}")
+
+            simpleripper.SimpleRipperHandler.do_GET(handler)  # type: ignore[arg-type]
+
+            self.assertEqual(handler.responses[0][1], simpleripper.HTTPStatus.FORBIDDEN)
+            self.assertIn("outside allowed library roots", handler.responses[0][0]["error"])  # type: ignore[index]
+
+    def test_web_ui_folder_picker_uses_browser_endpoint(self) -> None:
+        self.assertIn("/api/browse-folders", simpleripper.INDEX_HTML)
+        self.assertIn("function pickFolder(initialDir=''){browseFolder(initialDir||'')}", simpleripper.INDEX_HTML)
+        self.assertIn("function selectBrowsedFolder(path){post('/api/custom-folder',{path:path,media_type:guessMediaType(path)});closeFolderBrowser()}", simpleripper.INDEX_HTML)
+        self.assertNotIn("function pickFolder(initialDir=''){post('/api/custom-folder'", simpleripper.INDEX_HTML)
+        self.assertFalse(hasattr(simpleripper, "pick_folder_dialog"))
 
     def test_copy_file_interruptible_removes_partial_output_on_force_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

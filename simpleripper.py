@@ -742,100 +742,6 @@ def configured_folder_suggestions(config: dict[str, Any]) -> tuple[list[str], st
     return suggestions, "linux-mounts"
 
 
-def _pick_folder_with_windows_dialog(initial_dir: str | None = None) -> str | None:
-    selected = str(initial_dir or "").strip()
-    script = "\n".join([
-        "$shell = New-Object -ComObject Shell.Application",
-        "$title = 'Vyberte slozku pro SimpleRipper'",
-        "$flags = 0x0001 + 0x0040 + 0x0200 + 0x8000",
-        f"$initial = @'\n{selected}\n'@",
-        "$root = if ($initial) { $initial } else { 0 }",
-        "$dialog = $shell.BrowseForFolder(0, $title, $flags, $root)",
-        "if ($dialog -and $dialog.Self -and $dialog.Self.Path) {",
-        "  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
-        "  Write-Output $dialog.Self.Path",
-        "}",
-    ])
-    completed = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError((completed.stderr or completed.stdout or "Folder picker failed").strip())
-    folder = (completed.stdout or "").strip()
-    return folder or None
-
-
-def _pick_folder_with_linux_dialog(initial_dir: str | None = None) -> str | None:
-    selected = str(initial_dir or "").strip()
-    commands: list[list[str]] = []
-    if shutil.which("zenity"):
-        command = ["zenity", "--file-selection", "--directory", "--title=Vyberte slozku pro SimpleRipper"]
-        if selected:
-            command.append(f"--filename={selected.rstrip('/')}" + "/")
-        commands.append(command)
-    if shutil.which("kdialog"):
-        command = ["kdialog", "--getexistingdirectory"]
-        if selected:
-            command.append(selected)
-        command.append("/")
-        commands.append(command)
-    if shutil.which("qarma"):
-        command = ["qarma", "--file-selection", "--directory", "--title=Vyberte slozku pro SimpleRipper"]
-        if selected:
-            command.append(f"--filename={selected.rstrip('/')}" + "/")
-        commands.append(command)
-    if shutil.which("yad"):
-        command = ["yad", "--file-selection", "--directory", "--title=Vyberte slozku pro SimpleRipper"]
-        if selected:
-            command.append(f"--filename={selected.rstrip('/')}" + "/")
-        commands.append(command)
-
-    last_error = ""
-    for command in commands:
-        completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
-        if completed.returncode == 0:
-            folder = (completed.stdout or "").strip()
-            return folder or None
-        if completed.returncode not in {1}:
-            last_error = (completed.stderr or completed.stdout or "Folder picker failed").strip()
-    if last_error:
-        raise RuntimeError(last_error)
-    raise RuntimeError("No supported Linux folder dialog found. Pouzijte manualni vlozeni cesty.")
-
-
-def pick_folder_dialog(initial_dir: str | None = None) -> str | None:
-    if os.name == "nt":
-        try:
-            return _pick_folder_with_windows_dialog(initial_dir)
-        except Exception:
-            pass
-    else:
-        try:
-            return _pick_folder_with_linux_dialog(initial_dir)
-        except Exception:
-            pass
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        try:
-            folder = filedialog.askdirectory(title="Vyberte slozku pro SimpleRipper", initialdir=initial_dir or None)
-        finally:
-            root.destroy()
-        folder_text = str(folder).strip()
-        return folder_text or None
-    except Exception as exc:
-        raise RuntimeError(f"Folder picker failed: {exc}. Pouzijte manualni vlozeni cesty.") from exc
-
-
 def scan_candidates(folders: list[Path], config: dict[str, Any]) -> list[Path]:
     sync_history_from_shared_workers(config)
     extensions = {str(item).lower() for item in ((config.get("scan") or {}).get("file_extensions") or VIDEO_EXTENSIONS)}
@@ -1773,6 +1679,67 @@ def preserve_failed_output(work_dir: Path, source: Path, config: dict[str, Any])
         shutil.move(str(work_dir), str(target))
 
 
+def is_path_inside_roots(path: Path, roots: list[Path]) -> bool:
+    resolved_path = path.resolve()
+    for root in roots:
+        try:
+            resolved_path.relative_to(root.resolve())
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def safe_browse_folders(config: dict[str, Any], requested_path: str | None = None) -> dict[str, Any]:
+    configured_roots = [Path(str(path)) for path in ((config.get("libraries") or {}).get("roots") or [])]
+    allowed_roots = [root.resolve() for root in configured_roots]
+    if not allowed_roots:
+        raise ValueError("No allowed library roots are configured")
+
+    allowed_root_strings = [str(root) for root in allowed_roots]
+    if not requested_path:
+        return {
+            "current_path": None,
+            "parent_path": None,
+            "allowed_roots": allowed_root_strings,
+            "directories": [{"name": root.name or str(root), "path": str(root)} for root in allowed_roots],
+        }
+
+    current = Path(requested_path).expanduser().resolve()
+    containing_root = next((root for root in allowed_roots if is_path_inside_roots(current, [root])), None)
+    if containing_root is None:
+        raise PermissionError("Path is outside allowed library roots")
+    if not current.exists():
+        raise FileNotFoundError(f"Folder does not exist: {current}")
+    if not current.is_dir():
+        raise NotADirectoryError(f"Path is not a folder: {current}")
+
+    directories: list[dict[str, str]] = []
+    try:
+        children = list(current.iterdir())
+    except OSError:
+        children = []
+    for child in children:
+        try:
+            resolved_child = child.resolve()
+            if not is_path_inside_roots(resolved_child, [containing_root]):
+                continue
+            if resolved_child.is_dir():
+                directories.append({"name": child.name, "path": str(resolved_child)})
+        except OSError:
+            continue
+    directories.sort(key=lambda item: item["name"].casefold())
+
+    parent = current.parent.resolve()
+    parent_path = str(parent) if parent != current and is_path_inside_roots(parent, [containing_root]) else None
+    return {
+        "current_path": str(current),
+        "parent_path": parent_path,
+        "allowed_roots": allowed_root_strings,
+        "directories": directories,
+    }
+
+
 class SimpleRipperHandler(BaseHTTPRequestHandler):
     app: SimpleRipperApp
 
@@ -1801,14 +1768,28 @@ class SimpleRipperHandler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
 
     def do_GET(self) -> None:
-        if self.path == "/api/status":
+        parsed = parse.urlsplit(self.path)
+        path = parsed.path
+        if path == "/api/status":
             self.send_json(self.app.status())
             return
-        if self.path == "/api/config":
+        if path == "/api/config":
             self.send_json({"allowed_roots": [str(path) for path in self.app.roots]})
             return
-        if self.path == "/api/logs":
+        if path == "/api/logs":
             self.send_json({"lines": tail_text_lines(app_log_path(self.app.config), 200)})
+            return
+        if path == "/api/browse-folders":
+            query = parse.parse_qs(parsed.query)
+            requested_path = (query.get("path") or [None])[0]
+            try:
+                self.send_json(safe_browse_folders(self.app.config, requested_path))
+            except PermissionError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
+            except FileNotFoundError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            except (NotADirectoryError, ValueError, OSError) as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1828,9 +1809,8 @@ class SimpleRipperHandler(BaseHTTPRequestHandler):
                 else:
                     folder = str(payload.get("path") or "").strip()
                     if not folder:
-                        folder = str(pick_folder_dialog(str(payload.get("initial_dir") or "").strip() or None) or "").strip()
-                    if folder:
-                        self.app.add_custom_folder(folder, str(payload.get("media_type") or "auto"))
+                        raise ValueError("Missing folder path. Use /api/browse-folders from the web UI.")
+                    self.app.add_custom_folder(folder, str(payload.get("media_type") or "auto"))
                 self.send_json(self.app.status())
             elif self.path == "/api/start":
                 self.app.start()
@@ -1958,7 +1938,7 @@ pre{margin:0;padding:16px 18px;border-radius:18px;background:#09111a;color:#dce9
 @media (max-width:1060px){.hero-grid,.grid{grid-template-columns:1fr}.hero-stats{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media (max-width:760px){.shell{padding:18px 14px 36px}.hero{padding:22px 18px;border-radius:26px}.title{font-size:34px}.hero-stats,.metrics,.result-grid,.delta-grid,.controls,.folder-actions{grid-template-columns:1fr}.folder-row,.custom-row,.simple-item{grid-template-columns:auto 1fr;display:grid}.folder-row select,.custom-row select,.folder-row button,.custom-row button{grid-column:2}.status-banner,.result-head,.log-head{flex-direction:column;align-items:flex-start}}
 </style></head>
-<body><div class="shell"><section class="hero fade-in"><div class="hero-grid"><div><span class="eyebrow">Local only · one encode at a time</span><h1 class="title">SimpleRipper</h1><p class="lede">Simple local control panel for picking folders, watching the current job, and checking the last replacement result without a wall of debug noise.</p><div class="hero-stats"><article class="stat"><div class="stat-label">Selected folders</div><div class="stat-value" id="selectedCount">0</div></article><article class="stat"><div class="stat-label">Current phase</div><div class="stat-value" id="heroPhase">Idle</div></article><article class="stat"><div class="stat-label">Warnings</div><div class="stat-value" id="warningCount">0</div></article></div></div><aside class="hero-card"><h2>Session pulse</h2><p id="heroSummary">Waiting for the first status update.</p><div class="badge-row" id="heroBadges"></div></aside></div></section><main class="grid"><section class="stack"><section class="panel fade-in"><h2>Folders</h2><p class="panel-intro">Vyberte slozky pres explorer nebo je zadejte rucne. Fallback bere navrhy z configu podle platformy.</p><div class="folder-actions"><button class="primary" onclick="pickFolder()">Vybrat slozku</button><button class="ghost" onclick="pickFolder(lastSelectedFolderPath())">Vybrat dalsi pobliz</button></div><div class="folder-manual"><input id="manualFolderPath" type="text" list="folderSuggestionList" placeholder="\\\\server\\share\\FILMY nebo /mnt/nas/filmy/FILMY"><button class="ghost" onclick="addManualFolder()">Pridat cestu</button></div><datalist id="folderSuggestionList"></datalist><div id="folderPickerHint" class="panel-intro" style="margin-top:12px">Otevira systemovy vyber slozky. Kdyz sit v dialogu zlobi, vlozte cestu rucne z config navrhu niz.</div><div id="selectedFolders" class="simple-list"></div></section><section class="panel fade-in"><h2>Controls</h2><p class="panel-intro">Start, stop after the current file, force-stop the local encode, switch into safe test mode, or run update when the app is idle. Update only triggers a brief app reload.</p><div class="controls"><button class="primary" onclick="post('/api/start')">Start</button><button class="ghost" onclick="post('/api/stop-after-current')">Stop after current</button><button class="warning" onclick="post('/api/force-stop')">Force stop</button><button class="outline" id="testModeButton" onclick="toggleTestMode()">Test mode</button><button class="outline" onclick="post('/api/clear-stale-locks')">Clear stale locks</button></div><div id="testModeBanner"></div></section><section class="panel fade-in"><h2>Errors</h2><p class="panel-intro">Recent app-level failures and warnings.</p><div id="errors" class="error-list"></div></section></section><section class="stack"><section class="panel fade-in"><h2>Current Job</h2><p class="panel-intro">Current local runtime state and ffmpeg progress.</p><div id="current"></div></section><section class="panel fade-in"><h2>Last Result</h2><p class="panel-intro">Most recent completed, skipped, or failed job.</p><div id="lastResult"></div></section><section class="panel fade-in"><div class="log-head"><div><h2>Activity Log</h2><p class="panel-intro">Recent local app events.</p></div><div class="log-meta" id="logMeta">0 lines</div></div><div class="log-shell"><pre id="log"></pre><details class="disclosure"><summary>Raw status payload</summary><pre id="status"></pre></details></div></section></section></main></div>
+<body><div class="shell"><section class="hero fade-in"><div class="hero-grid"><div><span class="eyebrow">Local only · one encode at a time</span><h1 class="title">SimpleRipper</h1><p class="lede">Simple local control panel for picking folders, watching the current job, and checking the last replacement result without a wall of debug noise.</p><div class="hero-stats"><article class="stat"><div class="stat-label">Selected folders</div><div class="stat-value" id="selectedCount">0</div></article><article class="stat"><div class="stat-label">Current phase</div><div class="stat-value" id="heroPhase">Idle</div></article><article class="stat"><div class="stat-label">Warnings</div><div class="stat-value" id="warningCount">0</div></article></div></div><aside class="hero-card"><h2>Session pulse</h2><p id="heroSummary">Waiting for the first status update.</p><div class="badge-row" id="heroBadges"></div></aside></div></section><main class="grid"><section class="stack"><section class="panel fade-in"><h2>Folders</h2><p class="panel-intro">Vyberte slozky v prohlizeci nebo je zadejte rucne. Browser povoli jen rooty z configu.</p><div class="folder-actions"><button class="primary" onclick="pickFolder()">Vybrat slozku</button><button class="ghost" onclick="pickFolder(lastSelectedFolderPath())">Vybrat dalsi pobliz</button></div><div class="folder-manual"><input id="manualFolderPath" type="text" list="folderSuggestionList" placeholder="\\\\server\\share\\FILMY nebo /mnt/nas/filmy/FILMY"><button class="ghost" onclick="addManualFolder()">Pridat cestu</button></div><datalist id="folderSuggestionList"></datalist><div id="folderPickerHint" class="panel-intro" style="margin-top:12px">Otevre webovy browser slozek pod povolenymi rooty. Cestu muzete stale vlozit rucne.</div><div id="selectedFolders" class="simple-list"></div></section><section class="panel fade-in"><h2>Controls</h2><p class="panel-intro">Start, stop after the current file, force-stop the local encode, switch into safe test mode, or run update when the app is idle. Update only triggers a brief app reload.</p><div class="controls"><button class="primary" onclick="post('/api/start')">Start</button><button class="ghost" onclick="post('/api/stop-after-current')">Stop after current</button><button class="warning" onclick="post('/api/force-stop')">Force stop</button><button class="outline" id="testModeButton" onclick="toggleTestMode()">Test mode</button><button class="outline" onclick="post('/api/clear-stale-locks')">Clear stale locks</button></div><div id="testModeBanner"></div></section><section class="panel fade-in"><h2>Errors</h2><p class="panel-intro">Recent app-level failures and warnings.</p><div id="errors" class="error-list"></div></section></section><section class="stack"><section class="panel fade-in"><h2>Current Job</h2><p class="panel-intro">Current local runtime state and ffmpeg progress.</p><div id="current"></div></section><section class="panel fade-in"><h2>Last Result</h2><p class="panel-intro">Most recent completed, skipped, or failed job.</p><div id="lastResult"></div></section><section class="panel fade-in"><div class="log-head"><div><h2>Activity Log</h2><p class="panel-intro">Recent local app events.</p></div><div class="log-meta" id="logMeta">0 lines</div></div><div class="log-shell"><pre id="log"></pre><details class="disclosure"><summary>Raw status payload</summary><pre id="status"></pre></details></div></section></section></main></div>
 <script>
 let lastStatus=null
 let uiError=''
@@ -1985,13 +1965,21 @@ function collectSelectedFolders(){return [...document.querySelectorAll('#selecte
 function saveSelectedFolders(){post('/api/folders',{folders:collectSelectedFolders()})}
 function addFolder(path){const current=collectSelectedFolders();if(current.some(item=>item.path===path)){return}current.push({path,media_type:guessMediaType(path)});post('/api/folders',{folders:current})}
 function lastSelectedFolderPath(){const first=document.querySelector('#selectedFolders .simple-item');return first?first.getAttribute('data-path'):''}
-function pickFolder(initialDir=''){post('/api/custom-folder',initialDir?{initial_dir:initialDir}:{})}
+function ensureFolderBrowser(){let browser=document.getElementById('folderBrowser');if(browser){return browser}const selected=document.getElementById('selectedFolders');browser=document.createElement('div');browser.id='folderBrowser';browser.className='simple-list';browser.style.marginTop='14px';if(selected&&selected.parentNode){selected.parentNode.insertBefore(browser,selected)}return browser}
+async function browseFolder(path=''){try{const url=path?`/api/browse-folders?path=${encodeURIComponent(path)}`:'/api/browse-folders';const payload=await fetch(url,{cache:'no-store'}).then(readJsonResponse);uiError='';renderFolderBrowser(payload)}catch(error){renderUiError(formatRequestError(error))}}
+function renderFolderBrowser(payload){const browser=ensureFolderBrowser();const current=payload.current_path||'';const directories=payload.directories||[];const controls=[];if(current){controls.push(`<button class="primary" data-action="select" data-path="${escapeHtml(current)}">Vybrat tuto slozku</button>`)}if(payload.parent_path){controls.push(`<button class="ghost" data-action="browse" data-path="${escapeHtml(payload.parent_path)}">O uroven vys</button>`)}controls.push('<button class="ghost" data-action="browse" data-path="">Rooty</button>');controls.push('<button class="ghost" data-action="close">Zavrit</button>');browser.innerHTML=`<div class="path-block"><div class="path-label">Browser slozek</div><div class="code">${escapeHtml(current||'Vyberte root')}</div></div><div class="folder-actions" style="margin-top:10px">${controls.join('')}</div>${directories.length?directories.map(item=>`<div class="simple-item"><div class="simple-main"><div class="simple-title">${escapeHtml(item.name)}</div><div class="simple-sub">${escapeHtml(item.path)}</div></div><button class="ghost" data-action="browse" data-path="${escapeHtml(item.path)}">Otevrit</button><button class="primary" data-action="select" data-path="${escapeHtml(item.path)}">Vybrat</button></div>`).join(''):'<div class="empty">Zadne podadresare.</div>'}`;browser.querySelectorAll('button[data-action]').forEach(button=>{button.onclick=()=>{const action=button.getAttribute('data-action');const path=button.getAttribute('data-path')||'';if(action==='browse'){browseFolder(path)}else if(action==='select'){selectBrowsedFolder(path)}else if(action==='close'){closeFolderBrowser()}}})}
+function selectBrowsedFolder(path){post('/api/custom-folder',{path:path,media_type:guessMediaType(path)});closeFolderBrowser()}
+function closeFolderBrowser(){const browser=document.getElementById('folderBrowser');if(browser){browser.innerHTML=''}}
+function pickFolder(initialDir=''){browseFolder(initialDir||'')}
 function addManualFolder(){const input=document.getElementById('manualFolderPath');const path=(input&&input.value?input.value:'').trim();if(!path){return}post('/api/custom-folder',{path:path,media_type:guessMediaType(path)});if(input){input.value=''}}
 function removeFolder(path){post('/api/folders',{folders:collectSelectedFolders().filter(item=>item.path!==path)})}
 function ensureUpdateButton(){const controls=document.querySelector('.controls');if(!controls||document.getElementById('updateButton')){return}const button=document.createElement('button');button.className='outline';button.id='updateButton';button.textContent='Update';button.onclick=triggerUpdate;const testModeButton=document.getElementById('testModeButton');if(testModeButton&&testModeButton.parentNode===controls){controls.insertBefore(button,testModeButton)}else{controls.appendChild(button)}}
 function triggerUpdate(){const button=document.getElementById('updateButton');if(button&&button.disabled){return}post('/api/update')}
 function toggleTestMode(){const button=document.getElementById('testModeButton');const enable=!(button&&button.getAttribute('data-enabled')==='true');post('/api/test-mode',{enabled:enable})}
 function render(s){lastStatus=s;const selected=s.selected_folders||[];const combinedErrors=uiError?[{at:'UI',message:uiError},...(s.errors||[])]:[...(s.errors||[])];const warningCount=(combinedErrors.length?1:0)+(s.last_result&&s.last_result.warning?1:0);document.getElementById('status').textContent=JSON.stringify(s,null,2);document.getElementById('current').innerHTML=renderCurrent(s.current_summary);document.getElementById('lastResult').innerHTML=renderLastResult(s.last_result);document.getElementById('errors').innerHTML=combinedErrors.length?combinedErrors.map(e=>`<div class="err">${escapeHtml(e.at||'')}<br>${escapeHtml(e.message||e)}</div>`).join(''):'<p class="muted">No recent app-level errors.</p>';document.getElementById('log').textContent=(s.recent_log_lines||[]).join(String.fromCharCode(10));document.getElementById('logMeta').textContent=`${(s.recent_log_lines||[]).length} lines`;document.getElementById('selectedFolders').innerHTML=selected.length?selected.map(item=>`<div class="simple-item" data-path="${escapeHtml(item.path)}"><div class="simple-main"><div class="simple-title">${escapeHtml(item.path)}</div><div class="simple-sub">Selected for scan</div></div>${mediaTypeSelect(item.media_type||guessMediaType(item.path),'onchange="saveSelectedFolders()"')}<button class="ghost" data-path="${escapeHtml(item.path)}" onclick="removeFolder(this.getAttribute('data-path'))">Remove</button></div>`).join(''):'<div class="empty">No folders selected.</div>';document.getElementById('selectedCount').textContent=String(selected.length);document.getElementById('heroPhase').textContent=escapeHtml((s.current_summary&&s.current_summary.status)||s.current_phase||'Idle');document.getElementById('warningCount').textContent=String(warningCount);document.getElementById('heroSummary').textContent=heroSummary(s);document.getElementById('heroBadges').innerHTML=renderBadges(s);ensureUpdateButton();document.getElementById('updateButton').disabled=!s.can_update;document.getElementById('updateButton').textContent=s.current_phase==='updating'?'Updating...':'Update';document.getElementById('testModeButton').textContent=s.test_mode?'Test mode ON':'Test mode';document.getElementById('testModeButton').setAttribute('data-enabled',s.test_mode?'true':'false');document.getElementById('testModeBanner').innerHTML=s.test_mode?`<div class="callout info" style="margin-top:14px">${escapeHtml(s.test_mode_message||'Bezi v test modu.')}</div>`:'';document.getElementById('folderSuggestionList').innerHTML=(s.folder_suggestions||[]).map(path=>`<option value="${escapeHtml(path)}"></option>`).join('');document.getElementById('folderPickerHint').textContent=s.folder_suggestion_mode==='linux-mounts'?'Explorer fallback pouziva mount navrhy z linux configu. Sit lze zadat primo jako mount cestu.':'Explorer fallback pouziva Windows roots z configu. Kdyz sit v dialogu chybi, vlozte UNC cestu rucne.'}
+function updateFolderPickerHint(s){const hint=document.getElementById('folderPickerHint');if(!hint){return}hint.textContent=s.folder_suggestion_mode==='linux-mounts'?'Webovy browser pouziva povolene linux mount rooty z configu. Sit lze zadat primo jako mount cestu.':'Webovy browser pouziva povolene rooty z configu. Cestu muzete stale vlozit rucne.'}
+const renderBase=render
+render=function(s){renderBase(s);updateFolderPickerHint(s)}
 setInterval(getStatus,1500);getStatus();
 </script></body></html>"""
 

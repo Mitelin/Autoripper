@@ -38,9 +38,13 @@ python simpleripper.py check-config --config config.example.yaml
 python simpleripper.py web --config config.example.yaml
 ```
 
-Then open the printed local URL, select folders from configured library roots, and press `START`.
+Run those commands in an environment where the project dependencies are installed.
+
+Then open the printed local URL, browse folders from configured library roots in the built-in web picker, or enter a path manually, and press `START`.
 
 Each selected folder can be tagged as `Auto`, `Movie`, `Series`, or `Anime`. That folder-level media type is used before path heuristics for bitrate thresholds, profile selection, and track-policy behavior.
+
+The web UI folder browser is limited to `libraries.roots`, shows those roots first, lets you step into direct child directories, and exposes an up button when the current folder still lives inside an allowed root. This is the supported picker flow for headless Linux deployments.
 
 Folder selections are persisted both to local runtime state and back into `scan.selected_folders` in the configured YAML file.
 
@@ -53,6 +57,7 @@ By default, existing HEVC files are skipped, but very large HEVC files with stil
 Copy `config.example.yaml` to `config.yaml` and edit:
 
 - `libraries.roots`: allowed base folders shown in the GUI.
+- `libraries.roots`: allowed base folders shown in the GUI and exposed by the web folder browser.
 - `scan.selected_folders`: optional persisted `path + media_type` entries.
 - `scan.priority_probe_limit`: how many of the largest current candidates get ffprobe-based ranking before the next job is chosen.
 - `paths.local_work_dir`: local temporary processing area.
