@@ -770,6 +770,93 @@ class SimpleRipperTests(unittest.TestCase):
             simpleripper.jellyfin_item_score(filename_only, source, candidates),
         )
 
+    def test_refresh_jellyfin_refreshes_all_exact_path_matches(self) -> None:
+        config = self.make_config(Path("."))
+        config["jellyfin"] = {
+            "enabled": True,
+            "server_url": "http://jellyfin.local:8096",
+            "api_key": "secret",
+            "path_mapping": [
+                {"filesystem_prefix": "Z:/nas-backup/SERIALY/Czech", "jellyfin_prefix": "J:/serialy"},
+                {"filesystem_prefix": "Z:/nas-backup", "jellyfin_prefix": "K:/filmy"},
+            ],
+        }
+        source = Path("Z:/nas-backup/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv")
+        items = [
+            {"Id": "1", "Path": "J:/serialy/Fallout/Season 02/S02E02 Zlate pravidlo.mkv", "Name": "Episode 2"},
+            {"Id": "2", "Path": "K:/filmy/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv", "Name": "Episode 2"},
+        ]
+        requests_sent: list[str] = []
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def fake_urlopen(req: object, timeout: int = 10) -> FakeResponse:
+            requests_sent.append(req.full_url)  # type: ignore[attr-defined]
+            return FakeResponse()
+
+        with patch("simpleripper.jellyfin_query_items", return_value=items), patch("simpleripper.request.urlopen", side_effect=fake_urlopen):
+            result = simpleripper.refresh_jellyfin(config, source)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["refreshed_count"], 2)
+        self.assertEqual(result["match_type"], "exact_path")
+        self.assertEqual({match["item_id"] for match in result["matches"]}, {"1", "2"})
+        self.assertEqual(len(requests_sent), 2)
+
+    def test_refresh_jellyfin_refreshes_single_exact_path_match(self) -> None:
+        config = self.make_config(Path("."))
+        config["jellyfin"] = {
+            "enabled": True,
+            "server_url": "http://jellyfin.local:8096",
+            "api_key": "secret",
+            "path_mapping": [{"filesystem_prefix": "Z:/nas-backup", "jellyfin_prefix": "K:/filmy"}],
+        }
+        source = Path("Z:/nas-backup/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv")
+        items = [{"Id": "1", "Path": "K:/filmy/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv", "Name": "Episode 2"}]
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        with patch("simpleripper.jellyfin_query_items", return_value=items), patch("simpleripper.request.urlopen", return_value=FakeResponse()):
+            result = simpleripper.refresh_jellyfin(config, source)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["refreshed_count"], 1)
+        self.assertEqual(result["item_id"], "1")
+        self.assertEqual(result["match_type"], "exact_path")
+
+    def test_jellyfin_lookup_item_keeps_fuzzy_ties_ambiguous_without_exact_match(self) -> None:
+        source = Path("Z:/nas-backup/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv")
+        candidates = ["K:/filmy/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv"]
+        items = [
+            {"Id": "1", "Path": "X:/other/library/Fallout/Season 02/S02E02 Zlate pravidlo.mkv", "Name": "S02E02 Zlate pravidlo"},
+            {"Id": "2", "Path": "Y:/duplicate/library/Fallout/Season 02/S02E02 Zlate pravidlo.mkv", "Name": "S02E02 Zlate pravidlo"},
+        ]
+
+        with patch("simpleripper.jellyfin_query_items", return_value=items):
+            result = simpleripper.jellyfin_lookup_item("http://jellyfin.local:8096", "secret", source, candidates)
+
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertEqual(result["candidate_paths"], candidates)
+        self.assertTrue(result["search_terms"])
+        self.assertEqual(len(result["matches"]), 2)
+        self.assertEqual({match["item_id"] for match in result["matches"]}, {"1", "2"})
+
     def test_candidate_priority_score_prefers_h264_over_hevc(self) -> None:
         h264 = {"file_size_bytes": 10 * 1024 * 1024 * 1024, "video_codec": "h264", "overall_bitrate_kbps": 9000, "audio_stream_count": 2, "subtitle_stream_count": 2}
         hevc = {"file_size_bytes": 10 * 1024 * 1024 * 1024, "video_codec": "hevc", "overall_bitrate_kbps": 9000, "audio_stream_count": 2, "subtitle_stream_count": 2}
