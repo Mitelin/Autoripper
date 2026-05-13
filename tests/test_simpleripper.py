@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import io
 import socket
 import subprocess
 import tempfile
@@ -170,6 +171,153 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertEqual(candidates, [])
             log_mock.assert_any_call(config, "candidate_scan_skipped", source_path=str(failed), reason="recent_ffmpeg_failure", failure_count=1, retry_after=unittest.mock.ANY, error="ffmpeg failed with exit code 1")
+
+    def test_fast_inventory_scan_does_not_call_ffprobe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir()
+            source.write_bytes(b"x" * 10)
+
+            with patch("simpleripper.run_ffprobe", side_effect=AssertionError("ffprobe must not run")):
+                result = simpleripper.fast_inventory_scan([source.parent], config)
+
+            self.assertEqual(result["indexed_files"], 1)
+            self.assertEqual(simpleripper.worker_cache_summary(config)["indexed_files"], 1)
+
+    def test_cached_skip_is_not_selected_until_file_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir()
+            source.write_bytes(b"x" * 10)
+            simpleripper.fast_inventory_scan([source.parent], config)
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET decision = 'skip', decision_reason = 'already_hevc', policy_hash = ? WHERE path = ?", (simpleripper.policy_hash(config), str(source)))
+
+            with patch("simpleripper.run_ffprobe", side_effect=AssertionError("ffprobe must not run")):
+                self.assertEqual(simpleripper.scan_candidates([source.parent], config), [])
+
+            source.write_bytes(b"changed" * 10)
+            simpleripper.fast_inventory_scan([source.parent], config)
+
+            self.assertEqual(simpleripper.scan_candidates([source.parent], config), [source])
+
+    def test_policy_hash_change_invalidates_cached_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            source = root / "library" / "episode.mkv"
+            source.parent.mkdir()
+            source.write_bytes(b"x" * 10)
+            simpleripper.fast_inventory_scan([source.parent], config)
+            old_hash = simpleripper.policy_hash(config)
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET decision = 'skip', decision_reason = 'already_hevc', policy_hash = ? WHERE path = ?", (old_hash, str(source)))
+
+            config["retention_size_policy"]["series"]["max_mb_per_25min"] = 650
+
+            self.assertEqual(simpleripper.scan_candidates([source.parent], config), [source])
+
+    def test_repeated_ffmpeg_failures_block_cached_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            source = root / "library" / "bad.mkv"
+            source.parent.mkdir()
+            source.write_bytes(b"x" * 10)
+            simpleripper.fast_inventory_scan([source.parent], config)
+
+            for _ in range(3):
+                result = simpleripper.update_cache_job_failure(config, source, "ffmpeg failed")
+
+            self.assertEqual((result or {})["decision"], "blocked")
+            self.assertEqual(simpleripper.scan_candidates([source.parent], config), [])
+
+    def test_clean_folder_is_skipped_by_fast_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            season = root / "library" / "Series" / "Show" / "Season 02"
+            season.mkdir(parents=True)
+            episode = season / "episode.mkv"
+            episode.write_bytes(b"x" * 10)
+            simpleripper.fast_inventory_scan([root / "library"], config)
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET decision = 'skip', decision_reason = 'already_hevc', policy_hash = ? WHERE path = ?", (simpleripper.policy_hash(config), str(episode)))
+            simpleripper.refresh_folder_state_upwards(config, episode)
+
+            with patch("simpleripper.direct_video_files", side_effect=AssertionError("clean season should not be opened")):
+                result = simpleripper.fast_inventory_scan([season], config)
+
+            self.assertEqual(result["skipped_folders"], 1)
+            self.assertEqual(simpleripper.worker_cache_summary(config)["folder_states"]["clean"], 4)
+
+    def test_new_file_invalidates_clean_folder_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            season = root / "library" / "Series" / "Show" / "Season 02"
+            season.mkdir(parents=True)
+            first = season / "episode1.mkv"
+            first.write_bytes(b"x" * 10)
+            simpleripper.fast_inventory_scan([root / "library"], config)
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET decision = 'skip', decision_reason = 'already_hevc', policy_hash = ? WHERE path = ?", (simpleripper.policy_hash(config), str(first)))
+            simpleripper.refresh_folder_state_upwards(config, first)
+
+            second = season / "episode2.mkv"
+            second.write_bytes(b"y" * 20)
+            result = simpleripper.fast_inventory_scan([root / "library"], config)
+
+            self.assertGreaterEqual(result["changed_files"], 1)
+            self.assertIn(second, simpleripper.scan_candidates([root / "library"], config))
+            with simpleripper.open_worker_cache(config) as connection:
+                row = connection.execute("SELECT state FROM folder_index WHERE path = ?", (str(season),)).fetchone()
+            self.assertEqual(row["state"], "partial")
+
+    def test_policy_hash_change_marks_clean_folder_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            season = root / "library" / "Series" / "Show" / "Season 02"
+            season.mkdir(parents=True)
+            episode = season / "episode.mkv"
+            episode.write_bytes(b"x" * 10)
+            simpleripper.fast_inventory_scan([root / "library"], config)
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET decision = 'skip', decision_reason = 'already_hevc', policy_hash = ? WHERE path = ?", (simpleripper.policy_hash(config), str(episode)))
+            simpleripper.refresh_folder_state_upwards(config, episode)
+
+            config["retention_size_policy"]["series"]["max_mb_per_25min"] = 650
+            result = simpleripper.fast_inventory_scan([root / "library"], config)
+
+            self.assertEqual(result["skipped_folders"], 0)
+            self.assertIn(episode, simpleripper.scan_candidates([root / "library"], config))
+
+    def test_cache_cli_summary_and_clear_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            config_path = root / "config.yaml"
+            config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+            with patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(simpleripper.main(["cache-summary", "--config", str(config_path)]), 0)
+            self.assertTrue(simpleripper.worker_cache_path(config).exists())
+            with patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(simpleripper.main(["clear-cache", "--config", str(config_path)]), 0)
+            self.assertTrue(simpleripper.worker_cache_path(config).exists())
 
     def test_set_phase_writes_current_job_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

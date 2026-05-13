@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -25,7 +26,7 @@ import yaml
 
 
 APP_NAME = "SimpleRipper"
-VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts"}
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v", ".ts"}
 LANGUAGE_ALIASES = {
     "cze": {"cze", "ces", "cz", "czech", "cestina", "cesky", "cz dabing", "czech dub"},
     "slo": {"slo", "slk", "sk", "slovak", "slovencina", "sk dabing", "slovak dub"},
@@ -122,6 +123,195 @@ def log_dir(config: dict[str, Any]) -> Path:
 
 def current_job_path(config: dict[str, Any]) -> Path:
     return runtime_dir(config) / "current_job.json"
+
+
+def worker_cache_path(config: dict[str, Any]) -> Path:
+    explicit = str((config.get("paths") or {}).get("worker_cache_path") or "").strip()
+    return Path(explicit) if explicit else runtime_dir(config) / "worker_cache.sqlite"
+
+
+def scan_cache_settings(config: dict[str, Any]) -> dict[str, Any]:
+    settings = config.get("scan_cache") or {}
+    scan_settings = config.get("scan") or {}
+    return {
+        "enabled": bool(settings.get("enabled", scan_settings.get("inventory_cache_enabled", False))),
+        "fast_inventory_rescan_hours": float(settings.get("fast_inventory_rescan_hours", scan_settings.get("inventory_refresh_hours", 24))),
+        "max_deep_checks_per_cycle": int(settings.get("max_deep_checks_per_cycle", 50)),
+        "queue_size": int(settings.get("queue_size", 25)),
+        "failed_retry_hours": float(settings.get("failed_retry_hours", scan_settings.get("failed_retry_after_hours", 24))),
+        "max_failures_before_block": int(settings.get("max_failures_before_block", scan_settings.get("failed_retry_limit", 3))),
+        "blocked_retry_days": float(settings.get("blocked_retry_days", 30)),
+        "folder_state_cache_enabled": bool(settings.get("folder_state_cache_enabled", scan_settings.get("folder_state_cache_enabled", True))),
+        "skip_clean_folders": bool(settings.get("skip_clean_folders", scan_settings.get("skip_clean_folders", True))),
+    }
+
+
+def scan_cache_enabled(config: dict[str, Any]) -> bool:
+    return bool(scan_cache_settings(config).get("enabled"))
+
+
+def folder_state_cache_enabled(config: dict[str, Any]) -> bool:
+    settings = scan_cache_settings(config)
+    return bool(settings.get("enabled") and settings.get("folder_state_cache_enabled"))
+
+
+def policy_hash(config: dict[str, Any]) -> str:
+    relevant = {
+        "quality_profiles": config.get("quality_profiles") or {},
+        "skip_rules": config.get("skip_rules") or {},
+        "track_policy": config.get("track_policy") or {},
+        "retention_size_policy": config.get("retention_size_policy") or {},
+        "verification": config.get("verification") or {},
+        "libraries": (config.get("libraries") or {}).get("roots") or [],
+    }
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+@contextmanager
+def open_worker_cache(config: dict[str, Any]) -> Any:
+    path = worker_cache_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        initialize_worker_cache(connection)
+        yield connection
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def initialize_worker_cache(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS file_index (
+            path TEXT PRIMARY KEY,
+            normalized_path TEXT,
+            media_type TEXT,
+            size_bytes INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            suffix TEXT,
+            parent_dir TEXT,
+            duration_seconds REAL,
+            video_codec TEXT,
+            video_pix_fmt TEXT,
+            width INTEGER,
+            height INTEGER,
+            overall_bitrate_kbps INTEGER,
+            audio_stream_count INTEGER,
+            subtitle_stream_count INTEGER,
+            decision TEXT,
+            decision_reason TEXT,
+            score REAL DEFAULT 0,
+            estimated_saved_bytes INTEGER,
+            policy_hash TEXT,
+            failure_count INTEGER DEFAULT 0,
+            last_error TEXT,
+            retry_after TEXT,
+            next_check_after TEXT,
+            last_seen_at TEXT,
+            last_fast_scanned_at TEXT,
+            last_deep_checked_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scan_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS folder_index (
+            path TEXT PRIMARY KEY,
+            normalized_path TEXT,
+            state TEXT NOT NULL,
+            reason TEXT,
+            direct_file_count INTEGER NOT NULL DEFAULT 0,
+            direct_total_size INTEGER NOT NULL DEFAULT 0,
+            direct_latest_mtime_ns INTEGER NOT NULL DEFAULT 0,
+            child_dir_count INTEGER NOT NULL DEFAULT 0,
+            children_clean INTEGER NOT NULL DEFAULT 0,
+            policy_hash TEXT,
+            checked_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+
+def scan_state_get(config: dict[str, Any], key: str) -> str | None:
+    with open_worker_cache(config) as connection:
+        row = connection.execute("SELECT value FROM scan_state WHERE key = ?", (key,)).fetchone()
+    return str(row[0]) if row else None
+
+
+def scan_state_set(config: dict[str, Any], key: str, value: str) -> None:
+    with open_worker_cache(config) as connection:
+        now = utc_now()
+        connection.execute(
+            "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (key, value, now),
+        )
+
+
+def clear_worker_cache(config: dict[str, Any]) -> None:
+    path = worker_cache_path(config)
+    if path.exists():
+        path.unlink()
+    with open_worker_cache(config):
+        pass
+
+
+def clear_worker_failures(config: dict[str, Any]) -> None:
+    with open_worker_cache(config) as connection:
+        connection.execute(
+            "UPDATE file_index SET decision = NULL, decision_reason = NULL, failure_count = 0, last_error = NULL, retry_after = NULL, next_check_after = NULL WHERE decision IN ('failed', 'blocked')"
+        )
+        connection.execute("UPDATE folder_index SET state = 'dirty', reason = 'failures_cleared', checked_at = ?, updated_at = ?", (utc_now(), utc_now()))
+
+
+def worker_cache_summary(config: dict[str, Any]) -> dict[str, Any]:
+    settings = scan_cache_settings(config)
+    summary: dict[str, Any] = {
+        "enabled": bool(settings.get("enabled")),
+        "db_path": str(worker_cache_path(config)),
+        "last_fast_inventory_scan_at": None,
+        "indexed_files": 0,
+        "encode_candidates": 0,
+        "cached_skips": 0,
+        "failed_cooldown": 0,
+        "blocked": 0,
+        "queue_size": settings.get("queue_size"),
+        "candidate_queue_count": 0,
+        "folder_states": {"clean": 0, "partial": 0, "dirty": 0, "stale": 0, "blocked": 0},
+        "last_skipped_folder": None,
+    }
+    if not summary["enabled"]:
+        return summary
+    with open_worker_cache(config) as connection:
+        row = connection.execute("SELECT value FROM scan_state WHERE key = 'last_fast_inventory_scan_at'").fetchone()
+        summary["last_fast_inventory_scan_at"] = row["value"] if row else None
+        rows = connection.execute("SELECT COALESCE(decision, 'pending') AS decision, COUNT(*) AS count FROM file_index GROUP BY COALESCE(decision, 'pending')").fetchall()
+        counts = {str(row["decision"]): int(row["count"]) for row in rows}
+        folder_rows = connection.execute("SELECT state, COUNT(*) AS count FROM folder_index GROUP BY state").fetchall()
+        folder_counts = {str(row["state"]): int(row["count"]) for row in folder_rows}
+        queue_row = connection.execute("SELECT COUNT(*) AS count FROM file_index WHERE decision IS NULL OR decision = 'encode_candidate'").fetchone()
+        skipped_row = connection.execute("SELECT value FROM scan_state WHERE key = 'last_skipped_folder'").fetchone()
+    summary["indexed_files"] = sum(counts.values())
+    summary["encode_candidates"] = counts.get("encode_candidate", 0) + counts.get("pending", 0)
+    summary["cached_skips"] = counts.get("skip", 0) + counts.get("done", 0)
+    summary["failed_cooldown"] = counts.get("failed", 0)
+    summary["blocked"] = counts.get("blocked", 0)
+    summary["candidate_queue_count"] = int(queue_row["count"] or 0) if queue_row else 0
+    summary["folder_states"] = {key: folder_counts.get(key, 0) for key in summary["folder_states"]}
+    summary["last_skipped_folder"] = skipped_row["value"] if skipped_row else None
+    return summary
 
 
 def selected_folders_path(config: dict[str, Any]) -> Path:
@@ -797,7 +987,497 @@ def configured_folder_suggestions(config: dict[str, Any]) -> tuple[list[str], st
     return suggestions, "linux-mounts"
 
 
-def scan_candidates(folders: list[Path], config: dict[str, Any]) -> list[Path]:
+def cache_path_row(row: sqlite3.Row) -> Path:
+    return Path(str(row["path"]))
+
+
+def scan_excluded_tokens(config: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(str(item).lower() for item in ((config.get("scan") or {}).get("exclude_paths") or ["/.ripper_state/", "/.ripper_quarantine/", "/.simpleripper_quarantine/", "/.simpleripper_locks/", "/@eadir/", "/#recycle/"]))
+
+
+def scan_file_extensions(config: dict[str, Any]) -> set[str]:
+    return {str(item).lower() for item in ((config.get("scan") or {}).get("file_extensions") or VIDEO_EXTENSIONS)}
+
+
+def path_is_scan_excluded(path: Path, config: dict[str, Any]) -> bool:
+    normalized = str(path).replace("\\", "/").lower()
+    return any(token in normalized for token in scan_excluded_tokens(config))
+
+
+def path_is_ignored_video_name(path: Path) -> bool:
+    name = path.name.lower()
+    return any(token in name for token in (".sample.", "trailer", "extras", "behind the scenes")) or name.endswith((".original", ".tmp", ".partial"))
+
+
+def direct_folder_signature(folder: Path, config: dict[str, Any]) -> dict[str, int]:
+    direct_file_count = 0
+    direct_total_size = 0
+    direct_latest_mtime_ns = 0
+    child_dir_count = 0
+    try:
+        children = list(folder.iterdir())
+    except OSError:
+        return {"direct_file_count": 0, "direct_total_size": 0, "direct_latest_mtime_ns": 0, "child_dir_count": 0}
+    for child in children:
+        if path_is_scan_excluded(child, config):
+            continue
+        try:
+            if child.is_dir():
+                child_dir_count += 1
+                try:
+                    direct_latest_mtime_ns = max(direct_latest_mtime_ns, int(child.stat().st_mtime_ns))
+                except OSError:
+                    pass
+            elif child.is_file():
+                stat = child.stat()
+                direct_file_count += 1
+                direct_total_size += int(stat.st_size)
+                direct_latest_mtime_ns = max(direct_latest_mtime_ns, int(stat.st_mtime_ns))
+        except OSError:
+            continue
+    return {
+        "direct_file_count": direct_file_count,
+        "direct_total_size": direct_total_size,
+        "direct_latest_mtime_ns": direct_latest_mtime_ns,
+        "child_dir_count": child_dir_count,
+    }
+
+
+def folder_signature_matches(row: sqlite3.Row | None, signature: dict[str, int], current_policy_hash: str) -> bool:
+    if not row or str(row["state"]) != "clean" or str(row["policy_hash"] or "") != current_policy_hash:
+        return False
+    return all(int(row[key]) == int(signature[key]) for key in ("direct_file_count", "direct_total_size", "direct_latest_mtime_ns", "child_dir_count"))
+
+
+def direct_child_dirs(folder: Path, config: dict[str, Any]) -> list[Path]:
+    try:
+        return sorted([child for child in folder.iterdir() if child.is_dir() and not path_is_scan_excluded(child, config)], key=lambda item: item.name.casefold())
+    except OSError:
+        return []
+
+
+def direct_video_files(folder: Path, config: dict[str, Any]) -> list[Path]:
+    extensions = scan_file_extensions(config)
+    try:
+        files = [child for child in folder.iterdir() if child.is_file() and child.suffix.lower() in extensions and not path_is_ignored_video_name(child) and not path_is_scan_excluded(child, config)]
+    except OSError:
+        return []
+    return sorted(files, key=lambda item: item.name.casefold())
+
+
+def child_folder_cache_clean(connection: sqlite3.Connection, folder: Path, config: dict[str, Any], current_policy_hash: str) -> bool:
+    for child in direct_child_dirs(folder, config):
+        row = connection.execute("SELECT * FROM folder_index WHERE path = ?", (str(child),)).fetchone()
+        if not folder_signature_matches(row, direct_folder_signature(child, config), current_policy_hash):
+            return False
+        if not child_folder_cache_clean(connection, child, config, current_policy_hash):
+            return False
+    return True
+
+
+def update_folder_state_row(connection: sqlite3.Connection, folder: Path, config: dict[str, Any], state: str, reason: str, signature: dict[str, int], children_clean: bool) -> None:
+    now = utc_now()
+    connection.execute(
+        """
+        INSERT INTO folder_index(path, normalized_path, state, reason, direct_file_count, direct_total_size, direct_latest_mtime_ns, child_dir_count, children_clean, policy_hash, checked_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            normalized_path = excluded.normalized_path,
+            state = excluded.state,
+            reason = excluded.reason,
+            direct_file_count = excluded.direct_file_count,
+            direct_total_size = excluded.direct_total_size,
+            direct_latest_mtime_ns = excluded.direct_latest_mtime_ns,
+            child_dir_count = excluded.child_dir_count,
+            children_clean = excluded.children_clean,
+            policy_hash = excluded.policy_hash,
+            checked_at = excluded.checked_at,
+            updated_at = excluded.updated_at
+        """,
+        (str(folder), normalize_path_for_match(folder), state, reason, int(signature["direct_file_count"]), int(signature["direct_total_size"]), int(signature["direct_latest_mtime_ns"]), int(signature["child_dir_count"]), 1 if children_clean else 0, policy_hash(config), now, now),
+    )
+    log_event(config, "folder_state_updated", folder=str(folder), state=state, reason=reason)
+
+
+def direct_files_are_terminal(connection: sqlite3.Connection, folder: Path, config: dict[str, Any]) -> bool:
+    current_policy_hash = policy_hash(config)
+    for file_path in direct_video_files(folder, config):
+        marker = marker_path(file_path, config)
+        if marker is not None and marker.exists():
+            continue
+        if source_lock_path(file_path, config).exists():
+            return False
+        if is_history_done_for_current_source(config, file_path):
+            continue
+        row = connection.execute("SELECT decision, policy_hash FROM file_index WHERE path = ?", (str(file_path),)).fetchone()
+        if not row or str(row["policy_hash"] or "") != current_policy_hash:
+            return False
+        if str(row["decision"] or "") not in {"done", "skip", "blocked"}:
+            return False
+    return True
+
+
+def refresh_folder_state(connection: sqlite3.Connection, folder: Path, config: dict[str, Any]) -> str:
+    signature = direct_folder_signature(folder, config)
+    child_states = []
+    for child in direct_child_dirs(folder, config):
+        row = connection.execute("SELECT state, policy_hash FROM folder_index WHERE path = ?", (str(child),)).fetchone()
+        child_states.append(str(row["state"] or "") if row and str(row["policy_hash"] or "") == policy_hash(config) else "dirty")
+    children_clean = all(state == "clean" for state in child_states)
+    direct_terminal = direct_files_are_terminal(connection, folder, config)
+    if direct_terminal and children_clean:
+        state = "clean"
+        reason = "all_files_done_or_skipped"
+    elif any(state == "blocked" for state in child_states):
+        state = "blocked"
+        reason = "contains_blocked_child"
+    else:
+        state = "partial"
+        reason = "has_pending_candidates"
+    update_folder_state_row(connection, folder, config, state, reason, signature, children_clean)
+    return state
+
+
+def refresh_folder_state_upwards(config: dict[str, Any], source: Path) -> None:
+    if not folder_state_cache_enabled(config):
+        return
+    root_candidates = [Path(path) for path in ((config.get("libraries") or {}).get("roots") or [])]
+    root_candidates.extend(Path(item["path"]) for item in normalize_selected_folder_entries((config.get("scan") or {}).get("selected_folders") or []))
+    try:
+        source_resolved = source.resolve()
+    except OSError:
+        source_resolved = source
+    roots: list[Path] = []
+    for root in root_candidates:
+        try:
+            root_resolved = root.resolve()
+            source_resolved.relative_to(root_resolved)
+            roots.append(root_resolved)
+        except (OSError, ValueError):
+            continue
+    stop_root = max(roots, key=lambda item: len(str(item)), default=source.parent.resolve() if source.parent.exists() else source.parent)
+    with open_worker_cache(config) as connection:
+        current = source.parent if source.suffix else source
+        while True:
+            refresh_folder_state(connection, current, config)
+            try:
+                current_resolved = current.resolve()
+            except OSError:
+                current_resolved = current
+            if current_resolved == stop_root:
+                break
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+
+
+def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str, Any]:
+    now = utc_now()
+    seen = 0
+    changed = 0
+    skipped_folders = 0
+    queue_count = 0
+    current_policy_hash = policy_hash(config)
+    settings = scan_cache_settings(config)
+    log_event(config, "inventory_refresh_started", folders=[str(folder) for folder in folders], cache_path=str(worker_cache_path(config)))
+
+    def scan_folder(connection: sqlite3.Connection, folder: Path) -> None:
+        nonlocal seen, changed, skipped_folders
+        if not folder.exists() or not folder.is_dir() or path_is_scan_excluded(folder, config):
+            return
+        signature = direct_folder_signature(folder, config)
+        row = connection.execute("SELECT * FROM folder_index WHERE path = ?", (str(folder),)).fetchone()
+        if settings.get("skip_clean_folders") and folder_signature_matches(row, signature, current_policy_hash) and child_folder_cache_clean(connection, folder, config, current_policy_hash):
+            skipped_folders += 1
+            connection.execute(
+                "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                ("last_skipped_folder", str(folder), utc_now()),
+            )
+            log_event(config, "folder_scan_skipped", folder=str(folder), reason="folder_state_clean")
+            return
+        if row and str(row["state"] or "") == "clean":
+            update_folder_state_row(connection, folder, config, "stale", "signature_or_policy_changed", signature, False)
+        for child_dir in direct_child_dirs(folder, config):
+            scan_folder(connection, child_dir)
+        for path in direct_video_files(folder, config):
+            marker = marker_path(path, config)
+            if marker is not None and marker.exists():
+                continue
+            if source_lock_path(path, config).exists():
+                continue
+            stat = path.stat()
+            path_text = str(path)
+            row = connection.execute("SELECT size_bytes, mtime_ns FROM file_index WHERE path = ?", (path_text,)).fetchone()
+            same_file = bool(row and int(row["size_bytes"]) == int(stat.st_size) and int(row["mtime_ns"]) == int(stat.st_mtime_ns))
+            if not same_file:
+                changed += 1
+            decision = None
+            decision_reason = None
+            decision_policy_hash = None
+            failure_count = None
+            last_error = None
+            retry_after = None
+            if is_history_done_for_current_source(config, path):
+                decision = "done"
+                decision_reason = "history_done"
+                decision_policy_hash = current_policy_hash
+            else:
+                failure_info = recent_ffmpeg_failure_info(config, path)
+                if failure_info:
+                    decision = "failed"
+                    decision_reason = "recent_ffmpeg_failure"
+                    decision_policy_hash = current_policy_hash
+                    failure_count = int(failure_info.get("failure_count") or 1)
+                    last_error = failure_info.get("error")
+                    retry_after = failure_info.get("retry_after")
+                    log_event(config, "candidate_scan_skipped", source_path=str(path), reason="recent_ffmpeg_failure", **failure_info)
+            connection.execute(
+                """
+                INSERT INTO file_index(path, normalized_path, media_type, size_bytes, mtime_ns, suffix, parent_dir, score, decision, decision_reason, policy_hash, failure_count, last_error, retry_after, last_seen_at, last_fast_scanned_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    normalized_path = excluded.normalized_path,
+                    media_type = excluded.media_type,
+                    size_bytes = excluded.size_bytes,
+                    mtime_ns = excluded.mtime_ns,
+                    suffix = excluded.suffix,
+                    parent_dir = excluded.parent_dir,
+                    score = CASE WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.score ELSE excluded.score END,
+                    duration_seconds = CASE WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.duration_seconds ELSE NULL END,
+                    video_codec = CASE WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.video_codec ELSE NULL END,
+                    video_pix_fmt = CASE WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.video_pix_fmt ELSE NULL END,
+                    width = CASE WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.width ELSE NULL END,
+                    height = CASE WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.height ELSE NULL END,
+                    overall_bitrate_kbps = CASE WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.overall_bitrate_kbps ELSE NULL END,
+                    audio_stream_count = CASE WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.audio_stream_count ELSE NULL END,
+                    subtitle_stream_count = CASE WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.subtitle_stream_count ELSE NULL END,
+                    decision = CASE
+                        WHEN excluded.decision IS NOT NULL THEN excluded.decision
+                        WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.decision
+                        ELSE NULL
+                    END,
+                    decision_reason = CASE
+                        WHEN excluded.decision_reason IS NOT NULL THEN excluded.decision_reason
+                        WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.decision_reason
+                        ELSE NULL
+                    END,
+                    estimated_saved_bytes = CASE WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.estimated_saved_bytes ELSE NULL END,
+                    policy_hash = CASE
+                        WHEN excluded.policy_hash IS NOT NULL THEN excluded.policy_hash
+                        WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.policy_hash
+                        ELSE NULL
+                    END,
+                    failure_count = CASE
+                        WHEN excluded.failure_count IS NOT NULL THEN excluded.failure_count
+                        WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.failure_count
+                        ELSE 0
+                    END,
+                    last_error = CASE
+                        WHEN excluded.last_error IS NOT NULL THEN excluded.last_error
+                        WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.last_error
+                        ELSE NULL
+                    END,
+                    retry_after = CASE
+                        WHEN excluded.retry_after IS NOT NULL THEN excluded.retry_after
+                        WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.retry_after
+                        ELSE NULL
+                    END,
+                    next_check_after = CASE WHEN file_index.size_bytes = excluded.size_bytes AND file_index.mtime_ns = excluded.mtime_ns THEN file_index.next_check_after ELSE NULL END,
+                    last_seen_at = excluded.last_seen_at,
+                    last_fast_scanned_at = excluded.last_fast_scanned_at,
+                    updated_at = excluded.updated_at
+                """,
+                (path_text, normalize_path_for_match(path), guess_media_type(path), int(stat.st_size), int(stat.st_mtime_ns), path.suffix.lower(), str(path.parent), float(stat.st_size), decision, decision_reason, decision_policy_hash, failure_count, last_error, retry_after, now, now, now),
+            )
+            seen += 1
+        refresh_folder_state(connection, folder, config)
+
+    with open_worker_cache(config) as connection:
+        for folder in folders:
+            scan_folder(connection, folder)
+        connection.execute(
+            "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            ("last_fast_inventory_scan_at", now, now),
+        )
+        connection.execute(
+            "INSERT INTO scan_state(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            ("last_policy_hash", policy_hash(config), now),
+        )
+        queue_row = connection.execute("SELECT COUNT(*) AS count FROM file_index WHERE decision IS NULL OR decision = 'encode_candidate'").fetchone()
+        queue_count = int(queue_row["count"] or 0) if queue_row else 0
+    log_event(config, "inventory_refresh_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, cache_path=str(worker_cache_path(config)))
+    log_event(config, "candidate_queue_refreshed", count=queue_count)
+    log_event(config, "fast_inventory_scan_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, cache_path=str(worker_cache_path(config)))
+    return {"indexed_files": seen, "changed_files": changed, "skipped_folders": skipped_folders, "last_fast_inventory_scan_at": now}
+
+
+def fast_inventory_due(config: dict[str, Any]) -> bool:
+    last_scan = parse_utc_datetime(scan_state_get(config, "last_fast_inventory_scan_at"))
+    if last_scan is None:
+        return True
+    return time.time() >= last_scan.timestamp() + scan_cache_settings(config)["fast_inventory_rescan_hours"] * 3600
+
+
+def ensure_fast_inventory_scan(config: dict[str, Any], folders: list[Path], force: bool = False) -> dict[str, Any] | None:
+    if not scan_cache_enabled(config):
+        return None
+    with open_worker_cache(config):
+        pass
+    if force or fast_inventory_due(config):
+        return fast_inventory_scan(folders, config)
+    return None
+
+
+def cached_candidate_paths(config: dict[str, Any]) -> list[Path]:
+    settings = scan_cache_settings(config)
+    queue_size = max(1, int(settings.get("queue_size") or 25))
+    current_policy_hash = policy_hash(config)
+    now = utc_now()
+    paths: list[Path] = []
+    with open_worker_cache(config) as connection:
+        rows = connection.execute(
+            """
+            SELECT path, size_bytes, mtime_ns FROM file_index
+            WHERE
+                decision IS NULL
+                OR decision = 'encode_candidate'
+                OR policy_hash IS NULL
+                OR policy_hash != ?
+                OR (decision = 'failed' AND (retry_after IS NULL OR retry_after <= ?))
+                OR (decision = 'blocked' AND (next_check_after IS NULL OR next_check_after <= ?))
+            ORDER BY COALESCE(score, size_bytes) DESC, size_bytes DESC
+            LIMIT ?
+            """,
+            (current_policy_hash, now, now, queue_size),
+        ).fetchall()
+        for row in rows:
+            path = cache_path_row(row)
+            marker = marker_path(path, config)
+            if not path.exists() or (marker is not None and marker.exists()) or source_lock_path(path, config).exists():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if int(row["size_bytes"] or 0) != int(stat.st_size) or int(row["mtime_ns"] or 0) != int(stat.st_mtime_ns):
+                connection.execute(
+                    "UPDATE file_index SET size_bytes = ?, mtime_ns = ?, decision = NULL, decision_reason = NULL, policy_hash = NULL, updated_at = ? WHERE path = ?",
+                    (int(stat.st_size), int(stat.st_mtime_ns), utc_now(), str(path)),
+                )
+            paths.append(path)
+    log_event(config, "candidate_queue_loaded", count=len(paths))
+    if not paths:
+        log_event(config, "candidate_queue_empty")
+    return paths
+
+
+def estimated_saved_bytes_from_details(details: dict[str, Any]) -> int | None:
+    retention = details.get("retention_size_policy") or {}
+    actual_mb = retention.get("actual_mb")
+    limit_mb = retention.get("limit_mb")
+    if actual_mb is None or limit_mb is None:
+        return None
+    try:
+        return max(0, int((float(actual_mb) - float(limit_mb)) * 1024 * 1024))
+    except (TypeError, ValueError):
+        return None
+
+
+def update_cache_deep_check(config: dict[str, Any], details: dict[str, Any]) -> None:
+    if not scan_cache_enabled(config):
+        return
+    source = Path(str(details.get("path")))
+    if not source.exists():
+        return
+    metadata = details.get("metadata") or {}
+    decision = "encode_candidate"
+    decision_reason = details.get("candidate_reason") or "needs_encode"
+    if details.get("status") != "ok":
+        decision = "failed"
+        decision_reason = str(details.get("status") or "deep_check_failed")
+    elif details.get("skip_reason"):
+        decision = "skip"
+        decision_reason = str(details.get("skip_reason"))
+    stat = source.stat()
+    now = utc_now()
+    with open_worker_cache(config) as connection:
+        connection.execute(
+            """
+            UPDATE file_index SET
+                media_type = ?, size_bytes = ?, mtime_ns = ?, duration_seconds = ?, video_codec = ?, video_pix_fmt = ?, width = ?, height = ?,
+                overall_bitrate_kbps = ?, audio_stream_count = ?, subtitle_stream_count = ?, decision = ?, decision_reason = ?, score = ?,
+                estimated_saved_bytes = ?, policy_hash = ?, last_deep_checked_at = ?, updated_at = ?
+            WHERE path = ?
+            """,
+            (
+                metadata.get("media_type") or guess_media_type(source),
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+                metadata.get("duration_seconds"),
+                metadata.get("video_codec"),
+                metadata.get("video_pix_fmt"),
+                metadata.get("video_width"),
+                metadata.get("video_height"),
+                metadata.get("overall_bitrate_kbps"),
+                metadata.get("audio_stream_count"),
+                metadata.get("subtitle_stream_count"),
+                decision,
+                decision_reason,
+                float(details.get("score") or 0),
+                estimated_saved_bytes_from_details(details),
+                policy_hash(config),
+                now,
+                now,
+                str(source),
+            ),
+        )
+    log_event(config, "file_state_updated", source_path=str(source), state=decision, reason=decision_reason)
+    refresh_folder_state_upwards(config, source)
+
+
+def update_cache_job_success(config: dict[str, Any], source: Path) -> None:
+    if not scan_cache_enabled(config):
+        return
+    now = utc_now()
+    with open_worker_cache(config) as connection:
+        connection.execute(
+            "UPDATE file_index SET decision = 'done', decision_reason = 'job_done', failure_count = 0, last_error = NULL, retry_after = NULL, next_check_after = NULL, policy_hash = ?, updated_at = ? WHERE path = ?",
+            (policy_hash(config), now, str(source)),
+        )
+    log_event(config, "file_state_updated", source_path=str(source), state="done", reason="job_done")
+    refresh_folder_state_upwards(config, source)
+
+
+def update_cache_job_failure(config: dict[str, Any], source: Path, error: str) -> dict[str, Any] | None:
+    if not scan_cache_enabled(config):
+        return None
+    settings = scan_cache_settings(config)
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat(timespec="seconds")
+    retry_after = (now_dt.timestamp() + float(settings["failed_retry_hours"]) * 3600)
+    blocked_after = (now_dt.timestamp() + float(settings["blocked_retry_days"]) * 86400)
+    with open_worker_cache(config) as connection:
+        row = connection.execute("SELECT failure_count FROM file_index WHERE path = ?", (str(source),)).fetchone()
+        failure_count = int(row["failure_count"] or 0) + 1 if row else 1
+        decision = "blocked" if failure_count >= int(settings["max_failures_before_block"]) else "failed"
+        next_check_after = datetime.fromtimestamp(blocked_after, timezone.utc).isoformat(timespec="seconds") if decision == "blocked" else None
+        retry_text = datetime.fromtimestamp(retry_after, timezone.utc).isoformat(timespec="seconds") if decision == "failed" else None
+        connection.execute(
+            """
+            INSERT INTO file_index(path, normalized_path, media_type, size_bytes, mtime_ns, suffix, parent_dir, decision, decision_reason, policy_hash, failure_count, last_error, retry_after, next_check_after, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET decision = excluded.decision, decision_reason = excluded.decision_reason, policy_hash = excluded.policy_hash,
+                failure_count = excluded.failure_count, last_error = excluded.last_error, retry_after = excluded.retry_after, next_check_after = excluded.next_check_after, updated_at = excluded.updated_at
+            """,
+            (str(source), normalize_path_for_match(source), guess_media_type(source), source.stat().st_size if source.exists() else 0, source.stat().st_mtime_ns if source.exists() else 0, source.suffix.lower(), str(source.parent), decision, "repeated_ffmpeg_failure" if decision == "blocked" else "ffmpeg_failed", policy_hash(config), failure_count, error, retry_text, next_check_after, now),
+        )
+    log_event(config, "file_state_updated", source_path=str(source), state=decision, reason="repeated_ffmpeg_failure" if decision == "blocked" else "ffmpeg_failed")
+    refresh_folder_state_upwards(config, source)
+    return {"decision": decision, "failure_count": failure_count, "retry_after": retry_text, "next_check_after": next_check_after}
+
+
+def uncached_scan_candidates(folders: list[Path], config: dict[str, Any]) -> list[Path]:
     sync_history_from_shared_workers(config)
     extensions = {str(item).lower() for item in ((config.get("scan") or {}).get("file_extensions") or VIDEO_EXTENSIONS)}
     excluded_tokens = tuple(str(item).lower() for item in ((config.get("scan") or {}).get("exclude_paths") or ["/.ripper_state/", "/.ripper_quarantine/", "/.simpleripper_quarantine/", "/.simpleripper_locks/", "/@eadir/", "/#recycle/"]))
@@ -819,6 +1499,13 @@ def scan_candidates(folders: list[Path], config: dict[str, Any]) -> list[Path]:
                     continue
                 candidates.append(path)
     return sorted(candidates, key=lambda item: item.stat().st_size, reverse=True)
+
+
+def scan_candidates(folders: list[Path], config: dict[str, Any]) -> list[Path]:
+    if scan_cache_enabled(config):
+        ensure_fast_inventory_scan(config, folders)
+        return cached_candidate_paths(config)
+    return uncached_scan_candidates(folders, config)
 
 
 def candidate_priority_score(metadata: dict[str, Any]) -> float:
@@ -1515,6 +2202,7 @@ class SimpleRipperApp:
                 "selected_folder_paths": [str(path) for path in self.selected_folders],
                 "custom_folders": list(self.custom_folder_entries),
                 "test_mode_message": "Bezi v test modu. Original nikdy nebude po uspechu smazan, zustane v karantene." if self.state.test_mode else None,
+                "scan_cache": worker_cache_summary(self.config),
                 "recent_log_lines": tail_text_lines(app_log_path(self.config), 60),
             }
 
@@ -1723,11 +2411,12 @@ class SimpleRipperApp:
     def pick_next_candidate(self, candidates: list[Path]) -> Path | None:
         if not candidates:
             return None
-        probe_limit = int(((self.config.get("scan") or {}).get("priority_probe_limit") or 12))
+        probe_limit = int((scan_cache_settings(self.config).get("max_deep_checks_per_cycle") if scan_cache_enabled(self.config) else None) or ((self.config.get("scan") or {}).get("priority_probe_limit") or 12))
         probe_limit = max(1, probe_limit)
         inspected: list[dict[str, Any]] = []
         for candidate in candidates[:probe_limit]:
             details = inspect_candidate(self.config, candidate, self.media_type_for_source(candidate))
+            update_cache_deep_check(self.config, details)
             if details.get("status") != "ok":
                 log_event(self.config, "candidate_probe_failed", source_path=str(candidate), error=details.get("error"))
                 continue
@@ -1742,6 +2431,7 @@ class SimpleRipperApp:
             return Path(best["path"])
         for candidate in candidates[probe_limit:]:
             details = inspect_candidate(self.config, candidate, self.media_type_for_source(candidate))
+            update_cache_deep_check(self.config, details)
             if details.get("status") != "ok":
                 log_event(self.config, "candidate_probe_failed", source_path=str(candidate), error=details.get("error"))
                 continue
@@ -1770,6 +2460,8 @@ class SimpleRipperApp:
                     continue
                 candidate = self.pick_next_candidate(candidates)
                 if candidate is None:
+                    if scan_cache_enabled(self.config) and cached_candidate_paths(self.config):
+                        continue
                     if not self.schedule_rescan_wait(3600, "no_usable_candidates"):
                         break
                     continue
@@ -1839,6 +2531,10 @@ class SimpleRipperApp:
                 history_payload = {"status": "skipped", "source_signature": source_signature(source), "job_id": job_id, "updated_at": utc_now(), "reason": reason, "retention_size_policy": retention_size_policy}
                 write_history_index(self.config, source, history_payload)
                 write_shared_worker_history(self.config, source, history_payload)
+                update_cache_deep_check(
+                    self.config,
+                    {"path": source, "status": "ok", "metadata": source_meta, "skip_reason": reason, "score": candidate_priority_score(source_meta), "retention_size_policy": retention_size_policy},
+                )
                 log_event(self.config, "candidate_skipped", job_id=job_id, source_path=str(source), reason=reason, profile_mismatch_reasons=profile_mismatch_reasons, retention_size_policy=retention_size_policy)
                 with self._lock:
                     self.state.last_processed = ([{"source_path": str(source), "finished_at": utc_now(), "status": "skipped", "reason": reason}] + (self.state.last_processed or []))[:20]
@@ -1916,6 +2612,7 @@ class SimpleRipperApp:
             history_payload = {"status": "done", "job_id": job_id, "source_signature": source_signature(source), "updated_at": utc_now(), "video_codec_after": final_meta.get("video_codec")}
             write_history_index(self.config, source, history_payload)
             write_shared_worker_history(self.config, source, history_payload)
+            update_cache_job_success(self.config, source)
             log_event(self.config, "final_verification_ok", job_id=job_id, replacement_path=str(source), output_size_bytes=source.stat().st_size)
             self.set_phase("refreshing_jellyfin", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "quarantine_path": final_payload["quarantine_path"], **recovery_context})
             jellyfin_refresh = refresh_jellyfin(self.config, source)
@@ -1944,6 +2641,9 @@ class SimpleRipperApp:
             history_payload = {"status": "error", "job_id": job_id, "source_signature": current_signature, "updated_at": utc_now(), "error": str(exc), "failure_type": failure_type, "failure_count": previous_failure_count + 1}
             write_history_index(self.config, source, history_payload)
             write_shared_worker_history(self.config, source, history_payload)
+            cache_failure = update_cache_job_failure(self.config, source, str(exc)) if isinstance(exc, FfmpegFailedError) else None
+            if cache_failure:
+                log_event(self.config, "candidate_cache_failure", job_id=job_id, source_path=str(source), **cache_failure)
             self.log_error(f"{source}: {exc}", source_path=str(source), failure_type=failure_type)
             preserve_failed_output(work_dir_path, source, self.config)
         finally:
@@ -2319,13 +3019,29 @@ def run_server(config: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="simpleripper")
-    parser.add_argument("command", choices=["web", "check-config"])
+    parser.add_argument("command", choices=["web", "check-config", "rebuild-index", "cache-summary", "clear-failures", "clear-cache"])
     parser.add_argument("--config", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
         if args.command == "check-config":
             print(json.dumps({"ok": True, "config": str(args.config), "roots": (config.get("libraries") or {}).get("roots") or []}, indent=2))
+            return 0
+        if args.command == "rebuild-index":
+            folders = [Path(item.get("path")) if isinstance(item, dict) else Path(item) for item in (((config.get("scan") or {}).get("selected_folders") or (config.get("libraries") or {}).get("roots") or []))]
+            result = fast_inventory_scan(folders, config)
+            print(json.dumps({"ok": True, **result, "cache": worker_cache_summary(config)}, indent=2))
+            return 0
+        if args.command == "cache-summary":
+            print(json.dumps(worker_cache_summary(config), indent=2))
+            return 0
+        if args.command == "clear-failures":
+            clear_worker_failures(config)
+            print(json.dumps({"ok": True, "cache": worker_cache_summary(config)}, indent=2))
+            return 0
+        if args.command == "clear-cache":
+            clear_worker_cache(config)
+            print(json.dumps({"ok": True, "cache": worker_cache_summary(config)}, indent=2))
             return 0
         run_server(config)
         return 0

@@ -64,7 +64,9 @@ Copy `config.example.yaml` to `config.yaml` and edit:
 - `scan.write_sidecar_markers`: default `false`; when enabled, SimpleRipper also writes legacy `.simpleripper.done*` sidecar markers beside source files.
 - `scan.failed_retry_cooldown_hours` and `scan.max_failures_per_file`: keep recent ffmpeg failures out of the next scan using central history, so one bad file cannot loop immediately.
 - `scan.priority_probe_limit`: how many of the largest current candidates get ffprobe-based ranking before the next job is chosen.
+- `scan_cache`: local SQLite worker cache for fast inventory scans, cached skip decisions, candidate queues, hierarchical folder clean/partial state, and failed/blocked cooldowns.
 - `retention_size_policy`: keeps oversized HEVC/AV1 files eligible even when they already match the target codec, based on a per-media-type MB-per-25-minute limit.
+- `paths.worker_cache_path`: optional explicit SQLite cache path; defaults to `<runtime_dir>/worker_cache.sqlite`.
 - `paths.local_work_dir`: local temporary processing area.
 - `paths.history_dir`: local job history JSON and JSONL records.
 - `paths.log_dir`: reserved local app log directory.
@@ -83,4 +85,15 @@ Successful job history includes flattened before/after summary fields such as so
 python -m unittest discover -s tests -v
 ```
 
+## Cache Commands
+
+```powershell
+python simpleripper.py rebuild-index --config config.yaml
+python simpleripper.py cache-summary --config config.yaml
+python simpleripper.py clear-failures --config config.yaml
+python simpleripper.py clear-cache --config config.yaml
+```
+
 The old project is kept only as `ZAMEK_AUTORIPPER_OLD_READONLY_DO_NOT_CONTINUE/` for locked reference settings.
+
+The cache is worker-local and only an optimization. Deleting `paths.worker_cache_path` makes the next run rebuild its inventory and folder states from the media tree. Clean folders are skipped by cheap folder signatures only; no `.simpleripper.done` marker files are written to original media folders unless legacy sidecar markers are explicitly enabled.

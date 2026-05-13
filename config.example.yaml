@@ -7,6 +7,7 @@ paths:
   local_work_dir: work
   history_dir: history
   log_dir: logs
+  worker_cache_path: runtime/worker_cache.sqlite
   quarantine_dir: quarantine
   quarantine_relative_root: ""
   inspection_dir: inspection
@@ -42,6 +43,17 @@ scan:
     - /.simpleripper_locks/
     - /@eaDir/
     - /#recycle/
+
+scan_cache:
+  enabled: true
+  fast_inventory_rescan_hours: 24
+  folder_state_cache_enabled: true
+  skip_clean_folders: true
+  max_deep_checks_per_cycle: 50
+  queue_size: 25
+  failed_retry_hours: 24
+  max_failures_before_block: 3
+  blocked_retry_days: 30
 
 safety:
   min_free_disk_gb: 20
