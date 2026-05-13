@@ -62,6 +62,17 @@ quality_profiles:
     audio: copy
     subtitles: copy
 
+retention_size_policy:
+  enabled: true
+  series:
+    max_mb_per_25min: 500
+  anime:
+    max_mb_per_25min: 500
+  movie:
+    max_mb_per_25min: 500
+  unknown:
+    max_mb_per_25min: 500
+
 track_policy:
   enabled: true
   target_audio_languages:

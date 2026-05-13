@@ -64,6 +64,7 @@ Copy `config.example.yaml` to `config.yaml` and edit:
 - `scan.write_sidecar_markers`: default `false`; when enabled, SimpleRipper also writes legacy `.simpleripper.done*` sidecar markers beside source files.
 - `scan.failed_retry_cooldown_hours` and `scan.max_failures_per_file`: keep recent ffmpeg failures out of the next scan using central history, so one bad file cannot loop immediately.
 - `scan.priority_probe_limit`: how many of the largest current candidates get ffprobe-based ranking before the next job is chosen.
+- `retention_size_policy`: keeps oversized HEVC/AV1 files eligible even when they already match the target codec, based on a per-media-type MB-per-25-minute limit.
 - `paths.local_work_dir`: local temporary processing area.
 - `paths.history_dir`: local job history JSON and JSONL records.
 - `paths.log_dir`: reserved local app log directory.

@@ -936,16 +936,27 @@ def inspect_candidate(config: dict[str, Any], source: Path, media_type: str) -> 
         return {"path": source, "status": "ffprobe_failed", "error": error}
     metadata = extract_metadata(source, probe, media_type)
     stream_policy = select_streams(config, metadata)
+    retention_size_policy = retention_size_policy_evaluation(config, metadata, media_type)
     profile_matches, profile_mismatch_reasons = source_matches_target_profile(config, metadata, media_type, stream_policy)
     reason = skip_reason(config, metadata, stream_policy)
     score = candidate_priority_score(metadata)
     if should_reprocess_hevc(config, metadata):
         score += 35.0
     codec = str(metadata.get("video_codec") or "").lower()
-    candidate_reason = "hevc_not_normalized" if codec in {"hevc", "h265"} and not profile_matches else None
+    candidate_reason = None
+    if retention_size_policy.get("oversized") and codec in {"hevc", "h265"}:
+        candidate_reason = "hevc_oversized"
+        score += 40.0
+    elif retention_size_policy.get("oversized") and codec == "av1":
+        candidate_reason = "av1_oversized"
+        score += 40.0
+    elif codec in {"hevc", "h265"} and not profile_matches:
+        candidate_reason = "hevc_not_normalized"
+    elif codec == "av1" and not profile_matches:
+        candidate_reason = "av1_not_normalized"
     if candidate_reason:
         score += 20.0
-    return {"path": source, "status": "ok", "metadata": metadata, "skip_reason": reason, "score": score, "track_policy": stream_policy, "target_profile_matches": profile_matches, "profile_mismatch_reasons": profile_mismatch_reasons, "candidate_reason": candidate_reason}
+    return {"path": source, "status": "ok", "metadata": metadata, "skip_reason": reason, "score": score, "track_policy": stream_policy, "target_profile_matches": profile_matches, "profile_mismatch_reasons": profile_mismatch_reasons, "candidate_reason": candidate_reason, "retention_size_policy": retention_size_policy}
 
 
 def candidate_selection_key(candidate: dict[str, Any]) -> tuple[int, float]:
@@ -963,12 +974,14 @@ def skip_reason(config: dict[str, Any], metadata: dict[str, Any], track_policy_r
         return "skip_hdr"
     media_type = str(metadata.get("media_type") or "default")
     profile_matches, _profile_mismatch_reasons = source_matches_target_profile(config, metadata, media_type, track_policy_result)
+    retention_size_policy = retention_size_policy_evaluation(config, metadata, media_type)
+    oversized = bool(retention_size_policy.get("oversized"))
+    if rules.get("skip_hevc", True) and codec in {"hevc", "h265"} and profile_matches and not oversized:
+        return "already_hevc"
+    if rules.get("skip_av1", True) and codec == "av1" and profile_matches and not oversized:
+        return "already_av1"
     if profile_matches and str(metadata.get("encoded_by") or "").casefold() == APP_NAME.casefold():
         return "already_simpleripper"
-    if rules.get("skip_hevc", True) and codec in {"hevc", "h265"} and profile_matches:
-        return "already_normalized"
-    if rules.get("skip_av1", True) and codec == "av1" and profile_matches:
-        return "already_normalized"
     min_duration = rules.get("min_duration_seconds")
     if min_duration is not None and (metadata.get("duration_seconds") or 0) < float(min_duration):
         return "below_min_duration"
@@ -976,6 +989,35 @@ def skip_reason(config: dict[str, Any], metadata: dict[str, Any], track_policy_r
     if min_size_mb is not None and int(metadata.get("file_size_bytes") or 0) < int(min_size_mb) * 1024 * 1024:
         return "below_min_size"
     return None
+
+
+def retention_size_policy_evaluation(config: dict[str, Any], source_meta: dict[str, Any], media_type: str) -> dict[str, Any]:
+    policy = config.get("retention_size_policy") or {}
+    enabled = bool(policy.get("enabled", False))
+    bucket = media_type if media_type in {"series", "anime", "movie", "unknown"} else "unknown"
+    per_media = policy.get(bucket) or {}
+    try:
+        max_mb_per_25min = float(per_media.get("max_mb_per_25min")) if per_media.get("max_mb_per_25min") is not None else None
+    except (TypeError, ValueError):
+        max_mb_per_25min = None
+    duration_seconds = to_float(source_meta.get("duration_seconds"))
+    duration_minutes = (duration_seconds / 60.0) if duration_seconds is not None else None
+    actual_mb = (int(source_meta.get("file_size_bytes") or 0) / 1024 / 1024) if source_meta.get("file_size_bytes") is not None else None
+    limit_mb = None
+    oversized = False
+    if enabled and max_mb_per_25min is not None and duration_minutes and duration_minutes > 0:
+        limit_mb = duration_minutes / 25.0 * max_mb_per_25min
+        oversized = actual_mb is not None and actual_mb > limit_mb
+    return {
+        "enabled": enabled,
+        "media_type": bucket,
+        "codec": str(source_meta.get("video_codec") or "").lower() or None,
+        "max_mb_per_25min": max_mb_per_25min,
+        "duration_minutes": round(duration_minutes, 1) if duration_minutes is not None else None,
+        "actual_mb": round(actual_mb, 1) if actual_mb is not None else None,
+        "limit_mb": round(limit_mb, 1) if limit_mb is not None else None,
+        "oversized": oversized,
+    }
 
 
 def source_matches_target_profile(config: dict[str, Any], source_meta: dict[str, Any], media_type: str, track_policy_result: dict[str, Any] | None = None) -> tuple[bool, list[str]]:
@@ -989,6 +1031,12 @@ def source_matches_target_profile(config: dict[str, Any], source_meta: dict[str,
     source_pix_fmt = str(source_meta.get("video_pix_fmt") or "").strip()
     if target_pix_fmt and source_pix_fmt != target_pix_fmt:
         reasons.append(f"pix_fmt_mismatch:{source_pix_fmt or 'none'}!={target_pix_fmt}")
+    retention_size_policy = retention_size_policy_evaluation(config, source_meta, media_type)
+    if retention_size_policy.get("enabled") and retention_size_policy.get("oversized") and codec in {"hevc", "h265", "av1"}:
+        reasons.append(
+            "retention_size_exceeded:"
+            f"{retention_size_policy.get('actual_mb')}MB>{retention_size_policy.get('limit_mb')}MB"
+        )
     stream_policy = track_policy_result if track_policy_result is not None else select_streams(config, source_meta)
     if stream_policy.get("applied"):
         expected_audio = int(stream_policy.get("expected_audio_stream_count") or 0)
@@ -1684,13 +1732,13 @@ class SimpleRipperApp:
                 log_event(self.config, "candidate_probe_failed", source_path=str(candidate), error=details.get("error"))
                 continue
             if details.get("skip_reason"):
-                log_event(self.config, "candidate_scan_skipped", source_path=str(candidate), reason=details.get("skip_reason"))
+                log_event(self.config, "candidate_scan_skipped", source_path=str(candidate), reason=details.get("skip_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"), retention_size_policy=details.get("retention_size_policy"))
                 continue
             inspected.append(details)
         if inspected:
             inspected.sort(key=candidate_selection_key, reverse=True)
             best = inspected[0]
-            log_event(self.config, "candidate_ranked", source_path=str(best["path"]), score=best.get("score"), codec=(best.get("metadata") or {}).get("video_codec"), candidate_reason=best.get("candidate_reason"), profile_mismatch_reasons=best.get("profile_mismatch_reasons"))
+            log_event(self.config, "candidate_ranked", source_path=str(best["path"]), score=best.get("score"), codec=(best.get("metadata") or {}).get("video_codec"), candidate_reason=best.get("candidate_reason"), profile_mismatch_reasons=best.get("profile_mismatch_reasons"), retention_size_policy=best.get("retention_size_policy"))
             return Path(best["path"])
         for candidate in candidates[probe_limit:]:
             details = inspect_candidate(self.config, candidate, self.media_type_for_source(candidate))
@@ -1698,9 +1746,9 @@ class SimpleRipperApp:
                 log_event(self.config, "candidate_probe_failed", source_path=str(candidate), error=details.get("error"))
                 continue
             if details.get("skip_reason"):
-                log_event(self.config, "candidate_scan_skipped", source_path=str(candidate), reason=details.get("skip_reason"))
+                log_event(self.config, "candidate_scan_skipped", source_path=str(candidate), reason=details.get("skip_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"), retention_size_policy=details.get("retention_size_policy"))
                 continue
-            log_event(self.config, "candidate_ranked_fallback", source_path=str(details["path"]), score=details.get("score"), codec=(details.get("metadata") or {}).get("video_codec"), candidate_reason=details.get("candidate_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"))
+            log_event(self.config, "candidate_ranked_fallback", source_path=str(details["path"]), score=details.get("score"), codec=(details.get("metadata") or {}).get("video_codec"), candidate_reason=details.get("candidate_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"), retention_size_policy=details.get("retention_size_policy"))
             return Path(details["path"])
         return None
 
@@ -1776,26 +1824,28 @@ class SimpleRipperApp:
             recovery_context = {"source_metadata": source_meta}
             stream_policy = select_streams(self.config, source_meta)
             profile_matches, profile_mismatch_reasons = source_matches_target_profile(self.config, source_meta, str(source_meta.get("media_type") or "default"), stream_policy)
+            retention_size_policy = retention_size_policy_evaluation(self.config, source_meta, str(source_meta.get("media_type") or "default"))
             recovery_context["track_policy"] = stream_policy
             recovery_context["target_profile_matches"] = profile_matches
             recovery_context["profile_mismatch_reasons"] = profile_mismatch_reasons
+            recovery_context["retention_size_policy"] = retention_size_policy
             reason = skip_reason(self.config, source_meta, stream_policy)
             if reason:
-                job_summary.update({"status": "skipped", "skip_reason": reason, "finished_at": utc_now(), "source": source_meta, "target_profile_matches": profile_matches, "profile_mismatch_reasons": profile_mismatch_reasons, "track_policy": stream_policy})
+                job_summary.update({"status": "skipped", "skip_reason": reason, "finished_at": utc_now(), "source": source_meta, "target_profile_matches": profile_matches, "profile_mismatch_reasons": profile_mismatch_reasons, "track_policy": stream_policy, "retention_size_policy": retention_size_policy})
                 marker = marker_path(source, self.config)
                 if marker is not None:
                     write_json(marker, job_summary)
                 append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
-                history_payload = {"status": "skipped", "source_signature": source_signature(source), "job_id": job_id, "updated_at": utc_now(), "reason": reason}
+                history_payload = {"status": "skipped", "source_signature": source_signature(source), "job_id": job_id, "updated_at": utc_now(), "reason": reason, "retention_size_policy": retention_size_policy}
                 write_history_index(self.config, source, history_payload)
                 write_shared_worker_history(self.config, source, history_payload)
-                log_event(self.config, "candidate_skipped", job_id=job_id, source_path=str(source), reason=reason, profile_mismatch_reasons=profile_mismatch_reasons)
+                log_event(self.config, "candidate_skipped", job_id=job_id, source_path=str(source), reason=reason, profile_mismatch_reasons=profile_mismatch_reasons, retention_size_policy=retention_size_policy)
                 with self._lock:
                     self.state.last_processed = ([{"source_path": str(source), "finished_at": utc_now(), "status": "skipped", "reason": reason}] + (self.state.last_processed or []))[:20]
                 succeeded = True
                 return
             if profile_mismatch_reasons:
-                log_event(self.config, "candidate_profile_mismatch", job_id=job_id, source_path=str(source), reasons=profile_mismatch_reasons)
+                log_event(self.config, "candidate_profile_mismatch", job_id=job_id, source_path=str(source), reasons=profile_mismatch_reasons, retention_size_policy=retention_size_policy)
             self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
             command = build_ffmpeg_command(self.config, copied_source, output, source_meta, stream_policy)
             job_summary["ffmpeg_command"] = command

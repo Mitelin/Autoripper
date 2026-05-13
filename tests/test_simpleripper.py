@@ -20,6 +20,7 @@ class SimpleRipperTests(unittest.TestCase):
             "tools": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
             "libraries": {"roots": [str(root / "library")]},
             "scan": {"file_extensions": [".mkv"], "processed_marker_suffix": ".simpleripper.done.json", "lock_suffix": ".simpleripper.lock", "write_sidecar_markers": False, "failed_retry_cooldown_hours": 24, "max_failures_per_file": 1},
+            "retention_size_policy": {"enabled": True, "series": {"max_mb_per_25min": 500}, "anime": {"max_mb_per_25min": 500}, "movie": {"max_mb_per_25min": 500}, "unknown": {"max_mb_per_25min": 500}},
             "verification": {"max_duration_diff_seconds": 2, "max_output_source_ratio": 0.95, "low_ratio_warning": 0.15},
             "track_policy": {"enabled": True, "target_audio_languages": ["cze"], "drop_other_audio_if_target_found": True, "keep_subtitles": True},
         }
@@ -1066,6 +1067,8 @@ class SimpleRipperTests(unittest.TestCase):
             "video_pix_fmt": "yuv420p10le",
             "video_height": 1080,
             "is_hdr": False,
+            "duration_seconds": 1500,
+            "file_size_bytes": 400 * 1024 * 1024,
             "audio_stream_count": 1,
             "subtitle_stream_count": 2,
             "audio_streams": [{"index": 1, "codec": "eac3", "language": "cze", "title": "Czech"}],
@@ -1080,7 +1083,64 @@ class SimpleRipperTests(unittest.TestCase):
 
         self.assertTrue(matches)
         self.assertEqual(reasons, [])
-        self.assertEqual(simpleripper.skip_reason(config, metadata, track_policy), "already_normalized")
+        self.assertEqual(simpleripper.skip_reason(config, metadata, track_policy), "already_hevc")
+
+    def test_hevc_source_matching_profile_but_oversized_is_not_skipped(self) -> None:
+        config = self.make_config(Path("."))
+        config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}, "series": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+        config["skip_rules"] = {"skip_hevc": True, "skip_4k": True, "skip_hdr": True}
+        metadata = {
+            "media_type": "series",
+            "video_codec": "hevc",
+            "video_pix_fmt": "yuv420p10le",
+            "video_height": 1080,
+            "is_hdr": False,
+            "duration_seconds": 3036,
+            "file_size_bytes": 1554 * 1024 * 1024,
+            "audio_stream_count": 1,
+            "subtitle_stream_count": 2,
+            "audio_streams": [{"index": 1, "codec": "eac3", "language": "cze", "title": "Czech"}],
+            "subtitle_streams": [
+                {"index": 2, "codec": "subrip", "language": "cze", "title": "Czech"},
+                {"index": 3, "codec": "subrip", "language": "cze", "title": "Forced"},
+            ],
+        }
+        track_policy = simpleripper.select_streams(config, metadata)
+
+        matches, reasons = simpleripper.source_matches_target_profile(config, metadata, "series", track_policy)
+        retention = simpleripper.retention_size_policy_evaluation(config, metadata, "series")
+
+        self.assertFalse(matches)
+        self.assertIsNone(simpleripper.skip_reason(config, metadata, track_policy))
+        self.assertTrue(retention["oversized"])
+        self.assertEqual(retention["actual_mb"], 1554.0)
+        self.assertEqual(retention["limit_mb"], 1012.0)
+        self.assertIn("retention_size_exceeded:1554.0MB>1012.0MB", reasons)
+
+    def test_av1_source_matching_profile_but_oversized_is_not_skipped(self) -> None:
+        config = self.make_config(Path("."))
+        config["quality_profiles"] = {"default": {"encoder": "libsvtav1", "pix_fmt": "yuv420p10le"}, "series": {"encoder": "libsvtav1", "pix_fmt": "yuv420p10le"}}
+        config["skip_rules"] = {"skip_av1": True, "skip_4k": True, "skip_hdr": True}
+        metadata = {
+            "media_type": "series",
+            "video_codec": "av1",
+            "video_pix_fmt": "yuv420p10le",
+            "video_height": 1080,
+            "is_hdr": False,
+            "duration_seconds": 1500,
+            "file_size_bytes": 700 * 1024 * 1024,
+            "audio_stream_count": 1,
+            "subtitle_stream_count": 0,
+            "audio_streams": [{"index": 1, "codec": "aac", "language": "cze", "title": "Czech"}],
+            "subtitle_streams": [],
+        }
+        track_policy = simpleripper.select_streams(config, metadata)
+
+        matches, reasons = simpleripper.source_matches_target_profile(config, metadata, "series", track_policy)
+
+        self.assertFalse(matches)
+        self.assertIsNone(simpleripper.skip_reason(config, metadata, track_policy))
+        self.assertIn("retention_size_exceeded:700.0MB>500.0MB", reasons)
 
     def test_inspect_candidate_marks_hevc_not_normalized_as_usable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1108,6 +1168,32 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertIsNone(result["skip_reason"])
             self.assertEqual(result["candidate_reason"], "hevc_not_normalized")
             self.assertIn("pix_fmt_mismatch:yuv420p!=yuv420p10le", result["profile_mismatch_reasons"])
+
+    def test_inspect_candidate_marks_oversized_hevc_as_usable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}, "series": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+            source = root / "library" / "Futurama" / "Season 10" / "S10E06.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 1024)
+            probe = {
+                "format": {"duration": "3036", "bit_rate": str(1554 * 1024 * 1024 * 8 // 3036), "tags": {}},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "hevc", "pix_fmt": "yuv420p10le", "width": 1920, "height": 1080},
+                    {"index": 1, "codec_type": "audio", "codec_name": "eac3", "tags": {"language": "cze", "title": "Czech"}},
+                    {"index": 2, "codec_type": "subtitle", "codec_name": "subrip", "tags": {"language": "cze"}},
+                ],
+                "chapters": [],
+            }
+
+            with patch("simpleripper.extract_metadata", return_value={"media_type": "series", "video_codec": "hevc", "video_pix_fmt": "yuv420p10le", "video_height": 1080, "is_hdr": False, "duration_seconds": 3036, "file_size_bytes": 1554 * 1024 * 1024, "audio_stream_count": 1, "subtitle_stream_count": 1, "audio_streams": [{"index": 1, "codec": "eac3", "language": "cze", "title": "Czech"}], "subtitle_streams": [{"index": 2, "codec": "subrip", "language": "cze", "title": "CZ"}], "overall_bitrate_kbps": 4288}), patch("simpleripper.run_ffprobe", return_value=(True, probe, None)):
+                result = simpleripper.inspect_candidate(config, source, "series")
+
+            self.assertEqual(result["status"], "ok")
+            self.assertIsNone(result["skip_reason"])
+            self.assertEqual(result["candidate_reason"], "hevc_oversized")
+            self.assertTrue(result["retention_size_policy"]["oversized"])
 
     def test_history_summary_fields_flattens_before_after_values(self) -> None:
         source_meta = {"file_size_bytes": 1000, "video_codec": "h264", "audio_stream_count": 2, "subtitle_stream_count": 1}
