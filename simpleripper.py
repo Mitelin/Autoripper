@@ -1021,17 +1021,45 @@ def normalize_path_for_match(value: str | Path) -> str:
     return str(value).replace("\\", "/").rstrip("/").casefold()
 
 
+def normalize_path_for_prefix_match(value: str | Path) -> str:
+    text = str(value or "").replace("\\", "/").strip()
+    if not text:
+        return ""
+    unc_prefix = text.startswith("//")
+    body = text[2:] if unc_prefix else text
+    body = re.sub(r"/+", "/", body).rstrip("/")
+    normalized = f"//{body}" if unc_prefix else body
+    return normalized.casefold()
+
+
+def split_mapped_suffix(source_text: str, fs_prefix: str) -> str | None:
+    source_slash = re.sub(r"/+", "/", str(source_text or "").replace("\\", "/"))
+    prefix_slash = re.sub(r"/+", "/", str(fs_prefix or "").replace("\\", "/")).rstrip("/")
+    source_norm = normalize_path_for_prefix_match(source_text)
+    prefix_norm = normalize_path_for_prefix_match(fs_prefix)
+    if not prefix_norm or not source_norm.startswith(prefix_norm):
+        return None
+    remainder_norm = source_norm[len(prefix_norm):]
+    if remainder_norm and not remainder_norm.startswith("/"):
+        return None
+    remainder = source_slash[len(prefix_slash):]
+    return remainder if remainder.startswith("/") else f"/{remainder}" if remainder else ""
+
+
 def jellyfin_mapped_paths(settings: dict[str, Any], source: Path) -> list[str]:
     candidates = [str(source)]
     source_text = str(source)
-    source_norm = source_text.replace("\\", "/")
-    for mapping in settings.get("path_mapping") or []:
-        fs_prefix = str(mapping.get("filesystem_prefix") or "")
-        jellyfin_prefix = str(mapping.get("jellyfin_prefix") or "")
-        fs_prefix_norm = fs_prefix.replace("\\", "/").rstrip("/")
-        jellyfin_prefix_norm = jellyfin_prefix.replace("\\", "/").rstrip("/")
-        if fs_prefix_norm and jellyfin_prefix_norm and source_norm.startswith(fs_prefix_norm):
-            candidates.append(jellyfin_prefix_norm + source_norm[len(fs_prefix_norm):])
+    mappings = sorted(
+        (settings.get("path_mapping") or []),
+        key=lambda item: len(normalize_path_for_prefix_match(str((item or {}).get("fs_prefix") or (item or {}).get("filesystem_prefix") or ""))),
+        reverse=True,
+    )
+    for mapping in mappings:
+        fs_prefix = str(mapping.get("fs_prefix") or mapping.get("filesystem_prefix") or "")
+        jellyfin_prefix = str(mapping.get("jellyfin_prefix") or "").replace("\\", "/").rstrip("/")
+        suffix = split_mapped_suffix(source_text, fs_prefix)
+        if fs_prefix and jellyfin_prefix and suffix is not None:
+            candidates.append(jellyfin_prefix + suffix)
     result: list[str] = []
     seen: set[str] = set()
     for item in candidates:

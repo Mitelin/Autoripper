@@ -770,6 +770,35 @@ class SimpleRipperTests(unittest.TestCase):
             simpleripper.jellyfin_item_score(filename_only, source, candidates),
         )
 
+    def test_jellyfin_mapped_paths_maps_unc_source_with_broad_prefix(self) -> None:
+        settings = {
+            "path_mapping": [
+                {"fs_prefix": r"\\192.168.50.23\admin", "jellyfin_prefix": "/mnt/nas/filmy"},
+            ],
+        }
+        source = Path(r"\\192.168.50.23\admin\SERIALY\English\Futurama\file.mkv")
+
+        candidates = simpleripper.jellyfin_mapped_paths(settings, source)
+
+        self.assertEqual(candidates[0], str(source))
+        self.assertIn("/mnt/nas/filmy/SERIALY/English/Futurama/file.mkv", candidates)
+
+    def test_jellyfin_mapped_paths_prefers_specific_unc_prefix(self) -> None:
+        settings = {
+            "path_mapping": [
+                {"fs_prefix": r"\\192.168.50.23\admin", "jellyfin_prefix": "/mnt/nas/filmy"},
+                {"fs_prefix": r"\\192.168.50.23\admin\SERIALY\Czech", "jellyfin_prefix": "/mnt/jellyfin-cz/serialy"},
+            ],
+        }
+        source = Path(r"\\192.168.50.23\admin\SERIALY\Czech\Fallout\file.mkv")
+
+        candidates = simpleripper.jellyfin_mapped_paths(settings, source)
+
+        self.assertEqual(candidates[0], str(source))
+        self.assertIn("/mnt/jellyfin-cz/serialy/Fallout/file.mkv", candidates)
+        self.assertIn("/mnt/nas/filmy/SERIALY/Czech/Fallout/file.mkv", candidates)
+        self.assertLess(candidates.index("/mnt/jellyfin-cz/serialy/Fallout/file.mkv"), candidates.index("/mnt/nas/filmy/SERIALY/Czech/Fallout/file.mkv"))
+
     def test_refresh_jellyfin_refreshes_all_exact_path_matches(self) -> None:
         config = self.make_config(Path("."))
         config["jellyfin"] = {
