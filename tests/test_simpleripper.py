@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import io
 import socket
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -374,6 +375,36 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertNotEqual(row["state"], "clean")
             self.assertEqual(row["scan_complete"], 0)
+
+    def test_child_entry_oserror_keeps_parent_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30, "folder_clean_requires_full_inventory": True}
+            parent = root / "library" / "SERIALY"
+            broken_child = parent / "Broken"
+            good_child = parent / "Good"
+            parent.mkdir(parents=True)
+            broken_child.mkdir()
+            good_child.mkdir()
+            (good_child / "episode.mkv").write_bytes(b"x" * 10)
+
+            original_is_dir = Path.is_dir
+
+            def broken_is_dir(path: Path) -> bool:
+                if path == broken_child:
+                    raise OSError("permission denied")
+                return original_is_dir(path)
+
+            with patch("pathlib.Path.is_dir", autospec=True, side_effect=broken_is_dir):
+                simpleripper.fast_inventory_scan([parent], config)
+
+            with simpleripper.open_worker_cache(config) as connection:
+                row = connection.execute("SELECT state, scan_complete, child_folders_unknown FROM folder_index WHERE path = ?", (str(parent),)).fetchone()
+
+            self.assertEqual(row["state"], "partial")
+            self.assertEqual(row["scan_complete"], 0)
+            self.assertGreaterEqual(row["child_folders_unknown"], 1)
 
     def test_new_file_invalidates_clean_folder_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -890,6 +921,37 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertIn(str(root / "quarantine" / "Movies" / "A"), str(quarantine))
             self.assertIsNone(result["processed_marker_path"])
 
+    def test_target_output_path_switches_avi_to_mkv(self) -> None:
+        source = Path("The Chronicles of Narnia S01E02.avi")
+
+        self.assertEqual(simpleripper.target_output_suffix(source), ".mkv")
+        self.assertEqual(simpleripper.target_output_path(source), Path("The Chronicles of Narnia S01E02.mkv"))
+        self.assertEqual(simpleripper.temp_upload_path(simpleripper.target_output_path(source)).name, ".The Chronicles of Narnia S01E02.mkv.simpleripper.tmp")
+
+    def test_replace_avi_source_moves_verified_mkv_and_quarantines_original(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            library = root / "library"
+            library.mkdir()
+            source = library / "episode.avi"
+            replacement = library / "episode.mkv"
+            output = library / ".episode.mkv.simpleripper.tmp"
+            source.write_text("original", encoding="utf-8")
+            output.write_text("encoded", encoding="utf-8")
+
+            result = simpleripper.replace_source_with_output(source, output, config, {"job_id": "job-avi"}, replacement)
+
+            self.assertFalse(source.exists())
+            self.assertTrue(replacement.exists())
+            self.assertEqual(replacement.read_text(encoding="utf-8"), "encoded")
+            self.assertFalse(output.exists())
+            quarantine = Path(result["quarantine_path"])
+            self.assertTrue(quarantine.exists())
+            self.assertEqual(quarantine.read_text(encoding="utf-8"), "original")
+            self.assertEqual(result["replacement_path"], str(replacement))
+            self.assertEqual(result["final_path"], str(replacement))
+
     def test_replace_can_return_sidecar_marker_path_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -938,6 +1000,28 @@ class SimpleRipperTests(unittest.TestCase):
             simpleripper.rollback_replacement(source, Path(result["quarantine_path"]), config)
 
             self.assertEqual(source.read_text(encoding="utf-8"), "original")
+            failed_outputs = list((root / "inspection" / "failed_replacements").glob("*.failed-output"))
+            self.assertEqual(len(failed_outputs), 1)
+            self.assertEqual(failed_outputs[0].read_text(encoding="utf-8"), "encoded")
+
+    def test_rollback_replacement_restores_avi_source_from_mkv_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            library = root / "library"
+            library.mkdir()
+            source = library / "movie.avi"
+            replacement = library / "movie.mkv"
+            output = library / ".movie.mkv.simpleripper.tmp"
+            source.write_text("original", encoding="utf-8")
+            output.write_text("encoded", encoding="utf-8")
+            result = simpleripper.replace_source_with_output(source, output, config, {"job_id": "job-1"}, replacement)
+
+            simpleripper.rollback_replacement(source, Path(result["quarantine_path"]), config, replacement)
+
+            self.assertTrue(source.exists())
+            self.assertEqual(source.read_text(encoding="utf-8"), "original")
+            self.assertFalse(replacement.exists())
             failed_outputs = list((root / "inspection" / "failed_replacements").glob("*.failed-output"))
             self.assertEqual(len(failed_outputs), 1)
             self.assertEqual(failed_outputs[0].read_text(encoding="utf-8"), "encoded")
@@ -1253,6 +1337,42 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("candidate_paths", result)
         self.assertIn("search_terms", result)
 
+    def test_refresh_jellyfin_extension_change_refreshes_parent_when_new_file_path_is_missing(self) -> None:
+        config = self.make_config(Path("."))
+        config["jellyfin"] = {
+            "enabled": True,
+            "server_url": "http://jellyfin.local:8096",
+            "api_key": "secret",
+            "path_mapping": [{"filesystem_prefix": "Z:/nas-backup", "jellyfin_prefix": "K:/filmy"}],
+        }
+        source = Path("Z:/nas-backup/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.avi")
+        replacement = Path("Z:/nas-backup/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv")
+        requests_sent: list[str] = []
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def fake_urlopen(req: object, timeout: int = 10) -> FakeResponse:
+            requests_sent.append(req.full_url)  # type: ignore[attr-defined]
+            return FakeResponse()
+
+        with patch("simpleripper.jellyfin_query_items", return_value=[]), patch("simpleripper.jellyfin_query_path_items", return_value=[{"Id": "season-2", "Path": "K:/filmy/SERIALY/Czech/Fallout/Season 02", "Name": "Season 02"}]), patch("simpleripper.request.urlopen", side_effect=fake_urlopen):
+            result = simpleripper.refresh_jellyfin(config, source, replacement)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["refresh_target"], "parent")
+        self.assertEqual(result["refreshed_count"], 1)
+        self.assertEqual(result["source_path"], str(source))
+        self.assertEqual(result["replacement_path"], str(replacement))
+        self.assertEqual(len(requests_sent), 1)
+
     def test_jellyfin_lookup_item_reports_not_found_without_exact_match(self) -> None:
         source = Path("Z:/nas-backup/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv")
         candidates = ["K:/filmy/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv"]
@@ -1563,6 +1683,108 @@ class SimpleRipperTests(unittest.TestCase):
 
             jobs = (root / "history" / "jobs.jsonl").read_text(encoding="utf-8")
             self.assertIn("replacement_verified", jobs)
+
+    def test_process_one_avi_replacement_verifies_final_mkv_and_marks_both_paths_done(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan"]["file_extensions"] = [".mkv", ".avi"]
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+            config["paths"]["keep_quarantine_after_success"] = True
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "episode.avi"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 6000)
+            replacement = source.with_suffix(".mkv")
+            simpleripper.fast_inventory_scan([source.parent], config)
+            probed_paths: list[Path] = []
+
+            class FakeProcess:
+                def __init__(self, command: list[str]) -> None:
+                    self.stdout = io.StringIO("")
+                    self.pid = 4242
+                    self.returncode = 0
+                    Path(command[-1]).write_bytes(b"encoded-output")
+
+                def poll(self) -> int:
+                    return 0
+
+            def fake_popen(command: list[str], stdout: object = None, stderr: object = None, text: bool = True, encoding: str = "utf-8", errors: str = "replace") -> FakeProcess:
+                return FakeProcess(command)
+
+            def fake_probe(test_config: dict, path: Path, media_type: str) -> tuple[dict, dict]:
+                probed_paths.append(path)
+                if path == source.parent.parent / "work" / "current" / "input" / source.name:
+                    return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "mpeg4", "video_pix_fmt": "yuv420p", "overall_bitrate_kbps": 4000}
+                return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "hevc", "video_pix_fmt": "yuv420p10le", "overall_bitrate_kbps": 1500}
+
+            with patch("simpleripper.subprocess.Popen", side_effect=fake_popen), patch("simpleripper.ffprobe_metadata", side_effect=fake_probe), patch("simpleripper.refresh_jellyfin", return_value={"status": "ok"}):
+                app.process_one(source)
+
+            self.assertFalse(source.exists())
+            self.assertTrue(replacement.exists())
+            self.assertIn(replacement, probed_paths)
+            source_history = simpleripper.load_history_index(config, source)
+            replacement_history = simpleripper.load_history_index(config, replacement)
+            self.assertEqual((source_history or {})["status"], "done")
+            self.assertEqual((source_history or {})["replacement_path"], str(replacement))
+            self.assertEqual((replacement_history or {})["status"], "done")
+            with simpleripper.open_worker_cache(config) as connection:
+                source_row = connection.execute("SELECT decision FROM file_index WHERE path = ?", (str(source),)).fetchone()
+                replacement_row = connection.execute("SELECT decision FROM file_index WHERE path = ?", (str(replacement),)).fetchone()
+            self.assertEqual(source_row["decision"], "done")
+            self.assertEqual(replacement_row["decision"], "done")
+
+    def test_process_one_verification_failure_enters_cooldown_and_is_not_retried_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan"]["file_extensions"] = [".mkv", ".avi"]
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "episode.avi"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 6000)
+            simpleripper.fast_inventory_scan([source.parent], config)
+
+            class FakeProcess:
+                def __init__(self, command: list[str]) -> None:
+                    self.stdout = io.StringIO("")
+                    self.pid = 4242
+                    self.returncode = 0
+                    Path(command[-1]).write_bytes(b"encoded-output")
+
+                def poll(self) -> int:
+                    return 0
+
+            def fake_popen(command: list[str], stdout: object = None, stderr: object = None, text: bool = True, encoding: str = "utf-8", errors: str = "replace") -> FakeProcess:
+                return FakeProcess(command)
+
+            call_count = {"verify": 0}
+
+            def fake_probe(test_config: dict, path: Path, media_type: str) -> tuple[dict, dict]:
+                if path.name.endswith(".avi"):
+                    return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "mpeg4", "video_pix_fmt": "yuv420p", "overall_bitrate_kbps": 4000}
+                return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "hevc", "video_pix_fmt": "yuv420p10le", "overall_bitrate_kbps": 1500}
+
+            def fake_verify(test_config: dict, source_meta: dict, output: Path, output_meta: dict, stream_policy: dict) -> tuple[dict, list[str]]:
+                call_count["verify"] += 1
+                if call_count["verify"] == 1:
+                    return {"video_codec_ok": False, "pix_fmt_ok": False}, ["video codec mismatch", "pix fmt mismatch"]
+                return {"video_codec_ok": True, "pix_fmt_ok": True}, []
+
+            with patch("simpleripper.subprocess.Popen", side_effect=fake_popen), patch("simpleripper.ffprobe_metadata", side_effect=fake_probe), patch("simpleripper.verify_output", side_effect=fake_verify):
+                app.process_one(source)
+
+            history = simpleripper.load_history_index(config, source)
+            self.assertEqual((history or {})["status"], "error")
+            self.assertEqual((history or {})["failure_type"], "ffmpeg")
+            self.assertEqual(simpleripper.scan_candidates([source.parent], config), [])
+            with simpleripper.open_worker_cache(config) as connection:
+                row = connection.execute("SELECT decision, retry_after FROM file_index WHERE path = ?", (str(source),)).fetchone()
+            self.assertEqual(row["decision"], "failed")
+            self.assertTrue(row["retry_after"])
 
 
 if __name__ == "__main__":

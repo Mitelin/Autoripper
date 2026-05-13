@@ -1132,6 +1132,7 @@ def direct_folder_signature(folder: Path, config: dict[str, Any]) -> dict[str, i
     direct_total_size = 0
     direct_latest_mtime_ns = 0
     child_dir_count = 0
+    listing_error = 0
     try:
         children = list(folder.iterdir())
     except OSError:
@@ -1145,20 +1146,21 @@ def direct_folder_signature(folder: Path, config: dict[str, Any]) -> dict[str, i
                 try:
                     direct_latest_mtime_ns = max(direct_latest_mtime_ns, int(child.stat().st_mtime_ns))
                 except OSError:
-                    pass
+                    listing_error = 1
             elif child.is_file():
                 stat = child.stat()
                 direct_file_count += 1
                 direct_total_size += int(stat.st_size)
                 direct_latest_mtime_ns = max(direct_latest_mtime_ns, int(stat.st_mtime_ns))
         except OSError:
+            listing_error = 1
             continue
     return {
         "direct_file_count": direct_file_count,
         "direct_total_size": direct_total_size,
         "direct_latest_mtime_ns": direct_latest_mtime_ns,
         "child_dir_count": child_dir_count,
-        "listing_error": 0,
+        "listing_error": listing_error,
     }
 
 
@@ -1189,20 +1191,51 @@ def folder_summary_from_row(row: sqlite3.Row) -> dict[str, int | bool]:
     }
 
 
-def direct_child_dirs(folder: Path, config: dict[str, Any]) -> list[Path]:
+def direct_child_dirs_with_status(folder: Path, config: dict[str, Any]) -> tuple[list[Path], bool]:
     try:
-        return sorted([child for child in folder.iterdir() if child.is_dir() and not path_is_scan_excluded(child, config)], key=lambda item: item.name.casefold())
+        children = list(folder.iterdir())
     except OSError:
-        return []
+        return [], True
+    result: list[Path] = []
+    had_error = False
+    for child in children:
+        if path_is_scan_excluded(child, config):
+            continue
+        try:
+            if child.is_dir():
+                result.append(child)
+        except OSError:
+            had_error = True
+    return sorted(result, key=lambda item: item.name.casefold()), had_error
+
+
+def direct_child_dirs(folder: Path, config: dict[str, Any]) -> list[Path]:
+    result, _had_error = direct_child_dirs_with_status(folder, config)
+    return result
+
+
+def direct_video_files_with_status(folder: Path, config: dict[str, Any]) -> tuple[list[Path], bool]:
+    extensions = scan_file_extensions(config)
+    try:
+        children = list(folder.iterdir())
+    except OSError:
+        return [], True
+    files: list[Path] = []
+    had_error = False
+    for child in children:
+        if path_is_scan_excluded(child, config):
+            continue
+        try:
+            if child.is_file() and child.suffix.lower() in extensions and not path_is_ignored_video_name(child):
+                files.append(child)
+        except OSError:
+            had_error = True
+    return sorted(files, key=lambda item: item.name.casefold()), had_error
 
 
 def direct_video_files(folder: Path, config: dict[str, Any]) -> list[Path]:
-    extensions = scan_file_extensions(config)
-    try:
-        files = [child for child in folder.iterdir() if child.is_file() and child.suffix.lower() in extensions and not path_is_ignored_video_name(child) and not path_is_scan_excluded(child, config)]
-    except OSError:
-        return []
-    return sorted(files, key=lambda item: item.name.casefold())
+    files, _had_error = direct_video_files_with_status(folder, config)
+    return files
 
 
 def child_folder_cache_clean(connection: sqlite3.Connection, folder: Path, config: dict[str, Any], current_policy_hash: str, completed_generation_id: str | None) -> bool:
@@ -1298,10 +1331,10 @@ def direct_file_state_summary(connection: sqlite3.Connection, folder: Path, conf
 
 def refresh_folder_state(connection: sqlite3.Connection, folder: Path, config: dict[str, Any], inventory_generation_id: str | None = None) -> str:
     signature = direct_folder_signature(folder, config)
-    child_folders = direct_child_dirs(folder, config)
+    child_folders, child_listing_error = direct_child_dirs_with_status(folder, config)
     child_folders_clean = 0
     child_folders_unknown = 0
-    for child in direct_child_dirs(folder, config):
+    for child in child_folders:
         row = connection.execute("SELECT * FROM folder_index WHERE path = ?", (str(child),)).fetchone()
         child_signature = direct_folder_signature(child, config)
         child_current_generation = bool(row) and (not inventory_generation_id or str(row["inventory_generation_id"] or "") == str(inventory_generation_id))
@@ -1310,7 +1343,7 @@ def refresh_folder_state(connection: sqlite3.Connection, folder: Path, config: d
         else:
             child_folders_unknown += 1
     file_summary = direct_file_state_summary(connection, folder, config)
-    scan_complete = not bool(signature.get("listing_error")) and child_folders_unknown == 0
+    scan_complete = not bool(signature.get("listing_error")) and not child_listing_error and child_folders_unknown == 0
     summary: dict[str, int | bool] = {
         **file_summary,
         "child_folders_total": len(child_folders),
@@ -1663,7 +1696,7 @@ def update_cache_deep_check(config: dict[str, Any], details: dict[str, Any]) -> 
     refresh_folder_state_upwards(config, source)
 
 
-def update_cache_job_success(config: dict[str, Any], source: Path) -> None:
+def update_cache_job_success(config: dict[str, Any], source: Path, replacement: Path | None = None) -> None:
     if not scan_cache_enabled(config):
         return
     now = utc_now()
@@ -1672,8 +1705,33 @@ def update_cache_job_success(config: dict[str, Any], source: Path) -> None:
             "UPDATE file_index SET decision = 'done', decision_reason = 'job_done', failure_count = 0, last_error = NULL, retry_after = NULL, next_check_after = NULL, policy_hash = ?, updated_at = ? WHERE path = ?",
             (policy_hash(config), now, str(source)),
         )
+        if replacement is not None:
+            replacement_stat = replacement.stat() if replacement.exists() else None
+            connection.execute(
+                """
+                INSERT INTO file_index(path, normalized_path, media_type, size_bytes, mtime_ns, suffix, parent_dir, decision, decision_reason, policy_hash, failure_count, last_error, retry_after, next_check_after, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, 'done', 'job_done', ?, 0, NULL, NULL, NULL, ?)
+                ON CONFLICT(path) DO UPDATE SET decision = 'done', decision_reason = 'job_done', policy_hash = excluded.policy_hash,
+                    size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns, suffix = excluded.suffix, parent_dir = excluded.parent_dir,
+                    failure_count = 0, last_error = NULL, retry_after = NULL, next_check_after = NULL, updated_at = excluded.updated_at
+                """,
+                (
+                    str(replacement),
+                    normalize_path_for_match(replacement),
+                    guess_media_type(replacement),
+                    int(replacement_stat.st_size) if replacement_stat else 0,
+                    int(replacement_stat.st_mtime_ns) if replacement_stat else 0,
+                    replacement.suffix.lower(),
+                    str(replacement.parent),
+                    policy_hash(config),
+                    now,
+                ),
+            )
     log_event(config, "file_state_updated", source_path=str(source), state="done", reason="job_done")
     refresh_folder_state_upwards(config, source)
+    if replacement is not None:
+        log_event(config, "file_state_updated", source_path=str(replacement), state="done", reason="job_done")
+        refresh_folder_state_upwards(config, replacement)
 
 
 def update_cache_job_failure(config: dict[str, Any], source: Path, error: str) -> dict[str, Any] | None:
@@ -2004,8 +2062,22 @@ def ensure_local_free_space(config: dict[str, Any], source_size: int) -> None:
         raise RuntimeError(f"not enough local free space: free={free}, required={required}")
 
 
-def temp_upload_path(source: Path) -> Path:
-    return source.with_name(f".{source.name}.simpleripper.tmp")
+LEGACY_CONTAINER_OUTPUT_SUFFIXES = {
+    ".avi": ".mkv",
+}
+
+
+def target_output_suffix(source: Path) -> str:
+    return LEGACY_CONTAINER_OUTPUT_SUFFIXES.get(source.suffix.lower(), source.suffix)
+
+
+def target_output_path(source: Path) -> Path:
+    suffix = target_output_suffix(source)
+    return source.with_suffix(suffix) if suffix != source.suffix else source
+
+
+def temp_upload_path(final_target: Path) -> Path:
+    return final_target.with_name(f".{final_target.name}.simpleripper.tmp")
 
 
 def quarantine_path_for_source(source: Path, config: dict[str, Any]) -> Path:
@@ -2062,7 +2134,7 @@ def finalize_quarantined_original(quarantine_path: Path, config: dict[str, Any])
         return {"quarantine_retained": True, "quarantine_deleted": False, "quarantine_cleanup_error": str(exc), "quarantine_retention_reason": "cleanup_failed"}
 
 
-def refresh_jellyfin(config: dict[str, Any], source: Path) -> dict[str, Any]:
+def refresh_jellyfin(config: dict[str, Any], source: Path, replacement: Path | None = None) -> dict[str, Any]:
     settings = config.get("jellyfin") or {}
     if not settings.get("enabled", False):
         return {"status": "disabled"}
@@ -2070,10 +2142,40 @@ def refresh_jellyfin(config: dict[str, Any], source: Path) -> dict[str, Any]:
     api_key = str(settings.get("api_key") or "")
     if not server_url or not api_key:
         return {"status": "skipped", "reason": "missing_server_url_or_api_key"}
-    mapped_paths = jellyfin_mapped_paths(settings, source)
+
+    def refresh_item(item_id: str) -> None:
+        refresh_req = request.Request(f"{server_url}/Items/{item_id}/Refresh?Recursive=false&MetadataRefreshMode=Default&ImageRefreshMode=Default", headers={"X-Emby-Token": api_key}, method="POST")
+        with request.urlopen(refresh_req, timeout=10):
+            pass
+
+    lookup_path = replacement or source
+    mapped_paths = jellyfin_mapped_paths(settings, lookup_path)
     try:
-        lookup = jellyfin_lookup_item(server_url, api_key, source, mapped_paths, settings)
+        lookup = jellyfin_lookup_item(server_url, api_key, lookup_path, mapped_paths, settings)
         if lookup.get("status") != "ok":
+            if replacement is not None and replacement != source:
+                parent_lookup = jellyfin_lookup_item(server_url, api_key, replacement.parent, jellyfin_mapped_paths(settings, replacement.parent), settings)
+                if parent_lookup.get("status") != "ok":
+                    return {**lookup, "fallback_status": parent_lookup.get("status"), "fallback_reason": parent_lookup.get("reason")}
+                matches = parent_lookup.get("matches") or []
+                if not matches and parent_lookup.get("item_id"):
+                    matches = [{"item_id": parent_lookup.get("item_id"), "matched_path": parent_lookup.get("matched_path")}]
+                refreshed: list[dict[str, Any]] = []
+                for match in matches:
+                    item_id = str(match.get("item_id") or "")
+                    if not item_id:
+                        continue
+                    refresh_item(item_id)
+                    refreshed.append({**match, "item_id": item_id, "matched_path": match.get("matched_path") or match.get("path")})
+                return {
+                    **parent_lookup,
+                    "status": "ok",
+                    "matches": refreshed,
+                    "refreshed_count": len(refreshed),
+                    "refresh_target": "parent",
+                    "source_path": str(source),
+                    "replacement_path": str(replacement),
+                }
             return lookup
         matches = lookup.get("matches") or []
         if not matches and lookup.get("item_id"):
@@ -2083,11 +2185,9 @@ def refresh_jellyfin(config: dict[str, Any], source: Path) -> dict[str, Any]:
             item_id = str(match.get("item_id") or "")
             if not item_id:
                 continue
-            refresh_req = request.Request(f"{server_url}/Items/{item_id}/Refresh?Recursive=false&MetadataRefreshMode=Default&ImageRefreshMode=Default", headers={"X-Emby-Token": api_key}, method="POST")
-            with request.urlopen(refresh_req, timeout=10):
-                pass
+            refresh_item(item_id)
             refreshed.append({**match, "item_id": item_id, "matched_path": match.get("matched_path") or match.get("path")})
-        return {**lookup, "status": "ok", "matches": refreshed, "refreshed_count": len(refreshed)}
+        return {**lookup, "status": "ok", "matches": refreshed, "refreshed_count": len(refreshed), "source_path": str(source), "replacement_path": str(replacement or lookup_path)}
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
 
@@ -2338,6 +2438,7 @@ def recover_runtime_state(config: dict[str, Any]) -> None:
         return
     phase = str(payload.get("phase") or payload.get("status") or "")
     source_path = Path(str(payload.get("source_path") or "")) if payload.get("source_path") else None
+    replacement_path = Path(str(payload.get("replacement_path") or "")) if payload.get("replacement_path") else source_path
     local_output_path = Path(str(payload.get("local_output_path") or "")) if payload.get("local_output_path") else None
     temp_output_path = Path(str(payload.get("temp_output_path") or "")) if payload.get("temp_output_path") else None
     quarantine_path = Path(str(payload.get("quarantine_path") or "")) if payload.get("quarantine_path") else None
@@ -2354,17 +2455,17 @@ def recover_runtime_state(config: dict[str, Any]) -> None:
         if temp_output_path and temp_output_path.exists():
             safe_unlink(temp_output_path)
         recovered_status = "upload_cleanup"
-    elif phase in {"swapping", "final_verify"} and source_path:
-        if not source_path.exists() and quarantine_path and quarantine_path.exists():
+    elif phase in {"swapping", "final_verify"} and source_path and replacement_path:
+        if not replacement_path.exists() and quarantine_path and quarantine_path.exists():
             quarantine_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(quarantine_path), str(source_path))
             recovered_status = "rollback_restored"
-        elif source_path.exists():
+        elif replacement_path.exists():
             recovered_status = "replacement_present"
             if source_metadata:
                 try:
-                    _probe, final_meta = ffprobe_metadata(config, source_path, str(source_metadata.get("media_type") or "default"))
-                    final_verification, final_errors = verify_output(config, source_metadata, source_path, final_meta, stream_policy)
+                    _probe, final_meta = ffprobe_metadata(config, replacement_path, str(source_metadata.get("media_type") or "default"))
+                    final_verification, final_errors = verify_output(config, source_metadata, replacement_path, final_meta, stream_policy)
                     if final_errors:
                         recovery_details["verification_errors"] = final_errors
                     else:
@@ -2374,14 +2475,14 @@ def recover_runtime_state(config: dict[str, Any]) -> None:
                     recovery_details["verification_error"] = str(exc)
     elif phase == "refreshing_jellyfin":
         recovered_status = "replacement_present"
-        if source_path and source_path.exists() and source_metadata:
+        if replacement_path and replacement_path.exists() and source_metadata:
             try:
-                _probe, final_meta = ffprobe_metadata(config, source_path, str(source_metadata.get("media_type") or "default"))
-                final_verification, final_errors = verify_output(config, source_metadata, source_path, final_meta, stream_policy)
+                _probe, final_meta = ffprobe_metadata(config, replacement_path, str(source_metadata.get("media_type") or "default"))
+                final_verification, final_errors = verify_output(config, source_metadata, replacement_path, final_meta, stream_policy)
                 if not final_errors:
                     recovered_status = "refresh_retried"
                     recovery_details["verification"] = final_verification
-                    recovery_details["jellyfin_refresh"] = refresh_jellyfin(config, source_path)
+                    recovery_details["jellyfin_refresh"] = refresh_jellyfin(config, source_path or replacement_path, replacement_path)
                 else:
                     recovery_details["verification_errors"] = final_errors
             except Exception as exc:
@@ -2746,27 +2847,31 @@ class SimpleRipperApp:
         if work_dir_path.exists():
             shutil.rmtree(work_dir_path, ignore_errors=True)
         work_dir_path.mkdir(parents=True, exist_ok=True)
-        output = work_dir_path / "output" / source.name
+        replacement_path = target_output_path(source)
+        output = work_dir_path / "output" / replacement_path.name
         output.parent.mkdir(parents=True, exist_ok=True)
         copied_source = work_dir_path / "input" / source.name
         copied_source.parent.mkdir(parents=True, exist_ok=True)
         metadata_dir = work_dir_path / "metadata"
         metadata_dir.mkdir(parents=True, exist_ok=True)
-        tmp_output = temp_upload_path(source)
-        job_summary: dict[str, Any] = {"job_id": job_id, "source_path": str(source), "started_at": utc_now(), "status": "running"}
+        tmp_output = temp_upload_path(replacement_path)
+        job_summary: dict[str, Any] = {"job_id": job_id, "source_path": str(source), "replacement_path": str(replacement_path), "started_at": utc_now(), "status": "running"}
         succeeded = False
+        ffmpeg_started = False
+        ffmpeg_completed = False
         try:
             log_event(self.config, "candidate_selected", job_id=job_id, source_path=str(source))
             ensure_local_free_space(self.config, source.stat().st_size)
-            self.set_phase("copying_source", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output)})
+            self.set_phase("copying_source", source, {"job_id": job_id, "replacement_path": str(replacement_path), "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output)})
             log_event(self.config, "copy_source_start", job_id=job_id, source_path=str(source), local_input_path=str(copied_source))
             copy_file_interruptible(source, copied_source, lambda: bool(self.state.force_stop))
             log_event(self.config, "copy_source_done", job_id=job_id, bytes=copied_source.stat().st_size)
-            self.set_phase("probing_source", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output)})
+            self.set_phase("probing_source", source, {"job_id": job_id, "replacement_path": str(replacement_path), "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output)})
             source_probe, source_meta = ffprobe_metadata(self.config, copied_source, self.media_type_for_source(source))
             source_meta["file_size_bytes"] = source.stat().st_size
+            source_before_signature = source_signature(source)
             write_json(metadata_dir / "source.ffprobe.json", {"probe": source_probe, "metadata": source_meta})
-            recovery_context = {"source_metadata": source_meta}
+            recovery_context = {"source_metadata": source_meta, "replacement_path": str(replacement_path)}
             stream_policy = select_streams(self.config, source_meta)
             profile_matches, profile_mismatch_reasons = source_matches_target_profile(self.config, source_meta, str(source_meta.get("media_type") or "default"), stream_policy)
             retention_size_policy = retention_size_policy_evaluation(self.config, source_meta, str(source_meta.get("media_type") or "default"))
@@ -2802,6 +2907,7 @@ class SimpleRipperApp:
             ffmpeg_log = work_dir_path / "logs" / "ffmpeg.log"
             log_event(self.config, "ffmpeg_start", job_id=job_id, command=command)
             with ffmpeg_log.open("w", encoding="utf-8", errors="replace") as log_handle:
+                ffmpeg_started = True
                 self._ffmpeg = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=log_handle, text=True, encoding="utf-8", errors="replace")
                 self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "ffmpeg_pid": self._ffmpeg.pid, **recovery_context})
                 progress_state: dict[str, Any] = {}
@@ -2829,6 +2935,7 @@ class SimpleRipperApp:
                 progress_thread.join(timeout=1)
                 if self._ffmpeg.returncode != 0:
                     raise FfmpegFailedError(f"ffmpeg failed with exit code {self._ffmpeg.returncode}")
+            ffmpeg_completed = True
             log_event(self.config, "ffmpeg_done", job_id=job_id, returncode=self._ffmpeg.returncode)
             self.set_phase("probing_output", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
             output_probe, output_meta = ffprobe_metadata(self.config, output, source_meta.get("media_type") or "default")
@@ -2848,13 +2955,14 @@ class SimpleRipperApp:
                 raise RuntimeError("NAS temp verification failed: " + "; ".join(temp_errors))
             log_event(self.config, "upload_done", job_id=job_id, temp_output_path=str(tmp_output), output_size_bytes=tmp_output.stat().st_size)
             self.set_phase("swapping", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
-            final_payload = replace_source_with_output(source, tmp_output, self.config, {"source": source_meta, "output": temp_meta, "verification": temp_verification, "track_policy": stream_policy, "job_id": job_id})
-            self.set_phase("final_verify", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "quarantine_path": final_payload["quarantine_path"], **recovery_context})
-            log_event(self.config, "swap_done", job_id=job_id, quarantine_path=final_payload["quarantine_path"], replacement_path=str(source))
-            final_probe, final_meta = ffprobe_metadata(self.config, source, source_meta.get("media_type") or "default")
-            final_verification, final_errors = verify_output(self.config, source_meta, source, final_meta, stream_policy)
+            final_payload = replace_source_with_output(source, tmp_output, self.config, {"source": source_meta, "output": temp_meta, "verification": temp_verification, "track_policy": stream_policy, "job_id": job_id}, replacement_path)
+            final_path = Path(str(final_payload["replacement_path"]))
+            self.set_phase("final_verify", source, {"job_id": job_id, "replacement_path": str(final_path), "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "quarantine_path": final_payload["quarantine_path"], **recovery_context})
+            log_event(self.config, "swap_done", job_id=job_id, quarantine_path=final_payload["quarantine_path"], source_path=str(source), replacement_path=str(final_path))
+            final_probe, final_meta = ffprobe_metadata(self.config, final_path, source_meta.get("media_type") or "default")
+            final_verification, final_errors = verify_output(self.config, source_meta, final_path, final_meta, stream_policy)
             if final_errors:
-                rollback_replacement(source, Path(str(final_payload["quarantine_path"])), self.config)
+                rollback_replacement(source, Path(str(final_payload["quarantine_path"])), self.config, final_path)
                 raise RuntimeError("Final verification failed after swap: " + "; ".join(final_errors))
             quarantine_cleanup = finalize_quarantined_original(Path(str(final_payload["quarantine_path"])), self.config)
             final_payload.update(quarantine_cleanup)
@@ -2862,13 +2970,16 @@ class SimpleRipperApp:
             marker = marker_path(source, self.config)
             if marker is not None:
                 write_json(marker, {"source": source_meta, "output": final_meta, "verification": final_verification, "track_policy": stream_policy, "job_id": job_id, **final_payload, "processed_at": utc_now()})
-            history_payload = {"status": "done", "job_id": job_id, "source_signature": source_signature(source), "updated_at": utc_now(), "video_codec_after": final_meta.get("video_codec")}
+            history_payload = {"status": "done", "job_id": job_id, "source_signature": source_before_signature, "updated_at": utc_now(), "video_codec_after": final_meta.get("video_codec"), "replacement_path": str(final_path), "final_path": str(final_path)}
             write_history_index(self.config, source, history_payload)
             write_shared_worker_history(self.config, source, history_payload)
-            update_cache_job_success(self.config, source)
-            log_event(self.config, "final_verification_ok", job_id=job_id, replacement_path=str(source), output_size_bytes=source.stat().st_size)
-            self.set_phase("refreshing_jellyfin", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "quarantine_path": final_payload["quarantine_path"], **recovery_context})
-            jellyfin_refresh = refresh_jellyfin(self.config, source)
+            replacement_history_payload = {"status": "done", "job_id": job_id, "source_signature": source_signature(final_path), "updated_at": utc_now(), "video_codec_after": final_meta.get("video_codec"), "source_path": str(source), "replacement_path": str(final_path), "final_path": str(final_path)}
+            write_history_index(self.config, final_path, replacement_history_payload)
+            write_shared_worker_history(self.config, final_path, replacement_history_payload)
+            update_cache_job_success(self.config, source, final_path)
+            log_event(self.config, "final_verification_ok", job_id=job_id, source_path=str(source), replacement_path=str(final_path), output_size_bytes=final_path.stat().st_size)
+            self.set_phase("refreshing_jellyfin", source, {"job_id": job_id, "replacement_path": str(final_path), "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "quarantine_path": final_payload["quarantine_path"], **recovery_context})
+            jellyfin_refresh = refresh_jellyfin(self.config, source, final_path)
             log_event(self.config, "jellyfin_refresh", job_id=job_id, source_path=str(source), status=jellyfin_refresh.get("status"), item_id=jellyfin_refresh.get("item_id"))
             summary_fields = history_summary_fields(source_meta, final_meta, final_verification, jellyfin_refresh)
             job_summary.update({"status": "done", "finished_at": utc_now(), "source": source_meta, "output": final_meta, "verification": final_verification, "local_verification": verification, "nas_temp_verification": temp_verification, "track_policy": stream_policy, **summary_fields, **final_payload})
@@ -2882,7 +2993,7 @@ class SimpleRipperApp:
             log_event(self.config, "force_stop_completed", job_id=job_id, source_path=str(source), phase=self.state.current_phase)
             self.reset_runtime_state(clear_errors=True)
         except Exception as exc:
-            failure_type = "ffmpeg" if isinstance(exc, FfmpegFailedError) else "job"
+            failure_type = "ffmpeg" if isinstance(exc, FfmpegFailedError) or ffmpeg_completed else "job"
             previous_failure_count = 0
             previous_payload = load_history_index(self.config, source)
             current_signature = source_signature(source) if source.exists() else None
@@ -2891,10 +3002,10 @@ class SimpleRipperApp:
                 previous_failure_count = int(previous_payload.get("failure_count") or 0)
             job_summary.update({"status": "error", "finished_at": utc_now(), "error": str(exc)})
             append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
-            history_payload = {"status": "error", "job_id": job_id, "source_signature": current_signature, "updated_at": utc_now(), "error": str(exc), "failure_type": failure_type, "failure_count": previous_failure_count + 1}
+            history_payload = {"status": "error", "job_id": job_id, "source_signature": current_signature, "updated_at": utc_now(), "error": str(exc), "failure_type": failure_type, "failure_count": previous_failure_count + 1, "replacement_path": str(replacement_path)}
             write_history_index(self.config, source, history_payload)
             write_shared_worker_history(self.config, source, history_payload)
-            cache_failure = update_cache_job_failure(self.config, source, str(exc)) if isinstance(exc, FfmpegFailedError) else None
+            cache_failure = update_cache_job_failure(self.config, source, str(exc)) if ffmpeg_started else None
             if cache_failure:
                 log_event(self.config, "candidate_cache_failure", job_id=job_id, source_path=str(source), **cache_failure)
             self.log_error(f"{source}: {exc}", source_path=str(source), failure_type=failure_type)
@@ -2918,30 +3029,33 @@ def guess_media_type(path: Path) -> str:
         return "movie"
     return "default"
 
-def replace_source_with_output(source: Path, output: Path, config: dict[str, Any], marker: dict[str, Any]) -> dict[str, Any]:
+def replace_source_with_output(source: Path, output: Path, config: dict[str, Any], marker: dict[str, Any], replacement_path: Path | None = None) -> dict[str, Any]:
+    final_path = replacement_path or target_output_path(source)
     quarantine_path = quarantine_path_for_source(source, config)
     quarantine_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(source), str(quarantine_path))
     try:
-        os.replace(output, source)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(output, final_path)
     except Exception:
         shutil.move(str(quarantine_path), str(source))
         raise
-    marker = {**marker, "source_path": str(source), "quarantine_path": str(quarantine_path), "processed_at": utc_now()}
+    marker = {**marker, "source_path": str(source), "replacement_path": str(final_path), "final_path": str(final_path), "quarantine_path": str(quarantine_path), "processed_at": utc_now()}
     write_json(history_dir(config) / "quarantine_index" / f"{file_lock_id(source)}.json", marker)
     sidecar_marker = marker_path(source, config)
-    return {"quarantine_path": str(quarantine_path), "replacement_path": str(source), "processed_marker_path": str(sidecar_marker) if sidecar_marker is not None else None}
+    return {"quarantine_path": str(quarantine_path), "replacement_path": str(final_path), "final_path": str(final_path), "processed_marker_path": str(sidecar_marker) if sidecar_marker is not None else None}
 
 
-def rollback_replacement(source: Path, quarantine_path: Path, config: dict[str, Any]) -> None:
+def rollback_replacement(source: Path, quarantine_path: Path, config: dict[str, Any], replacement_path: Path | None = None) -> None:
+    failed_target = replacement_path or target_output_path(source)
     inspection_root = Path(str((config.get("paths") or {}).get("inspection_dir") or "inspection")) / "failed_replacements"
     inspection_root.mkdir(parents=True, exist_ok=True)
-    failed_output = inspection_root / f"{source.name}.{int(time.time())}.failed-output"
-    if source.exists():
-        shutil.move(str(source), str(failed_output))
+    failed_output = inspection_root / f"{failed_target.name}.{int(time.time())}.failed-output"
+    if failed_target.exists():
+        shutil.move(str(failed_target), str(failed_output))
     if quarantine_path.exists():
         shutil.move(str(quarantine_path), str(source))
-    log_event(config, "rollback_restored", source_path=str(source), quarantine_path=str(quarantine_path), failed_output_path=str(failed_output))
+    log_event(config, "rollback_restored", source_path=str(source), replacement_path=str(failed_target), quarantine_path=str(quarantine_path), failed_output_path=str(failed_output))
 
 
 def preserve_failed_output(work_dir: Path, source: Path, config: dict[str, Any]) -> None:
