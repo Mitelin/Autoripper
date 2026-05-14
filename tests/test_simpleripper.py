@@ -6,6 +6,7 @@ import socket
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -465,6 +466,45 @@ class SimpleRipperTests(unittest.TestCase):
                 self.assertEqual(simpleripper.main(["clear-cache", "--config", str(config_path)]), 0)
             self.assertTrue(simpleripper.worker_cache_path(config).exists())
 
+    def test_worker_cache_reuses_initialized_schema_under_concurrency(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            simpleripper.worker_cache_summary(config)
+            original_initialize = simpleripper.initialize_worker_cache
+            init_calls = 0
+            errors: list[Exception] = []
+
+            def tracked_initialize(connection: object) -> None:
+                nonlocal init_calls
+                init_calls += 1
+                original_initialize(connection)  # type: ignore[arg-type]
+
+            def read_summary() -> None:
+                try:
+                    for _ in range(20):
+                        simpleripper.worker_cache_summary(config)
+                except Exception as exc:
+                    errors.append(exc)
+
+            def write_state() -> None:
+                try:
+                    for index in range(20):
+                        simpleripper.scan_state_set(config, "heartbeat", str(index))
+                except Exception as exc:
+                    errors.append(exc)
+
+            with patch("simpleripper.initialize_worker_cache", side_effect=tracked_initialize):
+                threads = [threading.Thread(target=read_summary) for _ in range(4)] + [threading.Thread(target=write_state)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+            self.assertEqual(init_calls, 0)
+            self.assertEqual(errors, [])
+
     def test_set_phase_writes_current_job_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -623,6 +663,49 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertEqual(handler.responses[0][1], simpleripper.HTTPStatus.FORBIDDEN)
             self.assertIn("outside allowed library roots", handler.responses[0][0]["error"])  # type: ignore[index]
+
+    def test_web_root_head_returns_headers_without_body(self) -> None:
+        class FakeHandler:
+            def __init__(self, app: simpleripper.SimpleRipperApp) -> None:
+                self.app = app
+                self.path = "/"
+                self.status: int | None = None
+                self.headers: dict[str, str] = {}
+                self.wfile = io.BytesIO()
+
+            def send_response(self, status: int) -> None:
+                self.status = status
+
+            def send_header(self, name: str, value: str) -> None:
+                self.headers[name] = value
+
+            def end_headers(self) -> None:
+                pass
+
+            def send_no_cache_headers(self) -> None:
+                simpleripper.SimpleRipperHandler.send_no_cache_headers(self)  # type: ignore[arg-type]
+
+            def send_index(self, include_body: bool = True) -> None:
+                simpleripper.SimpleRipperHandler.send_index(self, include_body=include_body)  # type: ignore[arg-type]
+
+            def send_json(self, payload: object, status: int = 200, include_body: bool = True) -> None:
+                simpleripper.SimpleRipperHandler.send_json(self, payload, status=status, include_body=include_body)  # type: ignore[arg-type]
+
+            def handle_get_request(self, include_body: bool = True) -> None:
+                simpleripper.SimpleRipperHandler.handle_get_request(self, include_body=include_body)  # type: ignore[arg-type]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            handler = FakeHandler(app)
+
+            simpleripper.SimpleRipperHandler.do_HEAD(handler)  # type: ignore[arg-type]
+
+            self.assertEqual(handler.status, 200)
+            self.assertEqual(handler.headers["Content-Type"], "text/html; charset=utf-8")
+            self.assertEqual(handler.headers["Content-Length"], str(len(simpleripper.INDEX_HTML.encode("utf-8"))))
+            self.assertEqual(handler.wfile.getvalue(), b"")
 
     def test_web_ui_folder_picker_uses_browser_endpoint(self) -> None:
         self.assertIn("/api/browse-folders", simpleripper.INDEX_HTML)

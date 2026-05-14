@@ -27,6 +27,7 @@ import yaml
 
 APP_NAME = "SimpleRipper"
 SCAN_SCOPE_SCHEMA_VERSION = 1
+WORKER_CACHE_BUSY_TIMEOUT_MS = 30000
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v", ".ts"}
 LANGUAGE_ALIASES = {
     "cze": {"cze", "ces", "cz", "czech", "cestina", "cesky", "cz dabing", "czech dub"},
@@ -34,6 +35,9 @@ LANGUAGE_ALIASES = {
     "eng": {"eng", "en", "english", "anglicky", "anglictina", "english dub", "en dub"},
     "jpn": {"jpn", "ja", "jp", "japanese", "japonstina", "nihongo"},
 }
+
+_WORKER_CACHE_INIT_LOCK = threading.Lock()
+_WORKER_CACHE_INITIALIZED: set[str] = set()
 
 
 class ForceStopRequested(RuntimeError):
@@ -238,14 +242,34 @@ def policy_hash(config: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(relevant, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
+def ensure_worker_cache_initialized(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cache_key = str(path.resolve())
+    if path.exists() and cache_key in _WORKER_CACHE_INITIALIZED:
+        return
+    with _WORKER_CACHE_INIT_LOCK:
+        if path.exists() and cache_key in _WORKER_CACHE_INITIALIZED:
+            return
+        connection = sqlite3.connect(path, timeout=WORKER_CACHE_BUSY_TIMEOUT_MS / 1000)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {WORKER_CACHE_BUSY_TIMEOUT_MS}")
+            connection.execute("PRAGMA journal_mode = WAL")
+            initialize_worker_cache(connection)
+            connection.commit()
+            _WORKER_CACHE_INITIALIZED.add(cache_key)
+        finally:
+            connection.close()
+
+
 @contextmanager
 def open_worker_cache(config: dict[str, Any]) -> Any:
     path = worker_cache_path(config)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    ensure_worker_cache_initialized(path)
+    connection = sqlite3.connect(path, timeout=WORKER_CACHE_BUSY_TIMEOUT_MS / 1000)
     connection.row_factory = sqlite3.Row
+    connection.execute(f"PRAGMA busy_timeout = {WORKER_CACHE_BUSY_TIMEOUT_MS}")
     try:
-        initialize_worker_cache(connection)
         yield connection
         connection.commit()
     finally:
@@ -3170,48 +3194,61 @@ class SimpleRipperHandler(BaseHTTPRequestHandler):
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
 
-    def send_json(self, payload: Any, status: int = 200) -> None:
+    def send_json(self, payload: Any, status: int = 200, include_body: bool = True) -> None:
         body = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_no_cache_headers()
         self.end_headers()
-        self.wfile.write(body)
+        if include_body:
+            self.wfile.write(body)
+
+    def send_index(self, include_body: bool = True) -> None:
+        body = INDEX_HTML.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_no_cache_headers()
+        self.end_headers()
+        if include_body:
+            self.wfile.write(body)
 
     def read_payload(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
 
-    def do_GET(self) -> None:
+    def handle_get_request(self, include_body: bool = True) -> None:
         parsed = parse.urlsplit(self.path)
         path = parsed.path
         if path == "/api/status":
-            self.send_json(self.app.status())
+            self.send_json(self.app.status(), include_body=include_body)
             return
         if path == "/api/config":
-            self.send_json({"allowed_roots": [str(path) for path in self.app.roots]})
+            self.send_json({"allowed_roots": [str(path) for path in self.app.roots]}, include_body=include_body)
             return
         if path == "/api/logs":
-            self.send_json({"lines": tail_text_lines(app_log_path(self.app.config), 200)})
+            self.send_json({"lines": tail_text_lines(app_log_path(self.app.config), 200)}, include_body=include_body)
             return
         if path == "/api/browse-folders":
             query = parse.parse_qs(parsed.query)
             requested_path = (query.get("path") or [None])[0]
             try:
-                self.send_json(safe_browse_folders(self.app.config, requested_path))
+                self.send_json(safe_browse_folders(self.app.config, requested_path), include_body=include_body)
             except PermissionError as exc:
-                self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
+                self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN, include_body=include_body)
             except FileNotFoundError as exc:
-                self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+                self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND, include_body=include_body)
             except (NotADirectoryError, ValueError, OSError) as exc:
-                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST, include_body=include_body)
             return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_no_cache_headers()
-        self.end_headers()
-        self.wfile.write(INDEX_HTML.encode("utf-8"))
+        self.send_index(include_body=include_body)
+
+    def do_GET(self) -> None:
+        self.handle_get_request(include_body=True)
+
+    def do_HEAD(self) -> None:
+        self.handle_get_request(include_body=False)
 
     def do_POST(self) -> None:
         try:
