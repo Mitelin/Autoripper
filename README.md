@@ -75,6 +75,7 @@ Copy `config.example.yaml` to `config.yaml` and edit:
 - `paths.keep_quarantine_after_success`: keep the quarantined original after success for development or manual inspection. Default is `false`.
 - `paths.inspection_dir`: failed-output inspection area.
 - `tools.ffmpeg` and `tools.ffprobe`.
+- `downscale`: optional 4K and ultrawide 4K downscale to a 1080p-class width while preserving aspect ratio. Example: `3840x1608 -> 1920x804`. Keep `downscale.enabled: false` unless you explicitly want smaller outputs instead of preserving 4K resolution.
 - `quality_profiles`, `track_policy`, `skip_rules`, and `verification`.
 - `jellyfin`: optional item refresh after a successful final verify.
 

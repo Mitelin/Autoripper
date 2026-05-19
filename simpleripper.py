@@ -964,15 +964,64 @@ def select_streams(config: dict[str, Any], source: dict[str, Any]) -> dict[str, 
     return {"applied": True, "map_arguments": args, "expected_audio_stream_count": len(target_audio), "expected_subtitle_stream_count": expected_subtitle_count}
 
 
-def build_ffmpeg_command(config: dict[str, Any], source: Path, output: Path, metadata: dict[str, Any], stream_policy: dict[str, Any]) -> list[str]:
+def downscale_settings(config: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    settings = config.get("downscale") or {}
+    enabled = bool(settings.get("enabled", False))
+    width = to_int(metadata.get("video_width"))
+    height = to_int(metadata.get("video_height"))
+    max_width = max(1, to_int(settings.get("max_width")) or 1920)
+    flags = str(settings.get("flags") or "lanczos").strip() or "lanczos"
+    only_buckets_raw = settings.get("only_buckets")
+    only_buckets = [str(item).strip().lower() for item in (only_buckets_raw if isinstance(only_buckets_raw, list) else ["4k"]) if str(item).strip()]
+    if not only_buckets:
+        only_buckets = ["4k"]
+    media_types_raw = settings.get("media_types")
+    media_types = [media_type_value(str(item)) for item in media_types_raw] if isinstance(media_types_raw, list) else []
+    media_types = [item for item in media_types if item != "auto"]
+    bucket = resolution_bucket(metadata)
+    media_type = str(metadata.get("media_type") or "default")
+    media_type_allowed = not media_types or media_type in media_types
+    bucket_allowed = bucket in only_buckets
+    width_allowed = width is not None and width > max_width
+    applied = enabled and bucket_allowed and media_type_allowed and width_allowed
+    return {
+        "enabled": enabled,
+        "applied": applied,
+        "media_type": media_type,
+        "bucket": bucket,
+        "source_width": width,
+        "source_height": height,
+        "max_width": max_width,
+        "flags": flags,
+        "only_buckets": only_buckets,
+        "media_types": media_types,
+        "crf_override": settings.get("crf_override"),
+        "filter": f"scale='min({max_width},iw)':-2:flags={flags}" if applied else None,
+    }
+
+
+def build_ffmpeg_command(
+    config: dict[str, Any],
+    source: Path,
+    output: Path,
+    metadata: dict[str, Any],
+    stream_policy: dict[str, Any],
+    downscale_plan: dict[str, Any] | None = None,
+) -> list[str]:
     settings = (config.get("quality_profiles") or {}).get(metadata.get("media_type") or "default") or (config.get("quality_profiles") or {}).get("default") or {}
+    downscale_plan = downscale_plan or downscale_settings(config, metadata)
+    crf = settings.get("crf", 24)
+    if downscale_plan.get("applied") and downscale_plan.get("crf_override") is not None:
+        crf = downscale_plan["crf_override"]
     command = [str((config.get("tools") or {}).get("ffmpeg") or "ffmpeg"), "-hide_banner", "-nostats", "-progress", "pipe:1", "-y", "-i", str(source)]
     default_maps = ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]
     map_arguments = list(stream_policy.get("map_arguments") or default_maps)
     if any(option == "-map" and index + 1 < len(map_arguments) and map_arguments[index + 1] == "0" for index, option in enumerate(map_arguments)):
         map_arguments = default_maps
     command.extend(map_arguments)
-    command.extend(["-c:v", str(settings.get("encoder", "libx265")), "-preset", str(settings.get("preset", "medium")), "-crf", str(settings.get("crf", 24))])
+    if downscale_plan.get("applied") and downscale_plan.get("filter"):
+        command.extend(["-vf", str(downscale_plan["filter"])])
+    command.extend(["-c:v", str(settings.get("encoder", "libx265")), "-preset", str(settings.get("preset", "medium")), "-crf", str(crf)])
     if settings.get("pix_fmt"):
         command.extend(["-pix_fmt", str(settings["pix_fmt"])])
     command.extend(["-c:a", str(settings.get("audio", "copy")), "-c:s", str(settings.get("subtitles", "copy")), "-c:t", "copy", "-map_metadata", "0", "-map_chapters", "0", "-metadata", f"encoded_by={APP_NAME}", str(output)])
@@ -3060,12 +3109,15 @@ class SimpleRipperApp:
             write_json(metadata_dir / "source.ffprobe.json", {"probe": source_probe, "metadata": source_meta})
             recovery_context = {"source_metadata": source_meta, "replacement_path": str(replacement_path)}
             stream_policy = select_streams(self.config, source_meta)
+            downscale_plan = downscale_settings(self.config, source_meta)
             profile_matches, profile_mismatch_reasons = source_matches_target_profile(self.config, source_meta, str(source_meta.get("media_type") or "default"), stream_policy)
             retention_size_policy = retention_size_policy_evaluation(self.config, source_meta, str(source_meta.get("media_type") or "default"))
             recovery_context["track_policy"] = stream_policy
+            recovery_context["downscale"] = downscale_plan
             recovery_context["target_profile_matches"] = profile_matches
             recovery_context["profile_mismatch_reasons"] = profile_mismatch_reasons
             recovery_context["retention_size_policy"] = retention_size_policy
+            job_summary["downscale"] = downscale_plan
             reason = skip_reason(self.config, source_meta, stream_policy)
             if reason:
                 job_summary.update({"status": "skipped", "skip_reason": reason, "finished_at": utc_now(), "source": source_meta, "target_profile_matches": profile_matches, "profile_mismatch_reasons": profile_mismatch_reasons, "track_policy": stream_policy, "retention_size_policy": retention_size_policy})
@@ -3073,7 +3125,7 @@ class SimpleRipperApp:
                 if marker is not None:
                     write_json(marker, job_summary)
                 append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
-                history_payload = {"status": "skipped", "source_signature": source_signature(source), "job_id": job_id, "updated_at": utc_now(), "reason": reason, "retention_size_policy": retention_size_policy}
+                history_payload = {"status": "skipped", "source_signature": source_signature(source), "job_id": job_id, "updated_at": utc_now(), "reason": reason, "retention_size_policy": retention_size_policy, "downscale": downscale_plan}
                 write_history_index(self.config, source, history_payload)
                 write_shared_worker_history(self.config, source, history_payload)
                 update_cache_deep_check(
@@ -3088,8 +3140,24 @@ class SimpleRipperApp:
             if profile_mismatch_reasons:
                 log_event(self.config, "candidate_profile_mismatch", job_id=job_id, source_path=str(source), reasons=profile_mismatch_reasons, retention_size_policy=retention_size_policy)
             self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
-            command = build_ffmpeg_command(self.config, copied_source, output, source_meta, stream_policy)
+            settings = (self.config.get("quality_profiles") or {}).get(source_meta.get("media_type") or "default") or (self.config.get("quality_profiles") or {}).get("default") or {}
+            crf = settings.get("crf", 24)
+            if downscale_plan.get("applied") and downscale_plan.get("crf_override") is not None:
+                crf = downscale_plan["crf_override"]
+            command = build_ffmpeg_command(self.config, copied_source, output, source_meta, stream_policy, downscale_plan)
             job_summary["ffmpeg_command"] = command
+            if downscale_plan.get("applied"):
+                log_event(
+                    self.config,
+                    "downscale_applied",
+                    source_width=downscale_plan.get("source_width"),
+                    source_height=downscale_plan.get("source_height"),
+                    max_width=downscale_plan.get("max_width"),
+                    flags=downscale_plan.get("flags"),
+                    crf=crf,
+                    media_type=downscale_plan.get("media_type"),
+                    bucket=downscale_plan.get("bucket"),
+                )
             (work_dir_path / "logs").mkdir(parents=True, exist_ok=True)
             ffmpeg_log = work_dir_path / "logs" / "ffmpeg.log"
             log_event(self.config, "ffmpeg_start", job_id=job_id, command=command)
@@ -3156,11 +3224,11 @@ class SimpleRipperApp:
             write_json(metadata_dir / "final.ffprobe.json", {"probe": final_probe, "metadata": final_meta})
             marker = marker_path(source, self.config)
             if marker is not None:
-                write_json(marker, {"source": source_meta, "output": final_meta, "verification": final_verification, "track_policy": stream_policy, "job_id": job_id, **final_payload, "processed_at": utc_now()})
-            history_payload = {"status": "done", "job_id": job_id, "source_signature": source_before_signature, "updated_at": utc_now(), "video_codec_after": final_meta.get("video_codec"), "replacement_path": str(final_path), "final_path": str(final_path)}
+                write_json(marker, {"source": source_meta, "output": final_meta, "verification": final_verification, "track_policy": stream_policy, "downscale": downscale_plan, "job_id": job_id, **final_payload, "processed_at": utc_now()})
+            history_payload = {"status": "done", "job_id": job_id, "source_signature": source_before_signature, "updated_at": utc_now(), "video_codec_after": final_meta.get("video_codec"), "replacement_path": str(final_path), "final_path": str(final_path), "downscale": downscale_plan}
             write_history_index(self.config, source, history_payload)
             write_shared_worker_history(self.config, source, history_payload)
-            replacement_history_payload = {"status": "done", "job_id": job_id, "source_signature": source_signature(final_path), "updated_at": utc_now(), "video_codec_after": final_meta.get("video_codec"), "source_path": str(source), "replacement_path": str(final_path), "final_path": str(final_path)}
+            replacement_history_payload = {"status": "done", "job_id": job_id, "source_signature": source_signature(final_path), "updated_at": utc_now(), "video_codec_after": final_meta.get("video_codec"), "source_path": str(source), "replacement_path": str(final_path), "final_path": str(final_path), "downscale": downscale_plan}
             write_history_index(self.config, final_path, replacement_history_payload)
             write_shared_worker_history(self.config, final_path, replacement_history_payload)
             update_cache_job_success(self.config, source, final_path)

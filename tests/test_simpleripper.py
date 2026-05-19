@@ -1385,6 +1385,75 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("pipe:1", command)
         self.assertIn("-nostats", command)
 
+    def test_downscale_settings_applies_for_4k_series(self) -> None:
+        config = self.make_config(Path("."))
+        config["downscale"] = {
+            "enabled": True,
+            "media_types": ["series", "movie"],
+            "only_buckets": ["4k"],
+            "max_width": 1920,
+            "flags": "lanczos",
+            "crf_override": 21,
+        }
+
+        result = simpleripper.downscale_settings(
+            config,
+            {"media_type": "series", "video_width": 3840, "video_height": 1608},
+        )
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["bucket"], "4k")
+        self.assertEqual(result["filter"], "scale='min(1920,iw)':-2:flags=lanczos")
+        self.assertEqual(result["crf_override"], 21)
+
+    def test_build_ffmpeg_command_adds_scale_and_crf_override_for_4k_downscale(self) -> None:
+        config = self.make_config(Path("."))
+        config["quality_profiles"] = {
+            "series": {"encoder": "libx265", "crf": 24, "preset": "medium", "pix_fmt": "yuv420p10le", "audio": "copy", "subtitles": "copy"}
+        }
+        config["downscale"] = {
+            "enabled": True,
+            "media_types": ["series", "movie"],
+            "only_buckets": ["4k"],
+            "max_width": 1920,
+            "flags": "lanczos",
+            "crf_override": 21,
+        }
+        metadata = {"media_type": "series", "video_width": 3840, "video_height": 1608}
+
+        command = simpleripper.build_ffmpeg_command(
+            config,
+            Path("input.mkv"),
+            Path("output.mkv"),
+            metadata,
+            {"map_arguments": ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]},
+        )
+
+        self.assertIn("-vf", command)
+        self.assertEqual(command[command.index("-vf") + 1], "scale='min(1920,iw)':-2:flags=lanczos")
+        self.assertEqual(command[command.index("-crf") + 1], "21")
+
+    def test_build_ffmpeg_command_skips_scale_for_1080p_source(self) -> None:
+        config = self.make_config(Path("."))
+        config["downscale"] = {
+            "enabled": True,
+            "media_types": ["series", "movie"],
+            "only_buckets": ["4k"],
+            "max_width": 1920,
+            "flags": "lanczos",
+            "crf_override": 21,
+        }
+
+        command = simpleripper.build_ffmpeg_command(
+            config,
+            Path("input.mkv"),
+            Path("output.mkv"),
+            {"media_type": "series", "video_width": 1920, "video_height": 1080},
+            {"map_arguments": ["-map", "0"]},
+        )
+
+        self.assertNotIn("-vf", command)
+
     def test_consume_ffmpeg_progress_emits_updates_from_chunked_binary_stream(self) -> None:
         class FakeBinaryBuffer:
             def __init__(self, chunks: list[bytes]) -> None:

@@ -76,6 +76,17 @@ quality_profiles:
     audio: copy
     subtitles: copy
 
+downscale:
+  enabled: false
+  media_types:
+    - series
+    - movie
+  only_buckets:
+    - 4k
+  max_width: 1920
+  flags: lanczos
+  crf_override: 21
+
 retention_size_policy:
   enabled: true
   series:
