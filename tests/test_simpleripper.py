@@ -1470,6 +1470,21 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(len(app.state.errors or []), 1)
             self.assertEqual((app.state.errors or [])[0]["message"], "second")
 
+    def test_verification_failed_error_exposes_summary_and_details(self) -> None:
+        verification = {
+            "source_size_bytes": 3 * 1024 * 1024 * 1024,
+            "output_size_bytes": 300 * 1024 * 1024,
+            "output_to_source_ratio": 0.097,
+            "overall_bitrate_kbps": 552,
+            "suspicious_size_threshold_used": {"hard_fail_kbps": 900, "warning_kbps": 1200},
+            "suspicious_size_warning_reason": "low output/source ratio 0.097; bitrate 552 kbps below warning threshold 1200 kbps",
+        }
+
+        error = simpleripper.VerificationFailedError("Local verification failed", ["Verification failed: not_suspiciously_tiny"], verification)
+
+        self.assertIn("Local verification failed", error.summary)
+        self.assertTrue(any("552 kbps < hard fail 900 kbps" in line for line in error.details))
+
     def test_expected_video_codecs_maps_common_encoders(self) -> None:
         self.assertEqual(simpleripper.expected_video_codecs("libx265"), {"hevc", "h265"})
         self.assertEqual(simpleripper.expected_video_codecs("libx264"), {"h264", "avc"})

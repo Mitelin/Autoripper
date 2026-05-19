@@ -50,6 +50,17 @@ class FfmpegFailedError(RuntimeError):
     pass
 
 
+class VerificationFailedError(RuntimeError):
+    def __init__(self, stage: str, errors: list[str], verification: dict[str, Any]) -> None:
+        self.stage = stage
+        self.errors = list(errors)
+        self.verification = dict(verification)
+        summary, details = verification_failure_summary(stage, verification, errors)
+        self.summary = summary
+        self.details = details
+        super().__init__(summary)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -1028,6 +1039,7 @@ def verify_output(config: dict[str, Any], source: dict[str, Any], output: Path, 
         "source_size_bytes": source_size,
         "output_size_bytes": output_size,
         "output_to_source_ratio": ratio,
+        "max_output_source_ratio": to_float(limits.get("max_output_source_ratio", 0.95)),
         "overall_bitrate_kbps": bitrate,
         "suspicious_size_warning": bool(warning_reasons),
         "suspicious_size_warning_reason": "; ".join(warning_reasons) if warning_reasons else None,
@@ -1036,10 +1048,103 @@ def verify_output(config: dict[str, Any], source: dict[str, Any], output: Path, 
         "expected_audio_stream_count": expected_audio,
         "expected_subtitle_stream_count": expected_subtitle,
         "expected_stream_count_source": "track_policy" if stream_policy.get("applied") else "source",
+        "actual_audio_stream_count": to_int(output_metadata.get("audio_stream_count")),
+        "actual_subtitle_stream_count": to_int(output_metadata.get("subtitle_stream_count")),
+        "actual_video_codec": output_metadata.get("video_codec"),
+        "expected_video_codecs": sorted(expected_video_codecs(settings.get("encoder"))) if settings.get("encoder") else [],
+        "actual_pix_fmt": str(output_metadata.get("video_pix_fmt") or "") or None,
+        "expected_pix_fmt": str(settings.get("pix_fmt") or "") or None,
+        "duration_diff_seconds": duration_diff,
+        "max_duration_diff_seconds": to_float(limits.get("max_duration_diff_seconds", 2)),
     }
     hard_keys = ["output_exists", "output_non_empty", "duration_ok", "video_stream_exists", "video_codec_ok", "pix_fmt_ok", "audio_streams_ok", "subtitle_streams_ok", "size_reduction_ok", "not_suspiciously_tiny"]
     errors = [f"Verification failed: {key}" for key in hard_keys if not verification.get(key)]
     return verification, errors
+
+
+def verification_failure_summary(stage: str, verification: dict[str, Any], errors: list[str]) -> tuple[str, list[str]]:
+    stage_label = stage.strip() or "Verification"
+    failed_keys = [str(item).split(": ", 1)[-1] for item in errors]
+    details: list[str] = []
+    source_size = to_int(verification.get("source_size_bytes"))
+    output_size = to_int(verification.get("output_size_bytes"))
+    ratio = to_float(verification.get("output_to_source_ratio"))
+    bitrate = to_int(verification.get("overall_bitrate_kbps"))
+    threshold = verification.get("suspicious_size_threshold_used") or {}
+    expected_audio = to_int(verification.get("expected_audio_stream_count"))
+    expected_subtitles = to_int(verification.get("expected_subtitle_stream_count"))
+
+    summary_reason = ", ".join(failed_keys[:2]) if failed_keys else "unknown reason"
+    if len(failed_keys) > 2:
+        summary_reason += f" (+{len(failed_keys) - 2} more)"
+
+    for key in failed_keys:
+        if key == "not_suspiciously_tiny":
+            hard_fail = to_int(threshold.get("hard_fail_kbps"))
+            details.append(
+                "bitrate too low"
+                + (f": {bitrate} kbps < hard fail {hard_fail} kbps" if bitrate is not None and hard_fail is not None else "")
+            )
+        elif key == "size_reduction_ok":
+            max_ratio = to_float(verification.get("max_output_source_ratio"))
+            detail = "size reduction check failed"
+            size_bits: list[str] = []
+            if source_size is not None and output_size is not None:
+                size_bits.append(f"{format_bytes_compact(output_size)} / {format_bytes_compact(source_size)}")
+            if ratio is not None:
+                size_bits.append(f"ratio {ratio:.3f}")
+            if max_ratio is not None:
+                size_bits.append(f"limit {max_ratio:.3f}")
+            if size_bits:
+                detail += ": " + ", ".join(size_bits)
+            details.append(detail)
+        elif key == "audio_streams_ok":
+            actual_audio = to_int(verification.get("actual_audio_stream_count"))
+            details.append(f"audio stream count mismatch: expected {expected_audio}, got {actual_audio}")
+        elif key == "subtitle_streams_ok":
+            actual_subtitles = to_int(verification.get("actual_subtitle_stream_count"))
+            details.append(f"subtitle stream count mismatch: expected {expected_subtitles}, got {actual_subtitles}")
+        elif key == "duration_ok":
+            duration_diff = to_float(verification.get("duration_diff_seconds"))
+            max_diff = to_float(verification.get("max_duration_diff_seconds"))
+            details.append(
+                "duration mismatch"
+                + (f": diff {duration_diff:.2f}s > {max_diff:.2f}s" if duration_diff is not None and max_diff is not None else "")
+            )
+        elif key == "video_codec_ok":
+            details.append(
+                f"video codec mismatch: expected {escape_plain(verification.get('expected_video_codecs') or 'configured codec')}, got {escape_plain(verification.get('actual_video_codec') or 'none')}"
+            )
+        elif key == "pix_fmt_ok":
+            details.append(
+                f"pixel format mismatch: expected {escape_plain(verification.get('expected_pix_fmt') or 'configured pix_fmt')}, got {escape_plain(verification.get('actual_pix_fmt') or 'none')}"
+            )
+        else:
+            details.append(key)
+
+    if source_size is not None and output_size is not None and not any(item.startswith("output size") for item in details):
+        details.append(f"output size: {format_bytes_compact(output_size)} from {format_bytes_compact(source_size)}")
+    warning_reason = str(verification.get("suspicious_size_warning_reason") or "").strip()
+    if warning_reason:
+        details.append(f"warning: {warning_reason}")
+    return f"{stage_label}: {summary_reason}", details
+
+
+def format_bytes_compact(value: int | None) -> str:
+    if value is None:
+        return "n/a"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(value)
+    unit = 0
+    while size >= 1024 and unit < len(units) - 1:
+        size /= 1024.0
+        unit += 1
+    precision = 0 if size >= 10 or unit == 0 else 1
+    return f"{size:.{precision}f} {units[unit]}"
+
+
+def escape_plain(value: Any) -> str:
+    return str(value) if value is not None else "n/a"
 
 
 def expected_video_codecs(encoder: Any) -> set[str]:
@@ -2692,12 +2797,12 @@ class SimpleRipperApp:
             payload.update(extra or {})
             write_json(current_job_path(self.config), payload)
 
-    def log_error(self, message: str, source_path: str | None = None, failure_type: str | None = None) -> None:
+    def log_error(self, message: str, source_path: str | None = None, failure_type: str | None = None, summary: str | None = None, details: list[str] | None = None) -> None:
         with self._lock:
             key_source = source_path or ""
             key_type = failure_type or ""
             existing = [item for item in (self.state.errors or []) if not (isinstance(item, dict) and str(item.get("source_path") or "") == key_source and str(item.get("failure_type") or "") == key_type)]
-            self.state.errors = ([{"at": utc_now(), "message": message, "source_path": source_path, "failure_type": failure_type}] + existing)[:100]
+            self.state.errors = ([{"at": utc_now(), "message": message, "summary": summary or message, "details": list(details or []), "source_path": source_path, "failure_type": failure_type}] + existing)[:100]
         log_event(self.config, "error", message=message, source_path=source_path, failure_type=failure_type)
 
     def reset_runtime_state(self, clear_errors: bool = False) -> None:
@@ -3025,7 +3130,7 @@ class SimpleRipperApp:
             self.set_phase("verifying", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
             verification, errors = verify_output(self.config, source_meta, output, output_meta, stream_policy)
             if errors:
-                raise RuntimeError("; ".join(errors))
+                raise VerificationFailedError("Local verification failed", errors, verification)
             log_event(self.config, "local_verification_ok", job_id=job_id, output_size_bytes=output.stat().st_size)
             self.set_phase("uploading", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
             log_event(self.config, "upload_start", job_id=job_id, temp_output_path=str(tmp_output))
@@ -3034,7 +3139,7 @@ class SimpleRipperApp:
             write_json(metadata_dir / "nas-temp.ffprobe.json", {"probe": temp_probe, "metadata": temp_meta})
             temp_verification, temp_errors = verify_output(self.config, source_meta, tmp_output, temp_meta, stream_policy)
             if temp_errors:
-                raise RuntimeError("NAS temp verification failed: " + "; ".join(temp_errors))
+                raise VerificationFailedError("NAS temp verification failed", temp_errors, temp_verification)
             log_event(self.config, "upload_done", job_id=job_id, temp_output_path=str(tmp_output), output_size_bytes=tmp_output.stat().st_size)
             self.set_phase("swapping", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
             final_payload = replace_source_with_output(source, tmp_output, self.config, {"source": source_meta, "output": temp_meta, "verification": temp_verification, "track_policy": stream_policy, "job_id": job_id}, replacement_path)
@@ -3045,7 +3150,7 @@ class SimpleRipperApp:
             final_verification, final_errors = verify_output(self.config, source_meta, final_path, final_meta, stream_policy)
             if final_errors:
                 rollback_replacement(source, Path(str(final_payload["quarantine_path"])), self.config, final_path)
-                raise RuntimeError("Final verification failed after swap: " + "; ".join(final_errors))
+                raise VerificationFailedError("Final verification failed after swap", final_errors, final_verification)
             quarantine_cleanup = finalize_quarantined_original(Path(str(final_payload["quarantine_path"])), self.config)
             final_payload.update(quarantine_cleanup)
             write_json(metadata_dir / "final.ffprobe.json", {"probe": final_probe, "metadata": final_meta})
@@ -3090,7 +3195,11 @@ class SimpleRipperApp:
             cache_failure = update_cache_job_failure(self.config, source, str(exc)) if ffmpeg_started else None
             if cache_failure:
                 log_event(self.config, "candidate_cache_failure", job_id=job_id, source_path=str(source), **cache_failure)
-            self.log_error(f"{source}: {exc}", source_path=str(source), failure_type=failure_type)
+            if isinstance(exc, VerificationFailedError):
+                error_message = f"{source}: {exc.summary}"
+                self.log_error(error_message, source_path=str(source), failure_type=failure_type, summary=exc.summary, details=exc.details)
+            else:
+                self.log_error(f"{source}: {exc}", source_path=str(source), failure_type=failure_type)
             preserve_failed_output(work_dir_path, source, self.config)
         finally:
             lock_path.unlink(missing_ok=True)
@@ -3405,6 +3514,15 @@ pre{margin:0;padding:16px 18px;border-radius:18px;background:#09111a;color:#dce9
 .callout.info{background:#16314b;border-color:#356089;color:#cfe6ff}
 .error-list{display:grid;gap:10px}
 .err{padding:12px 14px;border-radius:16px;background:var(--danger-soft);color:#772727;border:1px solid #ecc2c2;line-height:1.5}
+.err-card{border-radius:16px;background:var(--danger-soft);border:1px solid #ecc2c2;color:#772727;overflow:hidden}
+.err-card summary{list-style:none;cursor:pointer;padding:12px 14px;display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;align-items:start}
+.err-card summary::-webkit-details-marker{display:none}
+.err-time{font-size:12px;color:#935050;white-space:nowrap}
+.err-summary{font-weight:700;line-height:1.45;word-break:break-word}
+.err-detail{padding:0 14px 14px;display:grid;gap:8px;border-top:1px solid rgba(119,39,39,.15)}
+.err-path{font-size:13px;line-height:1.45;color:#7b4040;word-break:break-word}
+.err-lines{margin:0;padding-left:18px}
+.err-lines li{margin:0;line-height:1.45}
 .log-shell{display:grid;gap:14px}
 .log-head{display:flex;justify-content:space-between;gap:12px;align-items:center}
 .log-meta{font-size:13px;color:var(--muted)}
@@ -3429,6 +3547,7 @@ let uiError=''
 function formatRequestError(error){return error&&error.message?error.message:String(error||'Unknown UI error')}
 async function readJsonResponse(response){const text=await response.text();let payload={};try{payload=text?JSON.parse(text):{}}catch(error){throw new Error(`Invalid server response (${response.status})`)}if(!response.ok){throw new Error(payload.error||`Request failed (${response.status})`)}return payload}
 function renderUiError(message){uiError=message;if(lastStatus){render(lastStatus);return}const errors=document.getElementById('errors');if(errors){errors.innerHTML=`<div class="err">UI<br>${escapeHtml(message)}</div>`}}
+function renderErrorEntry(entry){const item=entry&&typeof entry==='object'?entry:{message:String(entry||'')};const summary=escapeHtml(item.summary||item.message||'Unknown error');const at=escapeHtml(item.at||'');const sourcePath=item.source_path?`<div class="err-path">${escapeHtml(item.source_path)}</div>`:'';const detailLines=Array.isArray(item.details)?item.details.filter(Boolean):[];if(!sourcePath&&!detailLines.length){return `<div class="err"><div class="err-time">${at}</div><div class="err-summary">${summary}</div></div>`}const detailsHtml=detailLines.length?`<ul class="err-lines">${detailLines.map(line=>`<li>${escapeHtml(line)}</li>`).join('')}</ul>`:'';return `<details class="err-card"><summary><div class="err-time">${at}</div><div class="err-summary">${summary}</div></summary><div class="err-detail">${sourcePath}${detailsHtml}</div></details>`}
 async function getStatus(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(readJsonResponse);uiError='';render(s)}catch(error){renderUiError(formatRequestError(error))}}
 async function post(url,body={}){try{const s=await fetch(url,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(readJsonResponse);uiError='';render(s)}catch(error){renderUiError(formatRequestError(error))}}
 function selectedMap(s){return Object.fromEntries((s.selected_folders||[]).map(item=>[item.path,item.media_type||'auto']))}
@@ -3460,7 +3579,7 @@ function removeFolder(path){post('/api/folders',{folders:collectSelectedFolders(
 function ensureUpdateButton(){const controls=document.querySelector('.controls');if(!controls||document.getElementById('updateButton')){return}const button=document.createElement('button');button.className='outline';button.id='updateButton';button.textContent='Update';button.onclick=triggerUpdate;const testModeButton=document.getElementById('testModeButton');if(testModeButton&&testModeButton.parentNode===controls){controls.insertBefore(button,testModeButton)}else{controls.appendChild(button)}}
 function triggerUpdate(){const button=document.getElementById('updateButton');if(button&&button.disabled){return}post('/api/update')}
 function toggleTestMode(){const button=document.getElementById('testModeButton');const enable=!(button&&button.getAttribute('data-enabled')==='true');post('/api/test-mode',{enabled:enable})}
-function render(s){lastStatus=s;const selected=s.selected_folders||[];const combinedErrors=uiError?[{at:'UI',message:uiError},...(s.errors||[])]:[...(s.errors||[])];const warningCount=(combinedErrors.length?1:0)+(s.last_result&&s.last_result.warning?1:0);document.getElementById('status').textContent=JSON.stringify(s,null,2);document.getElementById('current').innerHTML=renderCurrent(s.current_summary);document.getElementById('lastResult').innerHTML=renderLastResult(s.last_result);document.getElementById('errors').innerHTML=combinedErrors.length?combinedErrors.map(e=>`<div class="err">${escapeHtml(e.at||'')}<br>${escapeHtml(e.message||e)}</div>`).join(''):'<p class="muted">No recent app-level errors.</p>';document.getElementById('log').textContent=(s.recent_log_lines||[]).join(String.fromCharCode(10));document.getElementById('logMeta').textContent=`${(s.recent_log_lines||[]).length} lines`;document.getElementById('selectedFolders').innerHTML=selected.length?selected.map(item=>`<div class="simple-item" data-path="${escapeHtml(item.path)}"><div class="simple-main"><div class="simple-title">${escapeHtml(item.path)}</div><div class="simple-sub">Selected for scan</div></div>${mediaTypeSelect(item.media_type||guessMediaType(item.path),'onchange="saveSelectedFolders()"')}<button class="ghost" data-path="${escapeHtml(item.path)}" onclick="removeFolder(this.getAttribute('data-path'))">Remove</button></div>`).join(''):'<div class="empty">No folders selected.</div>';document.getElementById('selectedCount').textContent=String(selected.length);document.getElementById('heroPhase').textContent=escapeHtml((s.current_summary&&s.current_summary.status)||s.current_phase||'Idle');document.getElementById('warningCount').textContent=String(warningCount);document.getElementById('heroSummary').textContent=heroSummary(s);document.getElementById('heroBadges').innerHTML=renderBadges(s);ensureUpdateButton();document.getElementById('updateButton').disabled=!s.can_update;document.getElementById('updateButton').textContent=s.current_phase==='updating'?'Updating...':'Update';document.getElementById('testModeButton').textContent=s.test_mode?'Test mode ON':'Test mode';document.getElementById('testModeButton').setAttribute('data-enabled',s.test_mode?'true':'false');document.getElementById('testModeBanner').innerHTML=s.test_mode?`<div class="callout info" style="margin-top:14px">${escapeHtml(s.test_mode_message||'Bezi v test modu.')}</div>`:'';document.getElementById('folderSuggestionList').innerHTML=(s.folder_suggestions||[]).map(path=>`<option value="${escapeHtml(path)}"></option>`).join('');document.getElementById('folderPickerHint').textContent=s.folder_suggestion_mode==='linux-mounts'?'Explorer fallback pouziva mount navrhy z linux configu. Sit lze zadat primo jako mount cestu.':'Explorer fallback pouziva Windows roots z configu. Kdyz sit v dialogu chybi, vlozte UNC cestu rucne.'}
+function render(s){lastStatus=s;const selected=s.selected_folders||[];const combinedErrors=uiError?[{at:'UI',message:uiError,summary:uiError},...(s.errors||[])]:[...(s.errors||[])];const warningCount=(combinedErrors.length?1:0)+(s.last_result&&s.last_result.warning?1:0);document.getElementById('status').textContent=JSON.stringify(s,null,2);document.getElementById('current').innerHTML=renderCurrent(s.current_summary);document.getElementById('lastResult').innerHTML=renderLastResult(s.last_result);document.getElementById('errors').innerHTML=combinedErrors.length?combinedErrors.map(renderErrorEntry).join(''):'<p class="muted">No recent app-level errors.</p>';document.getElementById('log').textContent=(s.recent_log_lines||[]).join(String.fromCharCode(10));document.getElementById('logMeta').textContent=`${(s.recent_log_lines||[]).length} lines`;document.getElementById('selectedFolders').innerHTML=selected.length?selected.map(item=>`<div class="simple-item" data-path="${escapeHtml(item.path)}"><div class="simple-main"><div class="simple-title">${escapeHtml(item.path)}</div><div class="simple-sub">Selected for scan</div></div>${mediaTypeSelect(item.media_type||guessMediaType(item.path),'onchange="saveSelectedFolders()"')}<button class="ghost" data-path="${escapeHtml(item.path)}" onclick="removeFolder(this.getAttribute('data-path'))">Remove</button></div>`).join(''):'<div class="empty">No folders selected.</div>';document.getElementById('selectedCount').textContent=String(selected.length);document.getElementById('heroPhase').textContent=escapeHtml((s.current_summary&&s.current_summary.status)||s.current_phase||'Idle');document.getElementById('warningCount').textContent=String(warningCount);document.getElementById('heroSummary').textContent=heroSummary(s);document.getElementById('heroBadges').innerHTML=renderBadges(s);ensureUpdateButton();document.getElementById('updateButton').disabled=!s.can_update;document.getElementById('updateButton').textContent=s.current_phase==='updating'?'Updating...':'Update';document.getElementById('testModeButton').textContent=s.test_mode?'Test mode ON':'Test mode';document.getElementById('testModeButton').setAttribute('data-enabled',s.test_mode?'true':'false');document.getElementById('testModeBanner').innerHTML=s.test_mode?`<div class="callout info" style="margin-top:14px">${escapeHtml(s.test_mode_message||'Bezi v test modu.')}</div>`:'';document.getElementById('folderSuggestionList').innerHTML=(s.folder_suggestions||[]).map(path=>`<option value="${escapeHtml(path)}"></option>`).join('');document.getElementById('folderPickerHint').textContent=s.folder_suggestion_mode==='linux-mounts'?'Explorer fallback pouziva mount navrhy z linux configu. Sit lze zadat primo jako mount cestu.':'Explorer fallback pouziva Windows roots z configu. Kdyz sit v dialogu chybi, vlozte UNC cestu rucne.'}
 function updateFolderPickerHint(s){const hint=document.getElementById('folderPickerHint');if(!hint){return}hint.textContent=s.folder_suggestion_mode==='linux-mounts'?'Webovy browser pouziva povolene linux mount rooty z configu. Sit lze zadat primo jako mount cestu.':'Webovy browser pouziva povolene rooty z configu. Cestu muzete stale vlozit rucne.'}
 const renderBase=render
 render=function(s){renderBase(s);updateFolderPickerHint(s)}
