@@ -105,6 +105,42 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertEqual(simpleripper.scan_candidates([library], config), [])
 
+    def test_cached_scan_skips_source_after_successful_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            library = root / "library"
+            library.mkdir()
+            source = library / "processed.mkv"
+            source.write_bytes(b"x" * 10)
+
+            simpleripper.fast_inventory_scan([library], config)
+            self.assertEqual(simpleripper.scan_candidates([library], config), [source])
+
+            simpleripper.update_cache_job_success(config, source)
+
+            self.assertEqual(simpleripper.scan_candidates([library], config), [])
+
+    def test_cached_scan_skips_replacement_path_after_successful_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            library = root / "library"
+            library.mkdir()
+            source = library / "source.mkv"
+            replacement = library / "source.simpleripper.mkv"
+            source.write_bytes(b"x" * 10)
+            replacement.write_bytes(b"y" * 12)
+
+            simpleripper.fast_inventory_scan([library], config)
+            self.assertEqual(simpleripper.scan_candidates([library], config), [replacement, source])
+
+            simpleripper.update_cache_job_success(config, source, replacement)
+
+            self.assertEqual(simpleripper.scan_candidates([library], config), [])
+
     def test_scan_skips_file_from_shared_nas_history_written_by_other_machine(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1087,6 +1123,30 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertIsNone(blocked_row["retry_after"])
             self.assertEqual(simpleripper.cached_candidate_paths(config, [source.parent]), [])
 
+    def test_cached_candidate_paths_fills_queue_after_scope_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 2, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            in_scope = root / "library" / "SERIALY" / "Show"
+            out_scope = root / "library" / "FILMY"
+            in_scope.mkdir(parents=True, exist_ok=True)
+            out_scope.mkdir(parents=True, exist_ok=True)
+            wanted_a = in_scope / "episode-a.mkv"
+            wanted_b = in_scope / "episode-b.mkv"
+            outside_a = out_scope / "movie-a.mkv"
+            outside_b = out_scope / "movie-b.mkv"
+            wanted_a.write_bytes(b"a" * 100)
+            wanted_b.write_bytes(b"b" * 90)
+            outside_a.write_bytes(b"c" * 1000)
+            outside_b.write_bytes(b"d" * 900)
+            config["scan"]["selected_folders"] = [{"path": str(in_scope), "media_type": "series"}]
+            simpleripper.fast_inventory_scan([wanted_a.parent, outside_a.parent], config)
+
+            candidates = simpleripper.cached_candidate_paths(config, [wanted_a.parent])
+
+            self.assertEqual(candidates, [wanted_a, wanted_b])
+
     def test_pick_next_candidate_returns_none_when_no_usable_job_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1324,6 +1384,63 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("-progress", command)
         self.assertIn("pipe:1", command)
         self.assertIn("-nostats", command)
+
+    def test_consume_ffmpeg_progress_emits_updates_from_chunked_binary_stream(self) -> None:
+        class FakeBinaryBuffer:
+            def __init__(self, chunks: list[bytes]) -> None:
+                self.chunks = list(chunks)
+
+            def read1(self, _size: int) -> bytes:
+                return self.chunks.pop(0) if self.chunks else b""
+
+        class FakeStream:
+            def __init__(self, chunks: list[bytes]) -> None:
+                self.buffer = FakeBinaryBuffer(chunks)
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        updates: list[dict[str, object]] = []
+        stream = FakeStream([
+            b"frame=10\nout_tim",
+            b"e=00:00:05.00\nspeed=1.1x\nprogress=continue\nframe=20\nout_time=00:00:10.00\n",
+            b"speed=1.2x\nprogress=end\n",
+        ])
+
+        simpleripper.consume_ffmpeg_progress(stream, lambda snapshot: updates.append(snapshot))
+
+        self.assertEqual(len(updates), 2)
+        self.assertEqual(updates[0]["out_time"], "00:00:05.00")
+        self.assertEqual(updates[0]["progress"], "continue")
+        self.assertEqual(updates[1]["out_time"], "00:00:10.00")
+        self.assertEqual(updates[1]["speed"], "1.2x")
+        self.assertEqual(updates[1]["progress"], "end")
+        self.assertTrue(stream.closed)
+
+    def test_consume_ffmpeg_progress_accepts_carriage_return_delimiters(self) -> None:
+        class FakeBinaryBuffer:
+            def __init__(self, chunks: list[bytes]) -> None:
+                self.chunks = list(chunks)
+
+            def read1(self, _size: int) -> bytes:
+                return self.chunks.pop(0) if self.chunks else b""
+
+        class FakeStream:
+            def __init__(self, chunks: list[bytes]) -> None:
+                self.buffer = FakeBinaryBuffer(chunks)
+
+            def close(self) -> None:
+                pass
+
+        updates: list[dict[str, object]] = []
+        stream = FakeStream([b"frame=30\rout_time=00:00:15.00\rspeed=0.9x\rprogress=continue\r"])
+
+        simpleripper.consume_ffmpeg_progress(stream, lambda snapshot: updates.append(snapshot))
+
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0]["out_time"], "00:00:15.00")
+        self.assertEqual(updates[0]["speed"], "0.9x")
 
     def test_build_ffmpeg_command_maps_attachments_without_transcoding_cover_images(self) -> None:
         command = simpleripper.build_ffmpeg_command(
@@ -1723,6 +1840,30 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertEqual(retention["actual_mb"], 1554.0)
         self.assertEqual(retention["limit_mb"], 1012.0)
         self.assertIn("retention_size_exceeded:1554.0MB>1012.0MB", reasons)
+
+    def test_hdr_hevc_source_matching_profile_but_oversized_is_not_skipped(self) -> None:
+        config = self.make_config(Path("."))
+        config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}, "series": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+        config["skip_rules"] = {"skip_hevc": True, "skip_4k": True, "skip_hdr": True}
+        metadata = {
+            "media_type": "series",
+            "video_codec": "hevc",
+            "video_pix_fmt": "yuv420p10le",
+            "video_height": 1080,
+            "is_hdr": True,
+            "duration_seconds": 3036,
+            "file_size_bytes": 1554 * 1024 * 1024,
+            "audio_stream_count": 1,
+            "subtitle_stream_count": 2,
+            "audio_streams": [{"index": 1, "codec": "eac3", "language": "cze", "title": "Czech"}],
+            "subtitle_streams": [
+                {"index": 2, "codec": "subrip", "language": "cze", "title": "Czech"},
+                {"index": 3, "codec": "subrip", "language": "cze", "title": "Forced"},
+            ],
+        }
+        track_policy = simpleripper.select_streams(config, metadata)
+
+        self.assertIsNone(simpleripper.skip_reason(config, metadata, track_policy))
 
     def test_av1_source_matching_profile_but_oversized_is_not_skipped(self) -> None:
         config = self.make_config(Path("."))

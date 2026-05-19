@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import ctypes
 import hashlib
 import json
@@ -27,6 +28,7 @@ import yaml
 
 APP_NAME = "SimpleRipper"
 SCAN_SCOPE_SCHEMA_VERSION = 1
+POLICY_HASH_SCHEMA_VERSION = 2
 WORKER_CACHE_BUSY_TIMEOUT_MS = 30000
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v", ".ts"}
 LANGUAGE_ALIASES = {
@@ -232,6 +234,7 @@ def invalidate_candidate_queue_scope(config: dict[str, Any], reason: str, old_sc
 
 def policy_hash(config: dict[str, Any]) -> str:
     relevant = {
+        "schema_version": POLICY_HASH_SCHEMA_VERSION,
         "quality_profiles": config.get("quality_profiles") or {},
         "skip_rules": config.get("skip_rules") or {},
         "track_policy": config.get("track_policy") or {},
@@ -854,15 +857,41 @@ def consume_ffmpeg_progress(stream: Any, on_update: Any) -> None:
     if stream is None:
         return
     current: dict[str, Any] = {}
+    reader = getattr(stream, "buffer", stream)
+    read_chunk = getattr(reader, "read1", None) or getattr(reader, "read", None)
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending = ""
     try:
-        for line in iter(stream.readline, ""):
-            parsed = parse_ffmpeg_progress_line(line)
-            if not parsed:
+        while True:
+            chunk = read_chunk(4096)
+            if not chunk:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    pending += tail
+                break
+            if isinstance(chunk, bytes):
+                text = decoder.decode(chunk)
+            else:
+                text = str(chunk)
+            if not text:
                 continue
-            key, value = parsed
-            current[key] = value
-            if key == "progress":
-                on_update(dict(current))
+            pending += text.replace("\r\n", "\n").replace("\r", "\n")
+            while "\n" in pending:
+                line, pending = pending.split("\n", 1)
+                parsed = parse_ffmpeg_progress_line(line)
+                if not parsed:
+                    continue
+                key, value = parsed
+                current[key] = value
+                if key == "progress":
+                    on_update(dict(current))
+        if pending.strip():
+            parsed = parse_ffmpeg_progress_line(pending)
+            if parsed:
+                key, value = parsed
+                current[key] = value
+                if key == "progress":
+                    on_update(dict(current))
     finally:
         try:
             stream.close()
@@ -1635,9 +1664,8 @@ def cached_candidate_paths(config: dict[str, Any], folders: list[Path] | None = 
                 OR policy_hash != ?
                 OR (decision = 'failed' AND retry_after IS NOT NULL AND retry_after <= ?)
             ORDER BY COALESCE(score, size_bytes) DESC, size_bytes DESC
-            LIMIT ?
             """,
-            (current_policy_hash, now, queue_size),
+            (current_policy_hash, now),
         ).fetchall()
         for row in rows:
             path = cache_path_row(row)
@@ -1656,6 +1684,8 @@ def cached_candidate_paths(config: dict[str, Any], folders: list[Path] | None = 
                     (int(stat.st_size), int(stat.st_mtime_ns), utc_now(), str(path)),
                 )
             paths.append(path)
+            if len(paths) >= queue_size:
+                break
     log_event(config, "candidate_queue_loaded", count=len(paths), scope_match=scope_match)
     if not paths:
         log_event(config, "candidate_queue_empty")
@@ -2012,13 +2042,14 @@ def candidate_selection_key(candidate: dict[str, Any]) -> tuple[int, float]:
 def skip_reason(config: dict[str, Any], metadata: dict[str, Any], track_policy_result: dict[str, Any] | None = None) -> str | None:
     rules = config.get("skip_rules") or {}
     codec = str(metadata.get("video_codec") or "").lower()
+    media_type = str(metadata.get("media_type") or "default")
+    retention_size_policy = retention_size_policy_evaluation(config, metadata, media_type)
+    oversized_reprocess = bool(retention_size_policy.get("oversized")) and codec in {"hevc", "h265", "av1"}
     if rules.get("skip_4k", True) and int(metadata.get("video_height") or 0) >= 1800:
         return "skip_4k"
-    if rules.get("skip_hdr", True) and metadata.get("is_hdr"):
+    if rules.get("skip_hdr", True) and metadata.get("is_hdr") and not oversized_reprocess:
         return "skip_hdr"
-    media_type = str(metadata.get("media_type") or "default")
     profile_matches, _profile_mismatch_reasons = source_matches_target_profile(config, metadata, media_type, track_policy_result)
-    retention_size_policy = retention_size_policy_evaluation(config, metadata, media_type)
     oversized = bool(retention_size_policy.get("oversized"))
     if rules.get("skip_hevc", True) and codec in {"hevc", "h265"} and profile_matches and not oversized:
         return "already_hevc"
