@@ -750,6 +750,13 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertNotIn("function pickFolder(initialDir=''){post('/api/custom-folder'", simpleripper.INDEX_HTML)
         self.assertFalse(hasattr(simpleripper, "pick_folder_dialog"))
 
+    def test_web_ui_preserves_open_error_disclosures_between_refreshes(self) -> None:
+        self.assertIn("function captureDisclosureState()", simpleripper.INDEX_HTML)
+        self.assertIn("function restoreDisclosureState(openKeys)", simpleripper.INDEX_HTML)
+        self.assertIn("data-ui-key=\"${escapeHtml(disclosureKey(item))}\"", simpleripper.INDEX_HTML)
+        self.assertIn("const openDisclosures=captureDisclosureState();", simpleripper.INDEX_HTML)
+        self.assertIn("restoreDisclosureState(openDisclosures)", simpleripper.INDEX_HTML)
+
     def test_copy_file_interruptible_removes_partial_output_on_force_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
