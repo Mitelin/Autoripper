@@ -2748,10 +2748,12 @@ class RuntimeState:
     output_size_bytes: int = 0
     last_processed: list[dict[str, Any]] | None = None
     errors: list[str] | None = None
+    pending_decisions: dict[str, dict[str, Any]] | None = None
+    queued_error_actions: list[dict[str, str]] | None = None
 
     def snapshot(self) -> dict[str, Any]:
         last_processed = self.last_processed or []
-        return {"running": self.running, "stop_after_current": self.stop_after_current, "force_stop": self.force_stop, "test_mode": self.test_mode, "next_scan_at": self.next_scan_at, "current_file": self.current_file, "current_phase": self.current_phase, "ffmpeg_progress": self.ffmpeg_progress, "output_size_bytes": self.output_size_bytes, "current_summary": summarize_current_state(self), "last_processed": last_processed, "last_result": summarize_result(last_processed[0] if last_processed else None), "errors": self.errors or []}
+        return {"running": self.running, "stop_after_current": self.stop_after_current, "force_stop": self.force_stop, "test_mode": self.test_mode, "next_scan_at": self.next_scan_at, "current_file": self.current_file, "current_phase": self.current_phase, "ffmpeg_progress": self.ffmpeg_progress, "output_size_bytes": self.output_size_bytes, "current_summary": summarize_current_state(self), "last_processed": last_processed, "last_result": summarize_result(last_processed[0] if last_processed else None), "errors": self.errors or [], "pending_decision_count": len(self.pending_decisions or {}), "queued_error_action_count": len(self.queued_error_actions or [])}
 
 
 class SimpleRipperApp:
@@ -2765,7 +2767,7 @@ class SimpleRipperApp:
         self.custom_folder_entries: list[dict[str, str]] = custom_entries
         self.selected_folders: list[Path] = [Path(item["path"]) for item in self.selected_folder_entries]
         self.custom_folders: list[Path] = [Path(item["path"]) for item in self.custom_folder_entries]
-        self.state = RuntimeState(last_processed=[], errors=[], test_mode=is_test_mode(config))
+        self.state = RuntimeState(last_processed=[], errors=[], pending_decisions={}, queued_error_actions=[], test_mode=is_test_mode(config))
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._ffmpeg: subprocess.Popen[Any] | None = None
@@ -2853,6 +2855,349 @@ class SimpleRipperApp:
             existing = [item for item in (self.state.errors or []) if not (isinstance(item, dict) and str(item.get("source_path") or "") == key_source and str(item.get("failure_type") or "") == key_type)]
             self.state.errors = ([{"at": utc_now(), "message": message, "summary": summary or message, "details": list(details or []), "source_path": source_path, "failure_type": failure_type}] + existing)[:100]
         log_event(self.config, "error", message=message, source_path=source_path, failure_type=failure_type)
+
+    def log_actionable_error(
+        self,
+        message: str,
+        source_path: str,
+        failure_type: str,
+        decision_id: str,
+        summary: str,
+        details: list[str],
+        stage: str,
+    ) -> None:
+        with self._lock:
+            key_source = source_path or ""
+            key_type = failure_type or ""
+            existing = [item for item in (self.state.errors or []) if not (isinstance(item, dict) and str(item.get("source_path") or "") == key_source and str(item.get("failure_type") or "") == key_type)]
+            self.state.errors = ([{
+                "id": decision_id,
+                "at": utc_now(),
+                "message": message,
+                "summary": summary or message,
+                "details": list(details or []),
+                "source_path": source_path,
+                "failure_type": failure_type,
+                "stage": stage,
+                "actions": ["approve", "skip"],
+                "action_required": True,
+            }] + existing)[:100]
+        log_event(self.config, "error_action_required", message=message, source_path=source_path, failure_type=failure_type, decision_id=decision_id, stage=stage)
+
+    def clear_error(self, decision_id: str) -> None:
+        with self._lock:
+            self.state.errors = [
+                item for item in (self.state.errors or [])
+                if not (isinstance(item, dict) and str(item.get("id") or "") == decision_id)
+            ]
+
+    def queue_manual_error_action(self, decision_id: str, action: str) -> dict[str, Any]:
+        action_name = str(action or "").strip().lower()
+        if action_name not in {"approve", "skip"}:
+            raise ValueError("Unsupported error action")
+        with self._lock:
+            pending_map = self.state.pending_decisions or {}
+            pending = pending_map.get(decision_id)
+            if not pending:
+                raise ValueError("Pending error action was not found")
+            pending["queued_action"] = action_name
+            pending["queued_at"] = utc_now()
+            queue = self.state.queued_error_actions or []
+            queue = [item for item in queue if str(item.get("id") or "") != decision_id]
+            queue.append({"id": decision_id, "action": action_name})
+            self.state.queued_error_actions = queue
+            errors = []
+            for item in (self.state.errors or []):
+                if isinstance(item, dict) and str(item.get("id") or "") == decision_id:
+                    updated = dict(item)
+                    updated["queued_action"] = action_name
+                    updated["queued_at"] = pending["queued_at"]
+                    updated["actions"] = []
+                    errors.append(updated)
+                else:
+                    errors.append(item)
+            self.state.errors = errors
+        log_event(self.config, "verification_error_action_queued", decision_id=decision_id, action=action_name, source_path=str(pending.get("source_path") or ""))
+        if not self.state.running:
+            return self.process_next_queued_error_action()
+        return {"status": "queued", "action": action_name, "source_path": str(pending.get("source_path") or "")}
+
+    def process_next_queued_error_action(self) -> dict[str, Any]:
+        with self._lock:
+            queue = self.state.queued_error_actions or []
+            if not queue:
+                return {"status": "idle"}
+            next_item = dict(queue.pop(0))
+            self.state.queued_error_actions = queue
+        self.set_phase("processing_error_action")
+        try:
+            return self.resolve_error_action(str(next_item.get("id") or ""), str(next_item.get("action") or ""))
+        except Exception as exc:
+            self.log_error(f"Queued error action failed: {exc}", failure_type="queued_error_action")
+            raise
+
+    def has_pending_decisions(self) -> bool:
+        with self._lock:
+            return bool(self.state.pending_decisions)
+
+    def _register_pending_verification(
+        self,
+        source: Path,
+        replacement_path: Path,
+        work_dir_path: Path,
+        copied_source: Path,
+        output: Path,
+        tmp_output: Path,
+        job_id: str,
+        source_before_signature: dict[str, Any],
+        source_meta: dict[str, Any],
+        output_meta: dict[str, Any],
+        stream_policy: dict[str, Any],
+        downscale_plan: dict[str, Any],
+        verification: dict[str, Any],
+        error: VerificationFailedError,
+        stage: str,
+        quarantine_path: Path | None = None,
+    ) -> None:
+        decision_id = f"verify:{file_lock_id(source)}:{stage}"
+        preserved_work_dir = preserve_pending_decision_workspace(work_dir_path, decision_id, source, self.config)
+        preserved_tmp_output = preserved_work_dir / "preserved-temp" / replacement_path.name
+        if tmp_output.exists():
+            preserved_tmp_output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(tmp_output), str(preserved_tmp_output))
+        pending = {
+            "id": decision_id,
+            "source_path": str(source),
+            "replacement_path": str(replacement_path),
+            "work_dir_path": str(preserved_work_dir),
+            "copied_source_path": str(preserved_work_dir / "input" / copied_source.name),
+            "local_output_path": str(preserved_work_dir / "output" / output.name),
+            "temp_output_path": str(preserved_tmp_output),
+            "job_id": job_id,
+            "stage": stage,
+            "source_before_signature": dict(source_before_signature),
+            "source_metadata": dict(source_meta),
+            "output_metadata": dict(output_meta),
+            "track_policy": dict(stream_policy),
+            "downscale": dict(downscale_plan),
+            "verification": dict(verification),
+            "quarantine_path": str(quarantine_path) if quarantine_path is not None else None,
+            "created_at": utc_now(),
+            "queued_action": None,
+        }
+        with self._lock:
+            pending_map = self.state.pending_decisions or {}
+            pending_map[decision_id] = pending
+            self.state.pending_decisions = pending_map
+        self.log_actionable_error(
+            f"{source}: {error.summary}",
+            source_path=str(source),
+            failure_type="verification",
+            decision_id=decision_id,
+            summary=error.summary,
+            details=error.details,
+            stage=stage,
+        )
+
+    def _record_manual_done(
+        self,
+        source: Path,
+        source_before_signature: dict[str, Any],
+        job_id: str,
+        source_meta: dict[str, Any],
+        output_meta: dict[str, Any] | None,
+        verification: dict[str, Any],
+        stream_policy: dict[str, Any],
+        downscale_plan: dict[str, Any],
+        replacement_path: Path | None,
+        status_reason: str,
+        jellyfin_refresh: dict[str, Any] | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        summary_fields = history_summary_fields(source_meta, output_meta or source_meta, verification, jellyfin_refresh)
+        finished_at = utc_now()
+        final_path = replacement_path or source
+        marker_payload = {
+            "source": source_meta,
+            "output": output_meta or source_meta,
+            "verification": verification,
+            "track_policy": stream_policy,
+            "downscale": downscale_plan,
+            "job_id": job_id,
+            "processed_at": finished_at,
+            "approved_reason": status_reason,
+        }
+        if extra_payload:
+            marker_payload.update(extra_payload)
+        marker = marker_path(source, self.config)
+        if marker is not None:
+            write_json(marker, marker_payload)
+        history_payload = {
+            "status": "done",
+            "job_id": job_id,
+            "source_signature": source_before_signature,
+            "updated_at": finished_at,
+            "video_codec_after": (output_meta or source_meta).get("video_codec"),
+            "replacement_path": str(final_path),
+            "final_path": str(final_path),
+            "downscale": downscale_plan,
+            "approved_reason": status_reason,
+        }
+        if extra_payload:
+            history_payload.update({key: value for key, value in extra_payload.items() if key not in {"source", "output", "verification", "track_policy"}})
+        write_history_index(self.config, source, history_payload)
+        write_shared_worker_history(self.config, source, history_payload)
+        if replacement_path is not None:
+            replacement_history_payload = {
+                "status": "done",
+                "job_id": job_id,
+                "source_signature": source_signature(replacement_path),
+                "updated_at": finished_at,
+                "video_codec_after": (output_meta or source_meta).get("video_codec"),
+                "source_path": str(source),
+                "replacement_path": str(replacement_path),
+                "final_path": str(replacement_path),
+                "downscale": downscale_plan,
+                "approved_reason": status_reason,
+            }
+            write_history_index(self.config, replacement_path, replacement_history_payload)
+            write_shared_worker_history(self.config, replacement_path, replacement_history_payload)
+            update_cache_job_success(self.config, source, replacement_path)
+        else:
+            update_cache_job_success(self.config, source)
+        last_processed_entry = {
+            "source_path": str(source),
+            "finished_at": finished_at,
+            "status": "done",
+            "reason": status_reason,
+            **summary_fields,
+        }
+        if extra_payload:
+            last_processed_entry.update(extra_payload)
+        with self._lock:
+            self.state.last_processed = ([last_processed_entry] + (self.state.last_processed or []))[:20]
+        return {"finished_at": finished_at, "summary_fields": summary_fields, "last_processed_entry": last_processed_entry}
+
+    def resolve_error_action(self, decision_id: str, action: str) -> dict[str, Any]:
+        with self._lock:
+            pending_map = self.state.pending_decisions or {}
+            pending = dict(pending_map.get(decision_id) or {})
+        if not pending:
+            raise ValueError("Pending error action was not found")
+        action_name = str(action or "").strip().lower()
+        if action_name not in {"approve", "skip"}:
+            raise ValueError("Unsupported error action")
+        source = Path(str(pending["source_path"]))
+        replacement_path = Path(str(pending["replacement_path"]))
+        work_dir_path = Path(str(pending["work_dir_path"]))
+        output_path = Path(str(pending["local_output_path"]))
+        tmp_output_path = Path(str(pending["temp_output_path"]))
+        source_meta = dict(pending.get("source_metadata") or {})
+        output_meta = dict(pending.get("output_metadata") or {})
+        verification = dict(pending.get("verification") or {})
+        stream_policy = dict(pending.get("track_policy") or {})
+        downscale_plan = dict(pending.get("downscale") or {})
+        source_before_signature = dict(pending.get("source_before_signature") or source_signature(source))
+        job_id = str(pending.get("job_id") or f"manual-{int(time.time())}")
+        stage = str(pending.get("stage") or "verification")
+        quarantine_text = str(pending.get("quarantine_path") or "").strip()
+        quarantine_path = Path(quarantine_text) if quarantine_text else None
+
+        try:
+            if action_name == "approve":
+                final_path: Path | None = None
+                final_payload: dict[str, Any] = {}
+                jellyfin_refresh: dict[str, Any] | None = None
+                if stage == "local_verification":
+                    if not output_path.exists():
+                        raise FileNotFoundError(f"Missing preserved output for approve: {output_path}")
+                    tmp_output_path.parent.mkdir(parents=True, exist_ok=True)
+                    copy_file_interruptible(output_path, tmp_output_path, lambda: False)
+                    final_payload = replace_source_with_output(
+                        source,
+                        tmp_output_path,
+                        self.config,
+                        {"source": source_meta, "output": output_meta, "verification": verification, "track_policy": stream_policy, "job_id": job_id},
+                        replacement_path,
+                    )
+                    final_path = Path(str(final_payload["replacement_path"]))
+                    quarantine_path = Path(str(final_payload["quarantine_path"]))
+                elif stage == "nas_temp_verification":
+                    if not tmp_output_path.exists():
+                        raise FileNotFoundError(f"Missing preserved NAS temp output for approve: {tmp_output_path}")
+                    final_payload = replace_source_with_output(
+                        source,
+                        tmp_output_path,
+                        self.config,
+                        {"source": source_meta, "output": output_meta, "verification": verification, "track_policy": stream_policy, "job_id": job_id},
+                        replacement_path,
+                    )
+                    final_path = Path(str(final_payload["replacement_path"]))
+                    quarantine_path = Path(str(final_payload["quarantine_path"]))
+                elif stage == "final_verification":
+                    final_path = replacement_path
+                    if not final_path.exists():
+                        raise FileNotFoundError(f"Missing preserved replacement for approve: {final_path}")
+                    final_payload = {
+                        "quarantine_path": str(quarantine_path) if quarantine_path is not None else None,
+                        "replacement_path": str(final_path),
+                        "final_path": str(final_path),
+                        "approved_reason": "user_approved_verification_error",
+                    }
+                else:
+                    raise ValueError(f"Unsupported verification stage: {stage}")
+                if quarantine_path is not None:
+                    final_payload.update(finalize_quarantined_original(quarantine_path, self.config))
+                if final_path is not None:
+                    jellyfin_refresh = refresh_jellyfin(self.config, source, final_path)
+                recorded = self._record_manual_done(
+                    source,
+                    source_before_signature,
+                    job_id,
+                    source_meta,
+                    output_meta,
+                    verification,
+                    stream_policy,
+                    downscale_plan,
+                    final_path,
+                    "user_approved_verification_error",
+                    jellyfin_refresh=jellyfin_refresh,
+                    extra_payload=final_payload,
+                )
+                log_event(self.config, "verification_error_approved", source_path=str(source), decision_id=decision_id, stage=stage, replacement_path=str(final_path) if final_path else None)
+                result = {"status": "done", "action": action_name, "source_path": str(source), "finished_at": recorded["finished_at"]}
+            else:
+                if stage == "final_verification" and quarantine_path is not None and replacement_path.exists():
+                    rollback_replacement(source, quarantine_path, self.config, replacement_path)
+                recorded = self._record_manual_done(
+                    source,
+                    source_before_signature,
+                    job_id,
+                    source_meta,
+                    None,
+                    verification,
+                    stream_policy,
+                    downscale_plan,
+                    None,
+                    "user_skipped_verification_error",
+                    extra_payload={"approved_reason": "user_skipped_verification_error"},
+                )
+                log_event(self.config, "verification_error_skipped", source_path=str(source), decision_id=decision_id, stage=stage)
+                result = {"status": "done", "action": action_name, "source_path": str(source), "finished_at": recorded["finished_at"]}
+        finally:
+            with self._lock:
+                pending_map = self.state.pending_decisions or {}
+                pending_map.pop(decision_id, None)
+                self.state.pending_decisions = pending_map
+                if not pending_map and self.state.current_phase in {"awaiting_user_decision", "processing_error_action"}:
+                    self.state.current_phase = "idle"
+                    self.state.current_file = None
+            self.clear_error(decision_id)
+            tmp_output_path.unlink(missing_ok=True)
+            safe_unlink(ffmpeg_current_log_path(self.config))
+            shutil.rmtree(work_dir_path, ignore_errors=True)
+            current_job_path(self.config).unlink(missing_ok=True)
+        return result
 
     def reset_runtime_state(self, clear_errors: bool = False) -> None:
         with self._lock:
@@ -3035,9 +3380,13 @@ class SimpleRipperApp:
                 with self._lock:
                     folders = list(self.selected_folders)
                     stop = self.state.stop_after_current or self.state.force_stop
+                    queued_actions = bool(self.state.queued_error_actions)
                 if stop:
                     self.reset_runtime_state(clear_errors=False)
                     break
+                if queued_actions:
+                    self.process_next_queued_error_action()
+                    continue
                 log_event(self.config, "scan_start", folders=[str(path) for path in folders])
                 self.set_phase("scanning_inventory")
                 candidates = scan_candidates(folders, self.config)
@@ -3248,7 +3597,7 @@ class SimpleRipperApp:
             log_event(self.config, "force_stop_completed", job_id=job_id, source_path=str(source), phase=self.state.current_phase)
             self.reset_runtime_state(clear_errors=True)
         except Exception as exc:
-            failure_type = "ffmpeg" if isinstance(exc, FfmpegFailedError) or ffmpeg_completed else "job"
+            failure_type = "ffmpeg" if isinstance(exc, VerificationFailedError) or isinstance(exc, FfmpegFailedError) or ffmpeg_completed else "job"
             previous_failure_count = 0
             previous_payload = load_history_index(self.config, source)
             current_signature = source_signature(source) if source.exists() else None
@@ -3264,11 +3613,43 @@ class SimpleRipperApp:
             if cache_failure:
                 log_event(self.config, "candidate_cache_failure", job_id=job_id, source_path=str(source), **cache_failure)
             if isinstance(exc, VerificationFailedError):
-                error_message = f"{source}: {exc.summary}"
-                self.log_error(error_message, source_path=str(source), failure_type=failure_type, summary=exc.summary, details=exc.details)
+                if exc.stage.startswith("Local"):
+                    pending_stage = "local_verification"
+                    pending_output_meta = output_meta if "output_meta" in locals() else {}
+                    pending_verification = verification if "verification" in locals() else exc.verification
+                    pending_quarantine = None
+                elif exc.stage.startswith("NAS temp"):
+                    pending_stage = "nas_temp_verification"
+                    pending_output_meta = temp_meta if "temp_meta" in locals() else {}
+                    pending_verification = temp_verification if "temp_verification" in locals() else exc.verification
+                    pending_quarantine = None
+                else:
+                    pending_stage = "final_verification"
+                    pending_output_meta = final_meta if "final_meta" in locals() else output_meta if "output_meta" in locals() else {}
+                    pending_verification = final_verification if "final_verification" in locals() else exc.verification
+                    pending_quarantine = Path(str(final_payload["quarantine_path"])) if "final_payload" in locals() and final_payload.get("quarantine_path") else None
+                self._register_pending_verification(
+                    source,
+                    replacement_path,
+                    work_dir_path,
+                    copied_source,
+                    output,
+                    tmp_output,
+                    job_id,
+                    source_before_signature,
+                    source_meta,
+                    pending_output_meta,
+                    stream_policy,
+                    downscale_plan,
+                    pending_verification,
+                    exc,
+                    pending_stage,
+                    quarantine_path=pending_quarantine,
+                )
             else:
                 self.log_error(f"{source}: {exc}", source_path=str(source), failure_type=failure_type)
-            preserve_failed_output(work_dir_path, source, self.config)
+            if not isinstance(exc, VerificationFailedError):
+                preserve_failed_output(work_dir_path, source, self.config)
         finally:
             lock_path.unlink(missing_ok=True)
             tmp_output.unlink(missing_ok=True)
@@ -3315,6 +3696,19 @@ def rollback_replacement(source: Path, quarantine_path: Path, config: dict[str, 
     if quarantine_path.exists():
         shutil.move(str(quarantine_path), str(source))
     log_event(config, "rollback_restored", source_path=str(source), replacement_path=str(failed_target), quarantine_path=str(quarantine_path), failed_output_path=str(failed_output))
+
+
+def preserve_pending_decision_workspace(work_dir: Path, decision_id: str, source: Path, config: dict[str, Any]) -> Path:
+    inspection_root = Path(str((config.get("paths") or {}).get("inspection_dir") or "inspection")) / "pending_decisions"
+    inspection_root.mkdir(parents=True, exist_ok=True)
+    target = inspection_root / f"{source.stem}-{int(time.time())}-{decision_id.replace(':', '-')[:40]}"
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+    if work_dir.exists():
+        shutil.move(str(work_dir), str(target))
+    else:
+        target.mkdir(parents=True, exist_ok=True)
+    return target
 
 
 def preserve_failed_output(work_dir: Path, source: Path, config: dict[str, Any]) -> None:
@@ -3426,37 +3820,43 @@ class SimpleRipperHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
 
+    def send_json_response(self, payload: Any, status: int = 200, include_body: bool = True) -> None:
+        try:
+            self.send_json(payload, status=status, include_body=include_body)
+        except TypeError:
+            self.send_json(payload, status=status)
+
     def handle_get_request(self, include_body: bool = True) -> None:
         parsed = parse.urlsplit(self.path)
         path = parsed.path
         if path == "/api/status":
-            self.send_json(self.app.status(), include_body=include_body)
+            SimpleRipperHandler.send_json_response(self, self.app.status(), include_body=include_body)
             return
         if path == "/api/config":
-            self.send_json({"allowed_roots": [str(path) for path in self.app.roots]}, include_body=include_body)
+            SimpleRipperHandler.send_json_response(self, {"allowed_roots": [str(path) for path in self.app.roots]}, include_body=include_body)
             return
         if path == "/api/logs":
-            self.send_json({"lines": tail_text_lines(app_log_path(self.app.config), 200)}, include_body=include_body)
+            SimpleRipperHandler.send_json_response(self, {"lines": tail_text_lines(app_log_path(self.app.config), 200)}, include_body=include_body)
             return
         if path == "/api/browse-folders":
             query = parse.parse_qs(parsed.query)
             requested_path = (query.get("path") or [None])[0]
             try:
-                self.send_json(safe_browse_folders(self.app.config, requested_path), include_body=include_body)
+                SimpleRipperHandler.send_json_response(self, safe_browse_folders(self.app.config, requested_path), include_body=include_body)
             except PermissionError as exc:
-                self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN, include_body=include_body)
+                SimpleRipperHandler.send_json_response(self, {"error": str(exc)}, HTTPStatus.FORBIDDEN, include_body=include_body)
             except FileNotFoundError as exc:
-                self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND, include_body=include_body)
+                SimpleRipperHandler.send_json_response(self, {"error": str(exc)}, HTTPStatus.NOT_FOUND, include_body=include_body)
             except (NotADirectoryError, ValueError, OSError) as exc:
-                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST, include_body=include_body)
+                SimpleRipperHandler.send_json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST, include_body=include_body)
             return
         self.send_index(include_body=include_body)
 
     def do_GET(self) -> None:
-        self.handle_get_request(include_body=True)
+        SimpleRipperHandler.handle_get_request(self, include_body=True)
 
     def do_HEAD(self) -> None:
-        self.handle_get_request(include_body=False)
+        SimpleRipperHandler.handle_get_request(self, include_body=False)
 
     def do_POST(self) -> None:
         try:
@@ -3488,6 +3888,11 @@ class SimpleRipperHandler(BaseHTTPRequestHandler):
                 self.send_json(self.app.status())
             elif self.path == "/api/clear-stale-locks":
                 self.send_json({"removed": self.app.clear_stale_locks()})
+            elif self.path == "/api/errors/action":
+                decision_id = str(payload.get("id") or "").strip()
+                action = str(payload.get("action") or "").strip().lower()
+                self.app.queue_manual_error_action(decision_id, action)
+                self.send_json(self.app.status())
             elif self.path == "/api/update":
                 self.app.begin_update()
                 self.send_json(self.app.status())
@@ -3618,7 +4023,9 @@ function renderUiError(message){uiError=message;if(lastStatus){render(lastStatus
 function disclosureKey(entry){const item=entry&&typeof entry==='object'?entry:{message:String(entry||'')};const detailLines=Array.isArray(item.details)?item.details.filter(Boolean):[];return [safeValue(item.at,''),safeValue(item.summary||item.message,'Unknown error'),safeValue(item.source_path,''),detailLines.join('|')].join('::')}
 function captureDisclosureState(){return new Set(Array.from(document.querySelectorAll('#errors details[data-ui-key]')).filter(item=>item.open).map(item=>item.getAttribute('data-ui-key')).filter(Boolean))}
 function restoreDisclosureState(openKeys){if(!openKeys||!openKeys.size){return}document.querySelectorAll('#errors details[data-ui-key]').forEach(item=>{const key=item.getAttribute('data-ui-key');if(key&&openKeys.has(key)){item.open=true}})}
-function renderErrorEntry(entry){const item=entry&&typeof entry==='object'?entry:{message:String(entry||'')};const summary=escapeHtml(item.summary||item.message||'Unknown error');const at=escapeHtml(item.at||'');const sourcePath=item.source_path?`<div class="err-path">${escapeHtml(item.source_path)}</div>`:'';const detailLines=Array.isArray(item.details)?item.details.filter(Boolean):[];if(!sourcePath&&!detailLines.length){return `<div class="err"><div class="err-time">${at}</div><div class="err-summary">${summary}</div></div>`}const detailsHtml=detailLines.length?`<ul class="err-lines">${detailLines.map(line=>`<li>${escapeHtml(line)}</li>`).join('')}</ul>`:'';return `<details class="err-card" data-ui-key="${escapeHtml(disclosureKey(item))}"><summary><div class="err-time">${at}</div><div class="err-summary">${summary}</div></summary><div class="err-detail">${sourcePath}${detailsHtml}</div></details>`}
+function approveError(id){post('/api/errors/action',{id:id,action:'approve'})}
+function skipError(id){post('/api/errors/action',{id:id,action:'skip'})}
+function renderErrorEntry(entry){const item=entry&&typeof entry==='object'?entry:{message:String(entry||'')};const summary=escapeHtml(item.summary||item.message||'Unknown error');const at=escapeHtml(item.at||'');const sourcePath=item.source_path?`<div class="err-path">${escapeHtml(item.source_path)}</div>`:'';const detailLines=Array.isArray(item.details)?item.details.filter(Boolean):[];const actions=Array.isArray(item.actions)&&item.id?`<div class="folder-actions" style="margin-top:12px"><button class="primary" onclick="approveError('${escapeHtml(item.id)}')">Approve</button><button class="ghost" onclick="skipError('${escapeHtml(item.id)}')">Skip</button></div>`:'';if(!sourcePath&&!detailLines.length&&!actions){return `<div class="err"><div class="err-time">${at}</div><div class="err-summary">${summary}</div></div>`}const detailsHtml=detailLines.length?`<ul class="err-lines">${detailLines.map(line=>`<li>${escapeHtml(line)}</li>`).join('')}</ul>`:'';return `<details class="err-card" data-ui-key="${escapeHtml(disclosureKey(item))}"><summary><div class="err-time">${at}</div><div class="err-summary">${summary}</div></summary><div class="err-detail">${sourcePath}${detailsHtml}${actions}</div></details>`}
 async function getStatus(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(readJsonResponse);uiError='';render(s)}catch(error){renderUiError(formatRequestError(error))}}
 async function post(url,body={}){try{const s=await fetch(url,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(readJsonResponse);uiError='';render(s)}catch(error){renderUiError(formatRequestError(error))}}
 function selectedMap(s){return Object.fromEntries((s.selected_folders||[]).map(item=>[item.path,item.media_type||'auto']))}

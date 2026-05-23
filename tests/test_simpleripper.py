@@ -757,6 +757,12 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("const openDisclosures=captureDisclosureState();", simpleripper.INDEX_HTML)
         self.assertIn("restoreDisclosureState(openDisclosures)", simpleripper.INDEX_HTML)
 
+    def test_web_ui_renders_approve_and_skip_actions_for_actionable_errors(self) -> None:
+        self.assertIn("function approveError(id){post('/api/errors/action',{id:id,action:'approve'})}", simpleripper.INDEX_HTML)
+        self.assertIn("function skipError(id){post('/api/errors/action',{id:id,action:'skip'})}", simpleripper.INDEX_HTML)
+        self.assertIn("Approve</button>", simpleripper.INDEX_HTML)
+        self.assertIn("Skip</button>", simpleripper.INDEX_HTML)
+
     def test_copy_file_interruptible_removes_partial_output_on_force_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2241,6 +2247,280 @@ class SimpleRipperTests(unittest.TestCase):
                 row = connection.execute("SELECT decision, retry_after FROM file_index WHERE path = ?", (str(source),)).fetchone()
             self.assertEqual(row["decision"], "failed")
             self.assertTrue(row["retry_after"])
+
+    def test_approve_verification_error_finishes_replacement_without_rerun(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan"]["file_extensions"] = [".mkv", ".avi"]
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "episode.avi"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 6000)
+            replacement = source.with_suffix(".mkv")
+            simpleripper.fast_inventory_scan([source.parent], config)
+
+            class FakeProcess:
+                def __init__(self, command: list[str]) -> None:
+                    self.stdout = io.StringIO("")
+                    self.pid = 4242
+                    self.returncode = 0
+                    Path(command[-1]).write_bytes(b"encoded-output")
+
+                def poll(self) -> int:
+                    return 0
+
+            def fake_popen(command: list[str], stdout: object = None, stderr: object = None, text: bool = True, encoding: str = "utf-8", errors: str = "replace") -> FakeProcess:
+                return FakeProcess(command)
+
+            def fake_probe(test_config: dict, path: Path, media_type: str) -> tuple[dict, dict]:
+                if path.name.endswith(".avi"):
+                    return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "mpeg4", "video_pix_fmt": "yuv420p", "overall_bitrate_kbps": 4000}
+                return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "hevc", "video_pix_fmt": "yuv420p10le", "overall_bitrate_kbps": 850}
+
+            with patch("simpleripper.subprocess.Popen", side_effect=fake_popen), patch("simpleripper.ffprobe_metadata", side_effect=fake_probe), patch("simpleripper.verify_output", return_value=({"output_size_bytes": 1200, "output_to_source_ratio": 0.2, "overall_bitrate_kbps": 850}, ["bitrate too low"])), patch("simpleripper.refresh_jellyfin", return_value={"status": "ok"}):
+                app.process_one(source)
+
+            status = app.status()
+            self.assertEqual(len(status["errors"]), 1)
+            self.assertEqual(status["errors"][0]["actions"], ["approve", "skip"])
+
+            app.queue_manual_error_action(status["errors"][0]["id"], "approve")
+
+            self.assertFalse(source.exists())
+            self.assertTrue(replacement.exists())
+            self.assertEqual(app.status()["errors"], [])
+            self.assertEqual(app.status()["current_phase"], "idle")
+            source_history = simpleripper.load_history_index(config, source)
+            replacement_history = simpleripper.load_history_index(config, replacement)
+            self.assertEqual((source_history or {})["status"], "done")
+            self.assertEqual((source_history or {})["approved_reason"], "user_approved_verification_error")
+            self.assertEqual((replacement_history or {})["status"], "done")
+            self.assertEqual(simpleripper.scan_candidates([source.parent], config), [])
+
+    def test_skip_verification_error_marks_source_done_without_reprocessing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan"]["file_extensions"] = [".mkv", ".avi"]
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "episode.avi"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 6000)
+            replacement = source.with_suffix(".mkv")
+            simpleripper.fast_inventory_scan([source.parent], config)
+
+            class FakeProcess:
+                def __init__(self, command: list[str]) -> None:
+                    self.stdout = io.StringIO("")
+                    self.pid = 4242
+                    self.returncode = 0
+                    Path(command[-1]).write_bytes(b"encoded-output")
+
+                def poll(self) -> int:
+                    return 0
+
+            def fake_popen(command: list[str], stdout: object = None, stderr: object = None, text: bool = True, encoding: str = "utf-8", errors: str = "replace") -> FakeProcess:
+                return FakeProcess(command)
+
+            def fake_probe(test_config: dict, path: Path, media_type: str) -> tuple[dict, dict]:
+                if path.name.endswith(".avi"):
+                    return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "mpeg4", "video_pix_fmt": "yuv420p", "overall_bitrate_kbps": 4000}
+                return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "hevc", "video_pix_fmt": "yuv420p10le", "overall_bitrate_kbps": 850}
+
+            with patch("simpleripper.subprocess.Popen", side_effect=fake_popen), patch("simpleripper.ffprobe_metadata", side_effect=fake_probe), patch("simpleripper.verify_output", return_value=({"output_size_bytes": 1200, "output_to_source_ratio": 0.2, "overall_bitrate_kbps": 850}, ["bitrate too low"])):
+                app.process_one(source)
+
+            error_id = app.status()["errors"][0]["id"]
+            app.queue_manual_error_action(error_id, "skip")
+
+            self.assertTrue(source.exists())
+            self.assertFalse(replacement.exists())
+            self.assertEqual(app.status()["errors"], [])
+            self.assertEqual(app.status()["current_phase"], "idle")
+            source_history = simpleripper.load_history_index(config, source)
+            self.assertEqual((source_history or {})["status"], "done")
+            self.assertEqual((source_history or {})["approved_reason"], "user_skipped_verification_error")
+            self.assertEqual(simpleripper.scan_candidates([source.parent], config), [])
+
+    def test_queue_manual_error_action_marks_error_queued_while_worker_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            decision_id = "verify:test:local"
+            app.state.running = True
+            app.state.pending_decisions = {decision_id: {"id": decision_id, "source_path": "movie.mkv"}}
+            app.state.errors = [{"id": decision_id, "summary": "needs decision", "source_path": "movie.mkv", "actions": ["approve", "skip"]}]
+
+            result = app.queue_manual_error_action(decision_id, "approve")
+
+            self.assertEqual(result["status"], "queued")
+            self.assertEqual((app.state.pending_decisions or {})[decision_id]["queued_action"], "approve")
+            self.assertEqual((app.state.queued_error_actions or [])[0]["action"], "approve")
+            self.assertEqual((app.state.errors or [])[0]["actions"], [])
+            self.assertEqual((app.state.errors or [])[0]["queued_action"], "approve")
+
+    def test_run_loop_continues_to_next_item_after_pending_verification_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan"]["file_extensions"] = [".mkv", ".avi"]
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+            library = root / "library"
+            library.mkdir(parents=True)
+            first = library / "first.avi"
+            second = library / "second.avi"
+            first.write_bytes(b"x" * 7000)
+            second.write_bytes(b"y" * 6000)
+            app = simpleripper.SimpleRipperApp(config)
+            app.set_selected_folders([{"path": str(library), "media_type": "auto"}])
+
+            class FakeProcess:
+                def __init__(self, command: list[str]) -> None:
+                    self.stdout = io.StringIO("")
+                    self.pid = 4242
+                    self.returncode = 0
+                    Path(command[-1]).write_bytes(b"encoded-output")
+
+                def poll(self) -> int:
+                    return 0
+
+            def fake_popen(command: list[str], stdout: object = None, stderr: object = None, text: bool = True, encoding: str = "utf-8", errors: str = "replace") -> FakeProcess:
+                return FakeProcess(command)
+
+            def fake_inspect(test_config: dict, source: Path, media_type: str) -> dict:
+                return {
+                    "path": source,
+                    "status": "ok",
+                    "metadata": {"file_size_bytes": source.stat().st_size, "video_codec": "mpeg4"},
+                    "skip_reason": None,
+                    "score": float(source.stat().st_size),
+                    "track_policy": {"applied": False},
+                    "target_profile_matches": False,
+                    "profile_mismatch_reasons": [],
+                    "candidate_reason": "needs_encode",
+                    "retention_size_policy": {"oversized": False},
+                }
+
+            def fake_probe(test_config: dict, path: Path, media_type: str) -> tuple[dict, dict]:
+                if path.name.endswith(".avi"):
+                    return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "mpeg4", "video_pix_fmt": "yuv420p", "overall_bitrate_kbps": 4000}
+                return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "hevc", "video_pix_fmt": "yuv420p10le", "overall_bitrate_kbps": 1500}
+
+            def fake_verify(test_config: dict, source_meta: dict, output: Path, output_meta: dict, stream_policy: dict) -> tuple[dict, list[str]]:
+                if output.parent.name == "output" and output.name == "first.mkv":
+                    return {"output_size_bytes": 1200, "output_to_source_ratio": 0.2, "overall_bitrate_kbps": 850}, ["bitrate too low"]
+                return {"output_size_bytes": 1400, "output_to_source_ratio": 0.3, "overall_bitrate_kbps": 1500, "video_codec_ok": True, "pix_fmt_ok": True}, []
+
+            with patch.object(app, "schedule_rescan_wait", return_value=False), patch("simpleripper.inspect_candidate", side_effect=fake_inspect), patch("simpleripper.subprocess.Popen", side_effect=fake_popen), patch("simpleripper.ffprobe_metadata", side_effect=fake_probe), patch("simpleripper.verify_output", side_effect=fake_verify), patch("simpleripper.refresh_jellyfin", return_value={"status": "ok"}):
+                app.start()
+                assert app._thread is not None
+                app._thread.join(timeout=5)
+
+            self.assertFalse(app.state.running)
+            self.assertTrue((library / "second.mkv").exists())
+            self.assertFalse((library / "first.mkv").exists())
+            self.assertEqual(len(app.status()["errors"]), 1)
+            self.assertEqual(app.status()["errors"][0]["source_path"], str(first))
+            self.assertEqual((app.status().get("pending_decision_count") or 0), 1)
+
+    def test_worker_continues_normally_after_processing_queued_error_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan"]["file_extensions"] = [".mkv", ".avi"]
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+            library = root / "library"
+            library.mkdir(parents=True)
+            source = library / "source.avi"
+            source.write_bytes(b"x" * 7000)
+            third = library / "third.avi"
+            third.write_bytes(b"z" * 5000)
+            replacement = source.with_suffix(".mkv")
+            app = simpleripper.SimpleRipperApp(config)
+            app.set_selected_folders([{"path": str(library), "media_type": "auto"}])
+
+            class FakeProcess:
+                def __init__(self, command: list[str]) -> None:
+                    self.stdout = io.StringIO("")
+                    self.pid = 4242
+                    self.returncode = 0
+                    Path(command[-1]).write_bytes(b"encoded-output")
+
+                def poll(self) -> int:
+                    return 0
+
+            def fake_popen(command: list[str], stdout: object = None, stderr: object = None, text: bool = True, encoding: str = "utf-8", errors: str = "replace") -> FakeProcess:
+                return FakeProcess(command)
+
+            def fake_inspect(test_config: dict, candidate: Path, media_type: str) -> dict:
+                return {
+                    "path": candidate,
+                    "status": "ok",
+                    "metadata": {"file_size_bytes": candidate.stat().st_size, "video_codec": "mpeg4"},
+                    "skip_reason": None,
+                    "score": float(candidate.stat().st_size),
+                    "track_policy": {"applied": False},
+                    "target_profile_matches": False,
+                    "profile_mismatch_reasons": [],
+                    "candidate_reason": "needs_encode",
+                    "retention_size_policy": {"oversized": False},
+                }
+
+            def fake_probe(test_config: dict, path: Path, media_type: str) -> tuple[dict, dict]:
+                if path.name.endswith(".avi"):
+                    return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "mpeg4", "video_pix_fmt": "yuv420p", "overall_bitrate_kbps": 4000}
+                return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "hevc", "video_pix_fmt": "yuv420p10le", "overall_bitrate_kbps": 1500}
+
+            verify_calls = {"source_local": 0, "third": 0}
+
+            def fake_verify(test_config: dict, source_meta: dict, output: Path, output_meta: dict, stream_policy: dict) -> tuple[dict, list[str]]:
+                if output.parent.name == "output" and output.name == "source.mkv":
+                    verify_calls["source_local"] += 1
+                    return {"output_size_bytes": 1200, "output_to_source_ratio": 0.2, "overall_bitrate_kbps": 850}, ["bitrate too low"]
+                if output.name == "third.mkv":
+                    verify_calls["third"] += 1
+                return {"output_size_bytes": 1400, "output_to_source_ratio": 0.3, "overall_bitrate_kbps": 1500, "video_codec_ok": True, "pix_fmt_ok": True}, []
+
+            phases: list[str] = []
+            original_set_phase = app.set_phase
+
+            def tracked_set_phase(phase: str, file: Path | None = None, extra: dict | None = None) -> None:
+                phases.append(phase)
+                original_set_phase(phase, file, extra)
+
+            queued_processed = threading.Event()
+            original_process_next = app.process_next_queued_error_action
+
+            def tracked_process_next() -> dict:
+                result = original_process_next()
+                queued_processed.set()
+                return result
+
+            with patch.object(app, "set_phase", side_effect=tracked_set_phase), patch.object(app, "schedule_rescan_wait", return_value=False), patch.object(app, "process_next_queued_error_action", side_effect=tracked_process_next), patch("simpleripper.inspect_candidate", side_effect=fake_inspect), patch("simpleripper.subprocess.Popen", side_effect=fake_popen), patch("simpleripper.ffprobe_metadata", side_effect=fake_probe), patch("simpleripper.verify_output", side_effect=fake_verify), patch("simpleripper.refresh_jellyfin", return_value={"status": "ok"}):
+                app.process_one(source)
+                error_id = app.status()["errors"][0]["id"]
+                app.queue_manual_error_action(error_id, "approve")
+                app.start()
+                assert app._thread is not None
+                app._thread.join(timeout=5)
+
+            self.assertTrue(queued_processed.is_set())
+            self.assertFalse(app.state.running)
+            self.assertTrue(replacement.exists())
+            self.assertTrue((library / "third.mkv").exists())
+            self.assertEqual(app.status()["errors"], [])
+            self.assertEqual((app.status().get("pending_decision_count") or 0), 0)
+            self.assertEqual((app.status().get("queued_error_action_count") or 0), 0)
+            self.assertIn("processing_error_action", phases)
+            processing_index = phases.index("processing_error_action")
+            self.assertIn("scanning_inventory", phases[processing_index + 1:])
+            self.assertGreaterEqual(verify_calls["third"], 1)
 
 
 if __name__ == "__main__":
