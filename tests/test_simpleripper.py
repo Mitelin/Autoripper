@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import errno
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -2306,6 +2307,9 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual((source_history or {})["status"], "done")
             self.assertEqual((source_history or {})["approved_reason"], "user_approved_verification_error")
             self.assertEqual((replacement_history or {})["status"], "done")
+            jobs = (root / "history" / "jobs.jsonl").read_text(encoding="utf-8")
+            self.assertIn('"approved_reason": "user_approved_verification_error"', jobs)
+            self.assertTrue((root / "history" / f'{(source_history or {})["job_id"]}.json').exists())
             self.assertEqual(simpleripper.scan_candidates([source.parent], config), [])
 
     def test_skip_verification_error_marks_source_done_without_reprocessing(self) -> None:
@@ -2530,6 +2534,55 @@ class SimpleRipperTests(unittest.TestCase):
             processing_index = phases.index("processing_error_action")
             self.assertIn("scanning_inventory", phases[processing_index + 1:])
             self.assertGreaterEqual(verify_calls["third"], 1)
+
+    def test_replace_source_with_output_falls_back_when_replace_crosses_devices(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            source = root / "library" / "movie.avi"
+            output = root / "inspection" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            output.parent.mkdir(parents=True)
+            source.write_bytes(b"source-bytes")
+            output.write_bytes(b"encoded-bytes")
+            replacement = source.with_suffix(".mkv")
+
+            original_replace = os.replace
+
+            def fake_replace(src: str | bytes, dst: str | bytes) -> None:
+                if Path(src) == output and Path(dst) == replacement:
+                    raise OSError(errno.EXDEV, "Invalid cross-device link")
+                original_replace(src, dst)
+
+            with patch("simpleripper.os.replace", side_effect=fake_replace):
+                result = simpleripper.replace_source_with_output(source, output, config, {"job_id": "job-1"}, replacement)
+
+            self.assertTrue(replacement.exists())
+            self.assertEqual(replacement.read_bytes(), b"encoded-bytes")
+            self.assertFalse(output.exists())
+            self.assertFalse(source.exists())
+            self.assertTrue(Path(result["quarantine_path"]).exists())
+
+    def test_failed_queued_error_action_restores_pending_decision_without_stopping_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            decision_id = "verify:test:local"
+            app.state.running = True
+            app.state.pending_decisions = {decision_id: {"id": decision_id, "source_path": "movie.mkv", "queued_action": "approve"}}
+            app.state.errors = [{"id": decision_id, "summary": "needs decision", "source_path": "movie.mkv", "actions": [], "queued_action": "approve"}]
+            app.state.queued_error_actions = [{"id": decision_id, "action": "approve"}]
+
+            with patch.object(app, "resolve_error_action", side_effect=OSError(errno.EXDEV, "Invalid cross-device link")):
+                result = app.process_next_queued_error_action()
+
+            self.assertEqual(result["status"], "error")
+            self.assertEqual((app.state.pending_decisions or {})[decision_id]["queued_action"], None)
+            restored = next(item for item in (app.state.errors or []) if isinstance(item, dict) and item.get("id") == decision_id)
+            self.assertEqual(restored["actions"], ["approve", "skip"])
+            self.assertNotIn("queued_action", restored)
+            self.assertEqual(app.state.current_phase, "idle")
 
 
 if __name__ == "__main__":

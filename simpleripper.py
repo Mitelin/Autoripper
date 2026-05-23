@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -2933,8 +2934,34 @@ class SimpleRipperApp:
         try:
             return self.resolve_error_action(str(next_item.get("id") or ""), str(next_item.get("action") or ""))
         except Exception as exc:
-            self.log_error(f"Queued error action failed: {exc}", failure_type="queued_error_action")
-            raise
+            decision_id = str(next_item.get("id") or "")
+            action = str(next_item.get("action") or "")
+            self.restore_pending_error_action(decision_id)
+            with self._lock:
+                self.state.current_phase = "idle"
+                self.state.current_file = None
+            self.log_error(f"Queued error action failed: {exc}", failure_type="queued_error_action", source_path=str((self.state.pending_decisions or {}).get(decision_id, {}).get("source_path") or None))
+            log_event(self.config, "queued_error_action_failed", decision_id=decision_id, action=action, error=str(exc))
+            return {"status": "error", "decision_id": decision_id, "action": action, "error": str(exc)}
+
+    def restore_pending_error_action(self, decision_id: str) -> None:
+        with self._lock:
+            pending_map = self.state.pending_decisions or {}
+            pending = pending_map.get(decision_id)
+            if isinstance(pending, dict):
+                pending["queued_action"] = None
+                pending.pop("queued_at", None)
+            restored_errors: list[Any] = []
+            for item in (self.state.errors or []):
+                if isinstance(item, dict) and str(item.get("id") or "") == decision_id:
+                    updated = dict(item)
+                    updated.pop("queued_action", None)
+                    updated.pop("queued_at", None)
+                    updated["actions"] = ["approve", "skip"]
+                    restored_errors.append(updated)
+                else:
+                    restored_errors.append(item)
+            self.state.errors = restored_errors
 
     def has_pending_decisions(self) -> bool:
         with self._lock:
@@ -3017,6 +3044,7 @@ class SimpleRipperApp:
         summary_fields = history_summary_fields(source_meta, output_meta or source_meta, verification, jellyfin_refresh)
         finished_at = utc_now()
         final_path = replacement_path or source
+        final_payload = dict(extra_payload or {})
         marker_payload = {
             "source": source_meta,
             "output": output_meta or source_meta,
@@ -3026,9 +3054,11 @@ class SimpleRipperApp:
             "job_id": job_id,
             "processed_at": finished_at,
             "approved_reason": status_reason,
+            "jellyfin_refresh": jellyfin_refresh,
+            **summary_fields,
         }
-        if extra_payload:
-            marker_payload.update(extra_payload)
+        if final_payload:
+            marker_payload.update(final_payload)
         marker = marker_path(source, self.config)
         if marker is not None:
             write_json(marker, marker_payload)
@@ -3043,8 +3073,8 @@ class SimpleRipperApp:
             "downscale": downscale_plan,
             "approved_reason": status_reason,
         }
-        if extra_payload:
-            history_payload.update({key: value for key, value in extra_payload.items() if key not in {"source", "output", "verification", "track_policy"}})
+        if final_payload:
+            history_payload.update({key: value for key, value in final_payload.items() if key not in {"source", "output", "verification", "track_policy"}})
         write_history_index(self.config, source, history_payload)
         write_shared_worker_history(self.config, source, history_payload)
         if replacement_path is not None:
@@ -3065,6 +3095,23 @@ class SimpleRipperApp:
             update_cache_job_success(self.config, source, replacement_path)
         else:
             update_cache_job_success(self.config, source)
+        job_summary = {
+            "job_id": job_id,
+            "source_path": str(source),
+            "replacement_path": str(final_path),
+            "started_at": str(source_meta.get("started_at") or finished_at),
+            "status": "done",
+            "finished_at": finished_at,
+            "source": source_meta,
+            "output": output_meta or source_meta,
+            "verification": verification,
+            "track_policy": stream_policy,
+            "approved_reason": status_reason,
+            **summary_fields,
+            **final_payload,
+        }
+        append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
+        write_json(history_dir(self.config) / f"{job_id}.json", job_summary)
         last_processed_entry = {
             "source_path": str(source),
             "finished_at": finished_at,
@@ -3072,11 +3119,12 @@ class SimpleRipperApp:
             "reason": status_reason,
             **summary_fields,
         }
-        if extra_payload:
-            last_processed_entry.update(extra_payload)
+        if final_payload:
+            last_processed_entry.update(final_payload)
         with self._lock:
             self.state.last_processed = ([last_processed_entry] + (self.state.last_processed or []))[:20]
-        return {"finished_at": finished_at, "summary_fields": summary_fields, "last_processed_entry": last_processed_entry}
+        log_event(self.config, "job_done", job_id=job_id, source_path=str(source), jellyfin_status=(jellyfin_refresh or {}).get("status"))
+        return {"finished_at": finished_at, "summary_fields": summary_fields, "last_processed_entry": last_processed_entry, "job_summary": job_summary}
 
     def resolve_error_action(self, decision_id: str, action: str) -> dict[str, Any]:
         with self._lock:
@@ -3676,9 +3724,16 @@ def replace_source_with_output(source: Path, output: Path, config: dict[str, Any
     shutil.move(str(source), str(quarantine_path))
     try:
         final_path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(output, final_path)
+        try:
+            os.replace(output, final_path)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            copy_file_interruptible(output, final_path, lambda: False)
+            output.unlink(missing_ok=True)
     except Exception:
         shutil.move(str(quarantine_path), str(source))
+        final_path.unlink(missing_ok=True)
         raise
     marker = {**marker, "source_path": str(source), "replacement_path": str(final_path), "final_path": str(final_path), "quarantine_path": str(quarantine_path), "processed_at": utc_now()}
     write_json(history_dir(config) / "quarantine_index" / f"{file_lock_id(source)}.json", marker)
