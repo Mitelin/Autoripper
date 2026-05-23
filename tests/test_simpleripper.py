@@ -2584,6 +2584,169 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertNotIn("queued_action", restored)
             self.assertEqual(app.state.current_phase, "idle")
 
+    def test_multiple_queued_error_actions_are_processed_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            app.state.running = True
+            first_id = "verify:first:local"
+            second_id = "verify:second:final"
+            app.state.pending_decisions = {
+                first_id: {"id": first_id, "source_path": "first.mkv"},
+                second_id: {"id": second_id, "source_path": "second.mkv"},
+            }
+            app.state.errors = [
+                {"id": first_id, "summary": "first", "source_path": "first.mkv", "actions": ["approve", "skip"]},
+                {"id": second_id, "summary": "second", "source_path": "second.mkv", "actions": ["approve", "skip"]},
+            ]
+
+            app.queue_manual_error_action(first_id, "approve")
+            app.queue_manual_error_action(second_id, "skip")
+
+            self.assertEqual(
+                app.state.queued_error_actions,
+                [{"id": first_id, "action": "approve"}, {"id": second_id, "action": "skip"}],
+            )
+
+            processed: list[tuple[str, str]] = []
+
+            def fake_resolve(decision_id: str, action: str) -> dict[str, str]:
+                processed.append((decision_id, action))
+                with app._lock:
+                    pending_map = app.state.pending_decisions or {}
+                    pending_map.pop(decision_id, None)
+                    app.state.pending_decisions = pending_map
+                app.clear_error(decision_id)
+                return {"status": "done", "decision_id": decision_id, "action": action}
+
+            with patch.object(app, "resolve_error_action", side_effect=fake_resolve):
+                first_result = app.process_next_queued_error_action()
+                second_result = app.process_next_queued_error_action()
+
+            self.assertEqual(first_result["decision_id"], first_id)
+            self.assertEqual(second_result["decision_id"], second_id)
+            self.assertEqual(processed, [(first_id, "approve"), (second_id, "skip")])
+            self.assertEqual(app.state.queued_error_actions, [])
+            self.assertEqual(app.state.pending_decisions, {})
+            self.assertEqual(app.state.errors, [])
+
+    def test_approving_one_pending_error_does_not_affect_other_pending_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            source_one = root / "library" / "first.avi"
+            source_two = root / "library" / "second.avi"
+            replacement_one = source_one.with_suffix(".mkv")
+            replacement_two = source_two.with_suffix(".mkv")
+            source_one.parent.mkdir(parents=True, exist_ok=True)
+            source_one.write_bytes(b"first-source")
+            source_two.write_bytes(b"second-source")
+            replacement_one.write_bytes(b"first-output")
+            replacement_two.write_bytes(b"second-output")
+            quarantine_one = root / "inspection" / "quarantine" / "first.avi"
+            quarantine_two = root / "inspection" / "quarantine" / "second.avi"
+            quarantine_one.parent.mkdir(parents=True, exist_ok=True)
+            quarantine_one.write_bytes(b"first-original")
+            quarantine_two.write_bytes(b"second-original")
+            work_dir_one = root / "inspection" / "pending_decisions" / "first"
+            work_dir_two = root / "inspection" / "pending_decisions" / "second"
+            work_dir_one.mkdir(parents=True, exist_ok=True)
+            work_dir_two.mkdir(parents=True, exist_ok=True)
+            first_id = "verify:first:final_verification"
+            second_id = "verify:second:final_verification"
+            first_pending = {
+                "id": first_id,
+                "source_path": str(source_one),
+                "replacement_path": str(replacement_one),
+                "work_dir_path": str(work_dir_one),
+                "local_output_path": str(work_dir_one / "output" / replacement_one.name),
+                "temp_output_path": str(work_dir_one / "preserved-temp" / replacement_one.name),
+                "job_id": "job-first",
+                "stage": "final_verification",
+                "source_before_signature": {"path": str(source_one)},
+                "source_metadata": {"path": str(source_one), "started_at": "2026-01-01T00:00:00Z", "video_codec": "mpeg4"},
+                "output_metadata": {"path": str(replacement_one), "video_codec": "hevc"},
+                "track_policy": {"applied": False},
+                "downscale": {"applied": False},
+                "verification": {"status": "failed"},
+                "quarantine_path": str(quarantine_one),
+                "created_at": "2026-01-01T00:00:00Z",
+                "queued_action": None,
+            }
+            second_pending = {
+                "id": second_id,
+                "source_path": str(source_two),
+                "replacement_path": str(replacement_two),
+                "work_dir_path": str(work_dir_two),
+                "local_output_path": str(work_dir_two / "output" / replacement_two.name),
+                "temp_output_path": str(work_dir_two / "preserved-temp" / replacement_two.name),
+                "job_id": "job-second",
+                "stage": "final_verification",
+                "source_before_signature": {"path": str(source_two)},
+                "source_metadata": {"path": str(source_two), "started_at": "2026-01-01T00:00:01Z", "video_codec": "mpeg4"},
+                "output_metadata": {"path": str(replacement_two), "video_codec": "hevc"},
+                "track_policy": {"applied": False},
+                "downscale": {"applied": False},
+                "verification": {"status": "failed"},
+                "quarantine_path": str(quarantine_two),
+                "created_at": "2026-01-01T00:00:01Z",
+                "queued_action": None,
+            }
+            app.state.pending_decisions = {first_id: first_pending, second_id: second_pending}
+            app.state.errors = [
+                {"id": first_id, "summary": "first", "source_path": str(source_one), "actions": ["approve", "skip"]},
+                {"id": second_id, "summary": "second", "source_path": str(source_two), "actions": ["approve", "skip"], "queued_action": "skip"},
+            ]
+            app.state.queued_error_actions = [{"id": second_id, "action": "skip"}]
+
+            with patch("simpleripper.refresh_jellyfin", return_value={"status": "ok"}), patch("simpleripper.source_signature", side_effect=lambda path: {"path": str(path)}):
+                result = app.resolve_error_action(first_id, "approve")
+
+            self.assertEqual(result["status"], "done")
+            self.assertEqual(result["action"], "approve")
+            self.assertNotIn(first_id, app.state.pending_decisions or {})
+            self.assertIn(second_id, app.state.pending_decisions or {})
+            self.assertEqual((app.state.pending_decisions or {})[second_id]["source_path"], str(source_two))
+            self.assertEqual(app.state.queued_error_actions, [{"id": second_id, "action": "skip"}])
+            remaining_errors = app.state.errors or []
+            self.assertEqual(len(remaining_errors), 1)
+            self.assertEqual(remaining_errors[0]["id"], second_id)
+            self.assertEqual(remaining_errors[0]["queued_action"], "skip")
+
+    def test_stop_after_current_processes_queued_error_actions_before_stopping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            decision_id = "verify:test:local"
+            app.state.running = True
+            app.state.pending_decisions = {decision_id: {"id": decision_id, "source_path": "movie.mkv", "queued_action": "approve"}}
+            app.state.errors = [{"id": decision_id, "summary": "needs decision", "source_path": "movie.mkv", "actions": [], "queued_action": "approve"}]
+            app.state.queued_error_actions = [{"id": decision_id, "action": "approve"}]
+            app.state.stop_after_current = True
+
+            processed: list[tuple[str, str]] = []
+
+            def fake_resolve(decision_id_arg: str, action_arg: str) -> dict[str, str]:
+                processed.append((decision_id_arg, action_arg))
+                with app._lock:
+                    pending_map = app.state.pending_decisions or {}
+                    pending_map.pop(decision_id_arg, None)
+                    app.state.pending_decisions = pending_map
+                app.clear_error(decision_id_arg)
+                return {"status": "done", "decision_id": decision_id_arg, "action": action_arg}
+
+            with patch.object(app, "resolve_error_action", side_effect=fake_resolve), patch("simpleripper.scan_candidates", return_value=[]):
+                app._run_loop()
+
+            self.assertFalse(app.state.running)
+            self.assertEqual(processed, [(decision_id, "approve")])
+            self.assertEqual(app.state.queued_error_actions, [])
+            self.assertEqual(app.state.pending_decisions, {})
+            self.assertEqual(app.state.errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

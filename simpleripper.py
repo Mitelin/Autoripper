@@ -3427,14 +3427,18 @@ class SimpleRipperApp:
             while True:
                 with self._lock:
                     folders = list(self.selected_folders)
-                    stop = self.state.stop_after_current or self.state.force_stop
+                    stop_after_current = self.state.stop_after_current
+                    force_stop = self.state.force_stop
                     queued_actions = bool(self.state.queued_error_actions)
-                if stop:
+                if force_stop:
                     self.reset_runtime_state(clear_errors=False)
                     break
                 if queued_actions:
                     self.process_next_queued_error_action()
                     continue
+                if stop_after_current:
+                    self.reset_runtime_state(clear_errors=False)
+                    break
                 log_event(self.config, "scan_start", folders=[str(path) for path in folders])
                 self.set_phase("scanning_inventory")
                 candidates = scan_candidates(folders, self.config)
