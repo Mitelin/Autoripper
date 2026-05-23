@@ -3988,12 +3988,17 @@ pre{margin:0;padding:16px 18px;border-radius:18px;background:#09111a;color:#dce9
 .error-list{display:grid;gap:10px}
 .err{padding:12px 14px;border-radius:16px;background:var(--danger-soft);color:#772727;border:1px solid #ecc2c2;line-height:1.5}
 .err-card{border-radius:16px;background:var(--danger-soft);border:1px solid #ecc2c2;color:#772727;overflow:hidden}
+.err.warn,.err-card.warn{background:var(--warn-soft);border-color:#eed2a4;color:#6c420f}
 .err-card summary{list-style:none;cursor:pointer;padding:12px 14px;display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;align-items:start}
 .err-card summary::-webkit-details-marker{display:none}
 .err-time{font-size:12px;color:#935050;white-space:nowrap}
+.err.warn .err-time,.err-card.warn .err-time{color:#8c6228}
 .err-summary{font-weight:700;line-height:1.45;word-break:break-word}
 .err-detail{padding:0 14px 14px;display:grid;gap:8px;border-top:1px solid rgba(119,39,39,.15)}
+.err-card.warn .err-detail{border-top-color:rgba(108,66,15,.18)}
 .err-path{font-size:13px;line-height:1.45;color:#7b4040;word-break:break-word}
+.err.warn .err-path,.err-card.warn .err-path{color:#80572a}
+.err-queued{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;background:rgba(240,179,91,.18);color:#6c420f;font-size:12px;font-weight:800;letter-spacing:.04em;text-transform:uppercase}
 .err-lines{margin:0;padding-left:18px}
 .err-lines li{margin:0;line-height:1.45}
 .log-shell{display:grid;gap:14px}
@@ -4025,7 +4030,7 @@ function captureDisclosureState(){return new Set(Array.from(document.querySelect
 function restoreDisclosureState(openKeys){if(!openKeys||!openKeys.size){return}document.querySelectorAll('#errors details[data-ui-key]').forEach(item=>{const key=item.getAttribute('data-ui-key');if(key&&openKeys.has(key)){item.open=true}})}
 function approveError(id){post('/api/errors/action',{id:id,action:'approve'})}
 function skipError(id){post('/api/errors/action',{id:id,action:'skip'})}
-function renderErrorEntry(entry){const item=entry&&typeof entry==='object'?entry:{message:String(entry||'')};const summary=escapeHtml(item.summary||item.message||'Unknown error');const at=escapeHtml(item.at||'');const sourcePath=item.source_path?`<div class="err-path">${escapeHtml(item.source_path)}</div>`:'';const detailLines=Array.isArray(item.details)?item.details.filter(Boolean):[];const actions=Array.isArray(item.actions)&&item.id?`<div class="folder-actions" style="margin-top:12px"><button class="primary" onclick="approveError('${escapeHtml(item.id)}')">Approve</button><button class="ghost" onclick="skipError('${escapeHtml(item.id)}')">Skip</button></div>`:'';if(!sourcePath&&!detailLines.length&&!actions){return `<div class="err"><div class="err-time">${at}</div><div class="err-summary">${summary}</div></div>`}const detailsHtml=detailLines.length?`<ul class="err-lines">${detailLines.map(line=>`<li>${escapeHtml(line)}</li>`).join('')}</ul>`:'';return `<details class="err-card" data-ui-key="${escapeHtml(disclosureKey(item))}"><summary><div class="err-time">${at}</div><div class="err-summary">${summary}</div></summary><div class="err-detail">${sourcePath}${detailsHtml}${actions}</div></details>`}
+function renderErrorEntry(entry){const item=entry&&typeof entry==='object'?entry:{message:String(entry||'')};const summary=escapeHtml(item.summary||item.message||'Unknown error');const at=escapeHtml(item.at||'');const queuedAction=item.queued_action?String(item.queued_action):'';const isQueued=queuedAction==='approve'||queuedAction==='skip';const toneClass=isQueued?'warn':'';const sourcePath=item.source_path?`<div class="err-path">${escapeHtml(item.source_path)}</div>`:'';const detailLines=Array.isArray(item.details)?item.details.filter(Boolean):[];const queuedLabel=isQueued?`<div class="err-queued">Queued ${escapeHtml(queuedAction)}</div>`:'';const actions=Array.isArray(item.actions)&&item.actions.length&&item.id?`<div class="folder-actions" style="margin-top:12px"><button class="primary" onclick="approveError('${escapeHtml(item.id)}')">Approve</button><button class="ghost" onclick="skipError('${escapeHtml(item.id)}')">Skip</button></div>`:'';if(!sourcePath&&!detailLines.length&&!actions&&!queuedLabel){return `<div class="err ${toneClass}"><div class="err-time">${at}</div><div class="err-summary">${summary}</div></div>`}const detailsHtml=detailLines.length?`<ul class="err-lines">${detailLines.map(line=>`<li>${escapeHtml(line)}</li>`).join('')}</ul>`:'';return `<details class="err-card ${toneClass}" data-ui-key="${escapeHtml(disclosureKey(item))}"><summary><div class="err-time">${at}</div><div class="err-summary">${summary}</div></summary><div class="err-detail">${queuedLabel}${sourcePath}${detailsHtml}${actions}</div></details>`}
 async function getStatus(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(readJsonResponse);uiError='';render(s)}catch(error){renderUiError(formatRequestError(error))}}
 async function post(url,body={}){try{const s=await fetch(url,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(readJsonResponse);uiError='';render(s)}catch(error){renderUiError(formatRequestError(error))}}
 function selectedMap(s){return Object.fromEntries((s.selected_folders||[]).map(item=>[item.path,item.media_type||'auto']))}

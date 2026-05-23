@@ -763,6 +763,15 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("Approve</button>", simpleripper.INDEX_HTML)
         self.assertIn("Skip</button>", simpleripper.INDEX_HTML)
 
+    def test_web_ui_marks_queued_error_as_warning(self) -> None:
+        self.assertIn(".err.warn,.err-card.warn{background:var(--warn-soft)", simpleripper.INDEX_HTML)
+        self.assertIn("const isQueued=queuedAction==='approve'||queuedAction==='skip'", simpleripper.INDEX_HTML)
+        self.assertIn("const toneClass=isQueued?'warn':''", simpleripper.INDEX_HTML)
+        self.assertIn("<div class=\"err-queued\">Queued ${escapeHtml(queuedAction)}</div>", simpleripper.INDEX_HTML)
+
+    def test_web_ui_hides_actions_for_queued_error(self) -> None:
+        self.assertIn("Array.isArray(item.actions)&&item.actions.length&&item.id", simpleripper.INDEX_HTML)
+
     def test_copy_file_interruptible_removes_partial_output_on_force_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
