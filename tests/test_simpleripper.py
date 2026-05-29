@@ -2108,6 +2108,9 @@ class SimpleRipperTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self.make_config(root)
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_text("source", encoding="utf-8")
             local_output = root / "work" / "current" / "output" / "movie.mkv"
             local_output.parent.mkdir(parents=True)
             local_output.write_text("partial", encoding="utf-8")
@@ -2116,7 +2119,7 @@ class SimpleRipperTests(unittest.TestCase):
                 {
                     "job_id": "job-1",
                     "phase": "encoding",
-                    "source_path": str(root / "library" / "movie.mkv"),
+                    "source_path": str(source),
                     "local_output_path": str(local_output),
                     "ffmpeg_pid": 999999,
                 },
@@ -2127,34 +2130,271 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertFalse(local_output.exists())
             self.assertFalse(simpleripper.current_job_path(config).exists())
+            resume_request = simpleripper.load_resume_request(config)
+            self.assertIsNotNone(resume_request)
+            self.assertEqual((resume_request or {})["source_path"], str(source))
+            self.assertEqual((resume_request or {})["phase"], "encoding")
             jobs = (root / "history" / "jobs.jsonl").read_text(encoding="utf-8")
             self.assertIn("interrupted", jobs)
 
-    def test_recover_runtime_state_verifies_replaced_file(self) -> None:
+    def test_recover_runtime_state_cleans_workspace_before_writing_resume_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_text("source", encoding="utf-8")
+            work_current = root / "work" / "current"
+            local_output = work_current / "output" / "movie.mkv"
+            temp_output = work_current / "temp" / "movie.mkv"
+            local_output.parent.mkdir(parents=True)
+            temp_output.parent.mkdir(parents=True)
+            local_output.write_text("partial", encoding="utf-8")
+            temp_output.write_text("temp", encoding="utf-8")
+            simpleripper.write_json(
+                simpleripper.current_job_path(config),
+                {
+                    "job_id": "job-1",
+                    "phase": "uploading",
+                    "source_path": str(source),
+                    "local_output_path": str(local_output),
+                    "temp_output_path": str(temp_output),
+                    "ffmpeg_pid": 999999,
+                },
+            )
+
+            original_write_resume_request = simpleripper.write_resume_request
+
+            def checking_write_resume_request(test_config: dict, resume_source: Path, phase: str, job_id: str | None = None) -> None:
+                self.assertFalse(work_current.exists())
+                self.assertFalse(simpleripper.current_job_path(test_config).exists())
+                original_write_resume_request(test_config, resume_source, phase, job_id)
+
+            with patch("simpleripper.write_resume_request", side_effect=checking_write_resume_request):
+                simpleripper.recover_runtime_state(config)
+
+            resume_request = simpleripper.load_resume_request(config)
+            self.assertIsNotNone(resume_request)
+            self.assertEqual((resume_request or {})["source_path"], str(source))
+            self.assertFalse(work_current.exists())
+            self.assertFalse(simpleripper.current_job_path(config).exists())
+
+    def test_recover_runtime_state_requeues_all_incomplete_pre_swap_phases(self) -> None:
+        phases = ["copying_source", "probing_source", "encoding", "probing_output", "verifying", "uploading"]
+        for phase in phases:
+            with self.subTest(phase=phase):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    config = self.make_config(root)
+                    source = root / "library" / "movie.mkv"
+                    source.parent.mkdir(parents=True)
+                    source.write_text("source", encoding="utf-8")
+                    work_current = root / "work" / "current"
+                    local_output = work_current / "output" / "movie.mkv"
+                    temp_output = work_current / "temp" / "movie.mkv"
+                    local_output.parent.mkdir(parents=True)
+                    temp_output.parent.mkdir(parents=True)
+                    local_output.write_text("partial", encoding="utf-8")
+                    temp_output.write_text("temp", encoding="utf-8")
+                    simpleripper.write_json(
+                        simpleripper.current_job_path(config),
+                        {
+                            "job_id": f"job-{phase}",
+                            "phase": phase,
+                            "source_path": str(source),
+                            "local_output_path": str(local_output),
+                            "temp_output_path": str(temp_output),
+                            "ffmpeg_pid": 999999,
+                        },
+                    )
+
+                    simpleripper.recover_runtime_state(config)
+
+                    resume_request = simpleripper.load_resume_request(config)
+                    self.assertIsNotNone(resume_request)
+                    self.assertEqual((resume_request or {})["source_path"], str(source))
+                    self.assertEqual((resume_request or {})["phase"], phase)
+                    self.assertFalse(work_current.exists())
+                    self.assertFalse(simpleripper.current_job_path(config).exists())
+
+    def test_recover_runtime_state_writes_explicit_crash_recovery_log_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_text("source", encoding="utf-8")
+            local_output = root / "work" / "current" / "output" / "movie.mkv"
+            local_output.parent.mkdir(parents=True)
+            local_output.write_text("partial", encoding="utf-8")
+            simpleripper.write_json(
+                simpleripper.current_job_path(config),
+                {
+                    "job_id": "job-logs",
+                    "phase": "encoding",
+                    "source_path": str(source),
+                    "local_output_path": str(local_output),
+                    "ffmpeg_pid": 999999,
+                },
+            )
+
+            simpleripper.recover_runtime_state(config)
+
+            log_lines = simpleripper.tail_text_lines(simpleripper.app_log_path(config), 20)
+            joined = "\n".join(log_lines)
+            self.assertIn("crash_recovery_detected", joined)
+            self.assertIn("crash_recovery_cleanup_started", joined)
+            self.assertIn("crash_recovery_cleanup_finished", joined)
+            self.assertIn("crash_recovery_rerun_scheduled", joined)
+            self.assertLess(joined.index("crash_recovery_detected"), joined.index("crash_recovery_cleanup_started"))
+            self.assertLess(joined.index("crash_recovery_cleanup_started"), joined.index("crash_recovery_cleanup_finished"))
+            self.assertLess(joined.index("crash_recovery_cleanup_finished"), joined.index("crash_recovery_rerun_scheduled"))
+
+    def test_app_init_autostarts_when_previous_session_was_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_text("source", encoding="utf-8")
+            simpleripper.set_running_requested(config, True)
+            simpleripper.write_resume_request(config, source, "encoding", "job-1")
+
+            with patch.object(simpleripper.SimpleRipperApp, "start", autospec=True) as start_mock:
+                app = simpleripper.SimpleRipperApp(config)
+
+            self.assertEqual((app._resume_request or {})["source_path"], str(source))
+            start_mock.assert_called_once_with(app, reason="auto_resume")
+
+    def test_run_loop_processes_resume_request_before_scanning_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_text("source", encoding="utf-8")
+            app = simpleripper.SimpleRipperApp(config)
+            app._resume_request = {"source_path": str(source), "phase": "encoding", "job_id": "job-1"}
+            app.state.running = True
+            processed: list[Path] = []
+
+            def fake_process_one(path: Path) -> None:
+                processed.append(path)
+                app.state.force_stop = True
+
+            with patch.object(app, "process_one", side_effect=fake_process_one), patch("simpleripper.scan_candidates") as scan_candidates_mock:
+                app._run_loop()
+
+            self.assertEqual(processed, [source])
+            scan_candidates_mock.assert_not_called()
+            self.assertFalse(simpleripper.resume_request_path(config).exists())
+
+    def test_recover_runtime_state_requeues_final_verify_from_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self.make_config(root)
             source = root / "library" / "movie.mkv"
             source.parent.mkdir(parents=True)
             source.write_text("encoded", encoding="utf-8")
+            quarantine = root / "quarantine" / "movie.mkv.original"
+            quarantine.parent.mkdir(parents=True)
+            quarantine.write_text("original", encoding="utf-8")
             simpleripper.write_json(
                 simpleripper.current_job_path(config),
                 {
                     "job_id": "job-2",
                     "phase": "final_verify",
                     "source_path": str(source),
+                    "replacement_path": str(source),
+                    "quarantine_path": str(quarantine),
                     "source_metadata": {"media_type": "default", "file_size_bytes": 6000, "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0},
                     "track_policy": {"applied": False},
                 },
             )
 
-            with patch("simpleripper.ffprobe_metadata", return_value=({}, {"duration_seconds": 10.0, "video_codec": "hevc", "video_pix_fmt": "yuv420p10le", "audio_stream_count": 1, "subtitle_stream_count": 0, "overall_bitrate_kbps": 1500})), patch(
-                "simpleripper.verify_output", return_value=({"video_codec_ok": True, "pix_fmt_ok": True}, [])
-            ):
-                simpleripper.recover_runtime_state(config)
+            simpleripper.recover_runtime_state(config)
 
+            self.assertTrue(source.exists())
+            self.assertEqual(source.read_text(encoding="utf-8"), "original")
+            self.assertFalse(quarantine.exists())
+            resume_request = simpleripper.load_resume_request(config)
+            self.assertIsNotNone(resume_request)
+            self.assertEqual((resume_request or {})["source_path"], str(source))
             jobs = (root / "history" / "jobs.jsonl").read_text(encoding="utf-8")
-            self.assertIn("replacement_verified", jobs)
+            self.assertIn("rollback_restored", jobs)
+            self.assertIn('"resume_requested": true', jobs)
+
+    def test_recover_runtime_state_requeues_refreshing_jellyfin_from_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_text("encoded", encoding="utf-8")
+            quarantine = root / "quarantine" / "movie.mkv.original"
+            quarantine.parent.mkdir(parents=True)
+            quarantine.write_text("original", encoding="utf-8")
+            simpleripper.write_json(
+                simpleripper.current_job_path(config),
+                {
+                    "job_id": "job-3",
+                    "phase": "refreshing_jellyfin",
+                    "source_path": str(source),
+                    "replacement_path": str(source),
+                    "quarantine_path": str(quarantine),
+                },
+            )
+
+            simpleripper.recover_runtime_state(config)
+
+            self.assertTrue(source.exists())
+            self.assertEqual(source.read_text(encoding="utf-8"), "original")
+            self.assertFalse(quarantine.exists())
+            resume_request = simpleripper.load_resume_request(config)
+            self.assertIsNotNone(resume_request)
+            self.assertEqual((resume_request or {})["phase"], "refreshing_jellyfin")
+
+    def test_process_one_keeps_quarantine_until_after_jellyfin_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan"]["file_extensions"] = [".mkv", ".avi"]
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "episode.avi"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 6000)
+
+            class FakeProcess:
+                def __init__(self, command: list[str]) -> None:
+                    self.stdout = io.StringIO("")
+                    self.pid = 4242
+                    self.returncode = 0
+                    Path(command[-1]).write_bytes(b"encoded-output")
+
+                def poll(self) -> int:
+                    return 0
+
+            def fake_popen(command: list[str], stdout: object = None, stderr: object = None, text: bool = True, encoding: str = "utf-8", errors: str = "replace") -> FakeProcess:
+                return FakeProcess(command)
+
+            def fake_probe(test_config: dict, path: Path, media_type: str) -> tuple[dict, dict]:
+                if path.suffix.lower() == ".avi":
+                    return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "mpeg4", "video_pix_fmt": "yuv420p", "overall_bitrate_kbps": 4000}
+                return {}, {"media_type": "default", "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "hevc", "video_pix_fmt": "yuv420p10le", "overall_bitrate_kbps": 1500}
+
+            def check_refresh(test_config: dict, original_source: Path, replacement: Path | None = None) -> dict[str, str]:
+                quarantine_root = root / "quarantine"
+                quarantined = list(quarantine_root.rglob("*.original"))
+                self.assertEqual(len(quarantined), 1)
+                self.assertTrue(quarantined[0].exists())
+                return {"status": "ok"}
+
+            with patch("simpleripper.subprocess.Popen", side_effect=fake_popen), patch("simpleripper.ffprobe_metadata", side_effect=fake_probe), patch("simpleripper.refresh_jellyfin", side_effect=check_refresh):
+                app.process_one(source)
+
+            self.assertEqual(list((root / "quarantine").rglob("*.original")), [])
 
     def test_process_one_avi_replacement_verifies_final_mkv_and_marks_both_paths_done(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

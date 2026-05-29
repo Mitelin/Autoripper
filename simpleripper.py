@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shutil
 import socket
 import sqlite3
@@ -142,6 +143,61 @@ def log_dir(config: dict[str, Any]) -> Path:
 
 def current_job_path(config: dict[str, Any]) -> Path:
     return runtime_dir(config) / "current_job.json"
+
+
+def runtime_control_path(config: dict[str, Any]) -> Path:
+    return runtime_dir(config) / "runtime_control.json"
+
+
+def resume_request_path(config: dict[str, Any]) -> Path:
+    return runtime_dir(config) / "resume_request.json"
+
+
+def load_runtime_control(config: dict[str, Any]) -> dict[str, Any]:
+    path = runtime_control_path(config)
+    if not path.exists():
+        return {"running_requested": False}
+    try:
+        payload = read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return {"running_requested": False}
+    return {"running_requested": bool(payload.get("running_requested", False))}
+
+
+def set_running_requested(config: dict[str, Any], requested: bool) -> None:
+    write_json(runtime_control_path(config), {"running_requested": bool(requested), "updated_at": utc_now()})
+
+
+def load_resume_request(config: dict[str, Any]) -> dict[str, Any] | None:
+    path = resume_request_path(config)
+    if not path.exists():
+        return None
+    try:
+        payload = read_json(path)
+    except (OSError, json.JSONDecodeError):
+        safe_unlink(path)
+        return None
+    source_path = str(payload.get("source_path") or "").strip()
+    if not source_path:
+        safe_unlink(path)
+        return None
+    return payload
+
+
+def write_resume_request(config: dict[str, Any], source_path: Path, phase: str, job_id: str | None = None) -> None:
+    write_json(
+        resume_request_path(config),
+        {
+            "source_path": str(source_path),
+            "phase": phase,
+            "job_id": job_id,
+            "requested_at": utc_now(),
+        },
+    )
+
+
+def clear_resume_request(config: dict[str, Any]) -> None:
+    safe_unlink(resume_request_path(config))
 
 
 def worker_cache_path(config: dict[str, Any]) -> Path:
@@ -1219,6 +1275,25 @@ def terminate_process_gracefully(process: subprocess.Popen[Any] | None, timeout_
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=timeout_seconds)
+
+
+def terminate_local_pid_gracefully(pid: int, timeout_seconds: float = 5.0) -> bool:
+    if pid <= 0 or not is_local_pid_running(pid):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if not is_local_pid_running(pid):
+            return True
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM)
+    except OSError:
+        pass
+    return not is_local_pid_running(pid)
 
 
 def file_lock_id(source: Path) -> str:
@@ -2683,56 +2758,99 @@ def recover_runtime_state(config: dict[str, Any]) -> None:
     temp_output_path = Path(str(payload.get("temp_output_path") or "")) if payload.get("temp_output_path") else None
     quarantine_path = Path(str(payload.get("quarantine_path") or "")) if payload.get("quarantine_path") else None
     ffmpeg_pid = int(payload.get("ffmpeg_pid") or -1)
-    source_metadata = payload.get("source_metadata") or None
-    stream_policy = payload.get("track_policy") or {"applied": False}
+    job_id = str(payload.get("job_id") or "").strip() or None
     recovered_status = None
     recovery_details: dict[str, Any] = {}
-    if phase == "encoding" and not is_local_pid_running(ffmpeg_pid):
+    incomplete_phases = {"copying_source", "probing_source", "encoding", "probing_output", "verifying", "uploading", "swapping", "final_verify", "refreshing_jellyfin"}
+    log_event(
+        config,
+        "crash_recovery_detected",
+        job_id=job_id,
+        source_path=str(source_path) if source_path else None,
+        phase=phase,
+        ffmpeg_pid=ffmpeg_pid if ffmpeg_pid > 0 else None,
+        local_output_exists=bool(local_output_path and local_output_path.exists()),
+        temp_output_exists=bool(temp_output_path and temp_output_path.exists()),
+        replacement_exists=bool(replacement_path and replacement_path.exists()),
+        quarantine_exists=bool(quarantine_path and quarantine_path.exists()),
+        current_job_path=str(path),
+    )
+    if phase == "encoding":
+        if is_local_pid_running(ffmpeg_pid):
+            recovery_details["ffmpeg_pid_terminated"] = terminate_local_pid_gracefully(ffmpeg_pid)
         if local_output_path and local_output_path.exists():
             safe_unlink(local_output_path)
         recovered_status = "interrupted"
+    elif phase in {"copying_source", "probing_source", "probing_output", "verifying"}:
+        if local_output_path and local_output_path.exists():
+            safe_unlink(local_output_path)
+        if temp_output_path and temp_output_path.exists():
+            safe_unlink(temp_output_path)
+        recovered_status = "restart_cleanup"
     elif phase == "uploading":
         if temp_output_path and temp_output_path.exists():
             safe_unlink(temp_output_path)
         recovered_status = "upload_cleanup"
-    elif phase in {"swapping", "final_verify"} and source_path and replacement_path:
-        if not replacement_path.exists() and quarantine_path and quarantine_path.exists():
+    elif phase in {"swapping", "final_verify", "refreshing_jellyfin"} and source_path and replacement_path:
+        if replacement_path.exists() and quarantine_path and quarantine_path.exists():
+            rollback_replacement(source_path, quarantine_path, config, replacement_path)
+            recovered_status = "rollback_restored"
+        elif not replacement_path.exists() and quarantine_path and quarantine_path.exists() and not source_path.exists():
             quarantine_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(quarantine_path), str(source_path))
             recovered_status = "rollback_restored"
-        elif replacement_path.exists():
-            recovered_status = "replacement_present"
-            if source_metadata:
-                try:
-                    _probe, final_meta = ffprobe_metadata(config, replacement_path, str(source_metadata.get("media_type") or "default"))
-                    final_verification, final_errors = verify_output(config, source_metadata, replacement_path, final_meta, stream_policy)
-                    if final_errors:
-                        recovery_details["verification_errors"] = final_errors
-                    else:
-                        recovered_status = "replacement_verified"
-                        recovery_details["verification"] = final_verification
-                except Exception as exc:
-                    recovery_details["verification_error"] = str(exc)
-    elif phase == "refreshing_jellyfin":
-        recovered_status = "replacement_present"
-        if replacement_path and replacement_path.exists() and source_metadata:
-            try:
-                _probe, final_meta = ffprobe_metadata(config, replacement_path, str(source_metadata.get("media_type") or "default"))
-                final_verification, final_errors = verify_output(config, source_metadata, replacement_path, final_meta, stream_policy)
-                if not final_errors:
-                    recovered_status = "refresh_retried"
-                    recovery_details["verification"] = final_verification
-                    recovery_details["jellyfin_refresh"] = refresh_jellyfin(config, source_path or replacement_path, replacement_path)
-                else:
-                    recovery_details["verification_errors"] = final_errors
-            except Exception as exc:
-                recovery_details["verification_error"] = str(exc)
+        elif temp_output_path and temp_output_path.exists():
+            safe_unlink(temp_output_path)
+            recovered_status = "upload_cleanup"
+        else:
+            recovered_status = "restart_cleanup"
+    log_event(
+        config,
+        "crash_recovery_cleanup_started",
+        job_id=job_id,
+        source_path=str(source_path) if source_path else None,
+        phase=phase,
+        recovery_status=recovered_status,
+        work_current_path=str(work_dir(config) / "current"),
+    )
+    shutil.rmtree(work_dir(config) / "current", ignore_errors=True)
+    safe_unlink(path)
+    log_event(
+        config,
+        "crash_recovery_cleanup_finished",
+        job_id=job_id,
+        source_path=str(source_path) if source_path else None,
+        phase=phase,
+        recovery_status=recovered_status,
+        work_current_exists=(work_dir(config) / "current").exists(),
+        current_job_exists=path.exists(),
+    )
     if recovered_status:
+        if source_path and phase in incomplete_phases and source_path.exists():
+            write_resume_request(config, source_path, phase, job_id)
+            recovery_details["resume_requested"] = True
+            log_event(
+                config,
+                "crash_recovery_rerun_scheduled",
+                job_id=job_id,
+                source_path=str(source_path),
+                phase=phase,
+                recovery_status=recovered_status,
+                resume_request_path=str(resume_request_path(config)),
+            )
+        elif source_path and phase in incomplete_phases:
+            log_event(
+                config,
+                "crash_recovery_rerun_skipped",
+                job_id=job_id,
+                source_path=str(source_path),
+                phase=phase,
+                recovery_status=recovered_status,
+                reason="missing_source",
+            )
         event = {"job_id": payload.get("job_id"), "source_path": str(source_path) if source_path else None, "status": recovered_status, "recovered_at": utc_now(), "previous_phase": phase, **recovery_details}
         append_jsonl(history_dir(config) / "jobs.jsonl", event)
         log_event(config, "recovery", **event)
-    shutil.rmtree(work_dir(config) / "current", ignore_errors=True)
-    safe_unlink(path)
 
 
 @dataclass
@@ -2772,7 +2890,21 @@ class SimpleRipperApp:
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._ffmpeg: subprocess.Popen[Any] | None = None
+        self._resume_request = load_resume_request(config)
+        self._running_requested = bool(load_runtime_control(config).get("running_requested"))
         log_event(self.config, "app_initialized", selected_folders=self.selected_folder_entries, custom_folders=self.custom_folder_entries)
+        if self._running_requested:
+            if self._resume_request:
+                log_event(
+                    self.config,
+                    "resume_start_requested",
+                    source_path=str(self._resume_request.get("source_path") or ""),
+                    phase=str(self._resume_request.get("phase") or ""),
+                    job_id=self._resume_request.get("job_id"),
+                )
+            else:
+                log_event(self.config, "auto_start_requested", reason="persisted_running_request")
+            self.start(reason="auto_resume")
 
     def can_update(self) -> bool:
         with self._lock:
@@ -2848,6 +2980,28 @@ class SimpleRipperApp:
             }
             payload.update(extra or {})
             write_json(current_job_path(self.config), payload)
+
+    def take_resume_request(self) -> dict[str, Any] | None:
+        with self._lock:
+            payload = dict(self._resume_request) if isinstance(self._resume_request, dict) else None
+            self._resume_request = None
+        if payload:
+            clear_resume_request(self.config)
+        return payload
+
+    def process_resume_request(self) -> bool:
+        payload = self.take_resume_request()
+        if not payload:
+            return False
+        source = Path(str(payload.get("source_path") or "")).expanduser()
+        phase = str(payload.get("phase") or "unknown")
+        job_id = payload.get("job_id")
+        if not source.exists():
+            log_event(self.config, "resume_request_skipped", source_path=str(source), phase=phase, job_id=job_id, reason="missing_source")
+            return False
+        log_event(self.config, "resume_request_processing", source_path=str(source), phase=phase, job_id=job_id)
+        self.process_one(source)
+        return True
 
     def log_error(self, message: str, source_path: str | None = None, failure_type: str | None = None, summary: str | None = None, details: list[str] | None = None) -> None:
         with self._lock:
@@ -3194,10 +3348,10 @@ class SimpleRipperApp:
                     }
                 else:
                     raise ValueError(f"Unsupported verification stage: {stage}")
-                if quarantine_path is not None:
-                    final_payload.update(finalize_quarantined_original(quarantine_path, self.config))
                 if final_path is not None:
                     jellyfin_refresh = refresh_jellyfin(self.config, source, final_path)
+                if quarantine_path is not None:
+                    final_payload.update(finalize_quarantined_original(quarantine_path, self.config))
                 recorded = self._record_manual_done(
                     source,
                     source_before_signature,
@@ -3261,6 +3415,7 @@ class SimpleRipperApp:
                 self.state.errors = []
         safe_unlink(ffmpeg_current_log_path(self.config))
         current_job_path(self.config).unlink(missing_ok=True)
+        clear_resume_request(self.config)
 
     def set_selected_folders(self, folders: list[Any]) -> None:
         normalized = normalize_selected_folder_entries(folders)
@@ -3291,26 +3446,32 @@ class SimpleRipperApp:
             self._sync_folder_views()
             self.persist_selected_folders(previous_entries)
 
-    def start(self) -> None:
+    def start(self, reason: str = "manual") -> None:
         with self._lock:
             if self.state.running:
                 raise RuntimeError("SimpleRipper is already running on this machine")
             self.state.running = True
+            self._running_requested = True
             self.state.stop_after_current = False
             self.state.force_stop = False
             self._thread = threading.Thread(target=self._run_loop, name="simpleripper-worker", daemon=True)
             self._thread.start()
-        log_event(self.config, "loop_start_requested")
+        set_running_requested(self.config, True)
+        log_event(self.config, "loop_start_requested", reason=reason)
 
     def stop_after_current(self) -> None:
         with self._lock:
+            self._running_requested = False
             self.state.stop_after_current = True
+        set_running_requested(self.config, False)
         log_event(self.config, "stop_after_current_requested")
 
     def force_stop(self) -> None:
         with self._lock:
+            self._running_requested = False
             self.state.force_stop = True
             process = self._ffmpeg
+        set_running_requested(self.config, False)
         log_event(self.config, "force_stop_requested", ffmpeg_pid=(process.pid if process else None))
         if process and process.poll() is None:
             terminate_process_gracefully(process)
@@ -3330,10 +3491,12 @@ class SimpleRipperApp:
         with self._lock:
             if self.state.running or self.state.current_phase != "idle":
                 raise RuntimeError("Update lze provest pouze kdyz je system idle")
+            self._running_requested = False
             self.state.current_phase = "updating"
             self.state.current_file = None
             self.state.ffmpeg_progress = None
             self.state.output_size_bytes = 0
+        set_running_requested(self.config, False)
 
     def perform_update(self, server: ThreadingHTTPServer) -> None:
         repo_root = Path(__file__).resolve().parent
@@ -3439,6 +3602,12 @@ class SimpleRipperApp:
                 if stop_after_current:
                     self.reset_runtime_state(clear_errors=False)
                     break
+                if self.process_resume_request():
+                    with self._lock:
+                        if self.state.force_stop:
+                            self.reset_runtime_state(clear_errors=True)
+                            break
+                    continue
                 log_event(self.config, "scan_start", folders=[str(path) for path in folders])
                 self.set_phase("scanning_inventory")
                 candidates = scan_candidates(folders, self.config)
@@ -3620,6 +3789,10 @@ class SimpleRipperApp:
             if final_errors:
                 rollback_replacement(source, Path(str(final_payload["quarantine_path"])), self.config, final_path)
                 raise VerificationFailedError("Final verification failed after swap", final_errors, final_verification)
+            log_event(self.config, "final_verification_ok", job_id=job_id, source_path=str(source), replacement_path=str(final_path), output_size_bytes=final_path.stat().st_size)
+            self.set_phase("refreshing_jellyfin", source, {"job_id": job_id, "replacement_path": str(final_path), "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "quarantine_path": final_payload["quarantine_path"], **recovery_context})
+            jellyfin_refresh = refresh_jellyfin(self.config, source, final_path)
+            log_event(self.config, "jellyfin_refresh", job_id=job_id, source_path=str(source), status=jellyfin_refresh.get("status"), item_id=jellyfin_refresh.get("item_id"))
             quarantine_cleanup = finalize_quarantined_original(Path(str(final_payload["quarantine_path"])), self.config)
             final_payload.update(quarantine_cleanup)
             write_json(metadata_dir / "final.ffprobe.json", {"probe": final_probe, "metadata": final_meta})
@@ -3633,10 +3806,6 @@ class SimpleRipperApp:
             write_history_index(self.config, final_path, replacement_history_payload)
             write_shared_worker_history(self.config, final_path, replacement_history_payload)
             update_cache_job_success(self.config, source, final_path)
-            log_event(self.config, "final_verification_ok", job_id=job_id, source_path=str(source), replacement_path=str(final_path), output_size_bytes=final_path.stat().st_size)
-            self.set_phase("refreshing_jellyfin", source, {"job_id": job_id, "replacement_path": str(final_path), "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "quarantine_path": final_payload["quarantine_path"], **recovery_context})
-            jellyfin_refresh = refresh_jellyfin(self.config, source, final_path)
-            log_event(self.config, "jellyfin_refresh", job_id=job_id, source_path=str(source), status=jellyfin_refresh.get("status"), item_id=jellyfin_refresh.get("item_id"))
             summary_fields = history_summary_fields(source_meta, final_meta, final_verification, jellyfin_refresh)
             job_summary.update({"status": "done", "finished_at": utc_now(), "source": source_meta, "output": final_meta, "verification": final_verification, "local_verification": verification, "nas_temp_verification": temp_verification, "track_policy": stream_policy, **summary_fields, **final_payload})
             append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
