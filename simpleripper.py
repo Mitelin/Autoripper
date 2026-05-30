@@ -73,6 +73,45 @@ def load_config(path: Path) -> dict[str, Any]:
     return data
 
 
+def extract_cli_cpu_percent_option(argv: list[str] | None) -> tuple[list[str], int | None]:
+    normalized = list(sys.argv[1:] if argv is None else argv)
+    cpu_percent: int | None = None
+    filtered: list[str] = []
+    for argument in normalized:
+        match = re.fullmatch(r"--cpu(\d{1,3})%", argument)
+        if not match:
+            filtered.append(argument)
+            continue
+        if cpu_percent is not None:
+            raise ValueError("Only one --cpuNN% option can be used at a time")
+        cpu_percent = int(match.group(1))
+    return filtered, cpu_percent
+
+
+def resolve_ffmpeg_thread_limit(core_limit: Any = None, cpu_percent: Any = None, cpu_total: int | None = None) -> int | None:
+    resolved_total = max(1, int(cpu_total or os.cpu_count() or 1))
+    resolved_core_limit = int(core_limit) if core_limit is not None else None
+    resolved_cpu_percent = int(cpu_percent) if cpu_percent is not None else None
+    if resolved_core_limit is not None and resolved_cpu_percent is not None:
+        raise ValueError("Use either --core N or --cpuNN%, not both")
+    if resolved_core_limit is not None:
+        if resolved_core_limit < 1:
+            raise ValueError("--core must be at least 1")
+        return min(resolved_core_limit, resolved_total)
+    if resolved_cpu_percent is not None:
+        if resolved_cpu_percent < 1 or resolved_cpu_percent > 100:
+            raise ValueError("--cpuNN% must be between 1% and 100%")
+        return min(resolved_total, max(1, (resolved_total * resolved_cpu_percent) // 100))
+    return None
+
+
+def apply_cli_ffmpeg_thread_limit(config: dict[str, Any], core_limit: Any = None, cpu_percent: Any = None) -> None:
+    thread_limit = resolve_ffmpeg_thread_limit(core_limit=core_limit, cpu_percent=cpu_percent)
+    if thread_limit is None:
+        return
+    config["__ffmpeg_thread_limit"] = thread_limit
+
+
 def save_config(config: dict[str, Any]) -> None:
     config_path = Path(str(config.get("__config_path") or "")).resolve() if config.get("__config_path") else None
     if not config_path:
@@ -88,6 +127,15 @@ def write_json(path: Path, data: Any) -> None:
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def try_read_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        return read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def append_jsonl(path: Path, data: dict[str, Any]) -> None:
@@ -1080,6 +1128,9 @@ def build_ffmpeg_command(
     if downscale_plan.get("applied") and downscale_plan.get("filter"):
         command.extend(["-vf", str(downscale_plan["filter"])])
     command.extend(["-c:v", str(settings.get("encoder", "libx265")), "-preset", str(settings.get("preset", "medium")), "-crf", str(crf)])
+    thread_limit = resolve_ffmpeg_thread_limit(core_limit=config.get("__ffmpeg_thread_limit"), cpu_total=config.get("__cpu_total"))
+    if thread_limit is not None:
+        command.extend(["-threads", str(thread_limit)])
     if settings.get("pix_fmt"):
         command.extend(["-pix_fmt", str(settings["pix_fmt"])])
     command.extend(["-c:a", str(settings.get("audio", "copy")), "-c:s", str(settings.get("subtitles", "copy")), "-c:t", "copy", "-map_metadata", "0", "-map_chapters", "0", "-metadata", f"encoded_by={APP_NAME}", str(output)])
@@ -2235,6 +2286,49 @@ def summarize_current_state(state: "RuntimeState") -> dict[str, Any]:
     }
 
 
+def merged_runtime_status(config: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(snapshot)
+    current_summary = dict(merged.get("current_summary") or {})
+    current_job = try_read_json(current_job_path(config)) or {}
+    ffmpeg_log = try_read_json(ffmpeg_current_log_path(config)) or {}
+    progress = merged.get("ffmpeg_progress") if isinstance(merged.get("ffmpeg_progress"), dict) else None
+    if not progress:
+        current_job_progress = current_job.get("progress") if isinstance(current_job.get("progress"), dict) else None
+        ffmpeg_log_progress = ffmpeg_log.get("progress") if isinstance(ffmpeg_log.get("progress"), dict) else None
+        progress = current_job_progress or ffmpeg_log_progress
+    current_file = merged.get("current_file") or current_job.get("source_path") or current_summary.get("source_path")
+    current_phase = merged.get("current_phase")
+    if (not current_phase or current_phase == "idle") and (current_job.get("phase") or current_job.get("status")):
+        current_phase = current_job.get("phase") or current_job.get("status")
+    output_size_bytes = merged.get("output_size_bytes")
+    if not output_size_bytes:
+        output_size_bytes = current_job.get("output_size_bytes")
+    duration_seconds = current_summary.get("duration_seconds")
+    if duration_seconds is None:
+        source_metadata = current_job.get("source_metadata") if isinstance(current_job.get("source_metadata"), dict) else {}
+        duration_seconds = to_float(source_metadata.get("duration_seconds"))
+    effective_state = RuntimeState(
+        running=bool(merged.get("running")),
+        stop_after_current=bool(merged.get("stop_after_current")),
+        force_stop=bool(merged.get("force_stop")),
+        test_mode=bool(merged.get("test_mode")),
+        next_scan_at=merged.get("next_scan_at"),
+        current_duration_seconds=duration_seconds,
+        current_file=current_file,
+        current_phase=str(current_phase or "idle"),
+        ffmpeg_progress=progress,
+        output_size_bytes=int(output_size_bytes or 0),
+        last_processed=list(merged.get("last_processed") or []),
+        errors=list(merged.get("errors") or []),
+    )
+    merged["current_file"] = current_file
+    merged["current_phase"] = effective_state.current_phase
+    merged["ffmpeg_progress"] = progress
+    merged["output_size_bytes"] = effective_state.output_size_bytes
+    merged["current_summary"] = summarize_current_state(effective_state)
+    return merged
+
+
 def inspect_candidate(config: dict[str, Any], source: Path, media_type: str) -> dict[str, Any]:
     ok, probe, error = run_ffprobe(source, str((config.get("tools") or {}).get("ffprobe") or "ffprobe"))
     if not ok:
@@ -2921,7 +3015,7 @@ class SimpleRipperApp:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            return {
+            snapshot = {
                 **self.state.snapshot(),
                 "can_update": (not self.state.running and self.state.current_phase == "idle"),
                 "allowed_roots": [str(path) for path in self.roots],
@@ -2934,6 +3028,7 @@ class SimpleRipperApp:
                 "scan_cache": worker_cache_summary(self.config),
                 "recent_log_lines": tail_text_lines(app_log_path(self.config), 60),
             }
+            return merged_runtime_status(self.config, snapshot)
 
     def persist_selected_folders(self, previous_entries: list[dict[str, str]] | None = None) -> None:
         old_entries = list(previous_entries or [])
@@ -3410,10 +3505,10 @@ class SimpleRipperApp:
             current_job_path(self.config).unlink(missing_ok=True)
         return result
 
-    def reset_runtime_state(self, clear_errors: bool = False) -> None:
+    def reset_runtime_state(self, clear_errors: bool = False, preserve_force_stop: bool = False, preserve_stop_after_current: bool = False) -> None:
         with self._lock:
-            self.state.stop_after_current = False
-            self.state.force_stop = False
+            self.state.stop_after_current = self.state.stop_after_current if preserve_stop_after_current else False
+            self.state.force_stop = self.state.force_stop if preserve_force_stop else False
             self.state.next_scan_at = None
             self.state.current_duration_seconds = None
             self.state.current_file = None
@@ -3623,7 +3718,7 @@ class SimpleRipperApp:
                     break
                 if self.process_resume_request():
                     with self._lock:
-                        if self.state.force_stop:
+                        if self.state.force_stop or not self._running_requested:
                             self.reset_runtime_state(clear_errors=True)
                             break
                     continue
@@ -3646,7 +3741,7 @@ class SimpleRipperApp:
                     continue
                 self.process_one(candidate)
                 with self._lock:
-                    if self.state.force_stop:
+                    if self.state.force_stop or not self._running_requested:
                         self.reset_runtime_state(clear_errors=True)
                         break
         except Exception as exc:
@@ -3845,7 +3940,7 @@ class SimpleRipperApp:
             succeeded = True
         except ForceStopRequested:
             log_event(self.config, "force_stop_completed", job_id=job_id, source_path=str(source), phase=self.state.current_phase)
-            self.reset_runtime_state(clear_errors=True)
+            self.reset_runtime_state(clear_errors=True, preserve_force_stop=True)
         except Exception as exc:
             failure_type = "ffmpeg" if isinstance(exc, VerificationFailedError) or isinstance(exc, FfmpegFailedError) or ffmpeg_completed else "job"
             previous_failure_count = 0
@@ -4342,9 +4437,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="simpleripper")
     parser.add_argument("command", choices=["web", "check-config", "rebuild-index", "cache-summary", "clear-failures", "clear-cache", "clear-folder-cache", "clear-file-cache", "clear-candidate-queue"])
     parser.add_argument("--config", required=True, type=Path)
-    args = parser.parse_args(argv)
+    parser.add_argument("--core", type=int)
+    try:
+        normalized_argv, cpu_percent = extract_cli_cpu_percent_option(argv)
+    except ValueError as exc:
+        parser.error(str(exc))
+    args = parser.parse_args(normalized_argv)
     try:
         config = load_config(args.config)
+        config["__cpu_total"] = max(1, int(os.cpu_count() or 1))
+        apply_cli_ffmpeg_thread_limit(config, core_limit=args.core, cpu_percent=cpu_percent)
         if args.command == "check-config":
             print(json.dumps({"ok": True, "config": str(args.config), "roots": (config.get("libraries") or {}).get("roots") or []}, indent=2))
             return 0

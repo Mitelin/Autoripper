@@ -503,6 +503,30 @@ class SimpleRipperTests(unittest.TestCase):
                 self.assertEqual(simpleripper.main(["clear-cache", "--config", str(config_path)]), 0)
             self.assertTrue(simpleripper.worker_cache_path(config).exists())
 
+    def test_main_accepts_core_override_for_web_command(self) -> None:
+        config = self.make_config(Path("."))
+
+        with patch("simpleripper.load_config", return_value=config), patch("simpleripper.run_server") as mocked_run_server:
+            self.assertEqual(simpleripper.main(["web", "--config", "config.yaml", "--core", "6"]), 0)
+
+        forwarded_config = mocked_run_server.call_args.args[0]
+        self.assertEqual(forwarded_config["__ffmpeg_thread_limit"], 6)
+
+    def test_main_accepts_cpu_percent_override_for_web_command(self) -> None:
+        config = self.make_config(Path("."))
+
+        with patch("simpleripper.load_config", return_value=config), patch("simpleripper.os.cpu_count", return_value=12), patch("simpleripper.run_server") as mocked_run_server:
+            self.assertEqual(simpleripper.main(["web", "--config", "config.yaml", "--cpu50%"]), 0)
+
+        forwarded_config = mocked_run_server.call_args.args[0]
+        self.assertEqual(forwarded_config["__ffmpeg_thread_limit"], 6)
+
+    def test_main_rejects_multiple_cpu_percent_overrides(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            simpleripper.main(["web", "--config", "config.yaml", "--cpu50%", "--cpu60%"])
+
+        self.assertEqual(raised.exception.code, 2)
+
     def test_worker_cache_reuses_initialized_schema_under_concurrency(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -793,13 +817,14 @@ class SimpleRipperTests(unittest.TestCase):
             source = root / "library" / "movie.mkv"
             source.parent.mkdir(parents=True)
             source.write_bytes(b"x" * 1024)
+            app.state.force_stop = True
 
             with patch("simpleripper.copy_file_interruptible", side_effect=simpleripper.ForceStopRequested("force stop requested")):
                 app.process_one(source)
 
             status = app.status()
             self.assertEqual(status["current_phase"], "idle")
-            self.assertFalse(status["force_stop"])
+            self.assertTrue(status["force_stop"])
             self.assertEqual(status["errors"], [])
             self.assertFalse(simpleripper.current_job_path(config).exists())
             self.assertFalse((Path(config["paths"]["local_work_dir"]) / "current").exists())
@@ -846,12 +871,35 @@ class SimpleRipperTests(unittest.TestCase):
 
             status = app.status()
             self.assertEqual(status["current_phase"], "idle")
-            self.assertFalse(status["force_stop"])
+            self.assertTrue(status["force_stop"])
             self.assertEqual(status["errors"], [])
             self.assertFalse(simpleripper.current_job_path(config).exists())
             self.assertFalse((Path(config["paths"]["local_work_dir"]) / "current").exists())
             self.assertFalse(Path(config["paths"]["inspection_dir"]).exists())
             self.assertFalse(simpleripper.temp_upload_path(simpleripper.target_output_path(source)).exists())
+
+    def test_run_loop_stops_after_force_stop_from_process_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 1024)
+            app.state.running = True
+
+            def fake_copy(_source: Path, _destination: Path, _should_stop: object, chunk_size: int = 8 * 1024 * 1024) -> None:
+                app._running_requested = False
+                app.state.force_stop = True
+                raise simpleripper.ForceStopRequested("force stop requested")
+
+            with patch("simpleripper.scan_candidates", side_effect=[[source], []]) as scan_candidates_mock, patch.object(app, "pick_next_candidate", return_value=source), patch("simpleripper.copy_file_interruptible", side_effect=fake_copy), patch.object(app, "schedule_rescan_wait", return_value=False) as wait_mock:
+                app._run_loop()
+
+            self.assertEqual(scan_candidates_mock.call_count, 1)
+            wait_mock.assert_not_called()
+            self.assertFalse(app.state.running)
+            self.assertFalse(app.state.force_stop)
 
     def test_force_stop_persists_idle_intent_in_runtime_control(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1015,6 +1063,66 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(status["last_result"]["bytes_saved"], 600)
             self.assertEqual(status["last_result"]["warning"], "warn")
             self.assertEqual(status["last_result"]["jellyfin_status"], "ok")
+
+    def test_status_restores_current_job_details_from_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "Movie" / "movie.mkv"
+
+            app.state.running = True
+            app.state.current_phase = "encoding"
+            simpleripper.write_json(
+                simpleripper.current_job_path(config),
+                {
+                    "phase": "encoding",
+                    "source_path": str(source),
+                    "output_size_bytes": 654321,
+                    "source_metadata": {"duration_seconds": 2400},
+                    "progress": {"out_time": "00:10:00.00", "fps": "24", "speed": "1.2x"},
+                },
+            )
+
+            status = app.status()
+
+            self.assertEqual(status["current_summary"]["source_path"], str(source))
+            self.assertEqual(status["current_summary"]["progress_time"], "00:10:00.00")
+            self.assertEqual(status["current_summary"]["progress_percent"], 25.0)
+            self.assertEqual(status["current_summary"]["progress_speed"], "1.2x")
+            self.assertEqual(status["current_summary"]["output_size_bytes"], 654321)
+
+    def test_status_falls_back_to_ffmpeg_progress_log_when_current_job_has_no_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "Movie" / "movie.mkv"
+
+            app.state.running = True
+            app.state.current_phase = "encoding"
+            simpleripper.write_json(
+                simpleripper.current_job_path(config),
+                {
+                    "phase": "encoding",
+                    "source_path": str(source),
+                    "source_metadata": {"duration_seconds": 3000},
+                },
+            )
+            simpleripper.write_json(
+                simpleripper.ffmpeg_current_log_path(config),
+                {
+                    "source_path": str(source),
+                    "progress": {"out_time": "00:15:00.00", "fps": "30", "speed": "0.9x"},
+                },
+            )
+
+            status = app.status()
+
+            self.assertEqual(status["current_summary"]["progress_time"], "00:15:00.00")
+            self.assertEqual(status["current_summary"]["progress_percent"], 30.0)
+            self.assertEqual(status["current_summary"]["progress_fps"], "30")
+            self.assertEqual(status["current_summary"]["progress_speed"], "0.9x")
 
     def test_status_allows_update_only_when_idle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1456,6 +1564,21 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("-progress", command)
         self.assertIn("pipe:1", command)
         self.assertIn("-nostats", command)
+
+    def test_build_ffmpeg_command_adds_thread_limit_when_configured(self) -> None:
+        config = self.make_config(Path("."))
+        config["__ffmpeg_thread_limit"] = 6
+
+        command = simpleripper.build_ffmpeg_command(
+            config,
+            Path("input.mkv"),
+            Path("output.mkv"),
+            {"media_type": "default"},
+            {"map_arguments": ["-map", "0"]},
+        )
+
+        self.assertIn("-threads", command)
+        self.assertEqual(command[command.index("-threads") + 1], "6")
 
     def test_downscale_settings_applies_for_4k_series(self) -> None:
         config = self.make_config(Path("."))

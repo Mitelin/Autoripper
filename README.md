@@ -169,6 +169,8 @@ Important sections:
 ```powershell
 python simpleripper.py check-config --config config.yaml
 python simpleripper.py web --config config.yaml
+python simpleripper.py web --config config.yaml --core 6
+python simpleripper.py web --config config.yaml --cpu50%
 python simpleripper.py rebuild-index --config config.yaml
 python simpleripper.py cache-summary --config config.yaml
 python simpleripper.py clear-failures --config config.yaml
@@ -181,7 +183,7 @@ python simpleripper.py clear-candidate-queue --config config.yaml
 Command summary:
 
 - `check-config`: load the config and print a minimal OK payload
-- `web`: start the local web UI and worker controller
+- `web`: start the local web UI and worker controller; `--core N` caps ffmpeg thread usage to N cores and `--cpuNN%` caps it to that share of the available CPU threads
 - `rebuild-index`: force a fresh fast inventory over selected folders or roots
 - `cache-summary`: print the current cache summary
 - `clear-failures`: reset cached file failures and cooldowns
