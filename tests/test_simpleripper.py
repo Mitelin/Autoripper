@@ -2050,6 +2050,86 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(result["candidate_reason"], "hevc_oversized")
             self.assertTrue(result["retention_size_policy"]["oversized"])
 
+    def test_skip_reason_under_retention_limit_overrides_profile_mismatch_when_enabled(self) -> None:
+        config = self.make_config(Path("."))
+        config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}, "anime": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+        metadata = {
+            "media_type": "anime",
+            "video_codec": "h264",
+            "video_pix_fmt": "yuv420p",
+            "video_height": 1080,
+            "is_hdr": False,
+            "duration_seconds": 7752,
+            "file_size_bytes": 1960 * 1024 * 1024,
+            "audio_stream_count": 1,
+            "subtitle_stream_count": 0,
+            "audio_streams": [{"index": 1, "codec": "aac", "language": "eng", "title": "English"}],
+            "subtitle_streams": [],
+        }
+        track_policy = simpleripper.select_streams(config, metadata)
+
+        matches, reasons = simpleripper.source_matches_target_profile(config, metadata, "anime", track_policy)
+        reason = simpleripper.skip_reason(config, metadata, track_policy)
+        retention = simpleripper.retention_size_policy_evaluation(config, metadata, "anime")
+
+        self.assertFalse(matches)
+        self.assertIn("video_codec_mismatch:h264!=h265,hevc", reasons)
+        self.assertIn("pix_fmt_mismatch:yuv420p!=yuv420p10le", reasons)
+        self.assertFalse(retention["oversized"])
+        self.assertEqual(retention["actual_mb"], 1960.0)
+        self.assertEqual(retention["limit_mb"], 2584.0)
+        self.assertEqual(reason, "under_retention_size_limit")
+
+    def test_skip_reason_profile_mismatch_stays_usable_when_retention_disabled(self) -> None:
+        config = self.make_config(Path("."))
+        config["retention_size_policy"]["enabled"] = False
+        config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}, "anime": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+        metadata = {
+            "media_type": "anime",
+            "video_codec": "h264",
+            "video_pix_fmt": "yuv420p",
+            "video_height": 1080,
+            "is_hdr": False,
+            "duration_seconds": 7752,
+            "file_size_bytes": 1960 * 1024 * 1024,
+            "audio_stream_count": 1,
+            "subtitle_stream_count": 0,
+            "audio_streams": [{"index": 1, "codec": "aac", "language": "eng", "title": "English"}],
+            "subtitle_streams": [],
+        }
+        track_policy = simpleripper.select_streams(config, metadata)
+
+        self.assertIsNone(simpleripper.skip_reason(config, metadata, track_policy))
+
+    def test_pick_next_candidate_logs_under_retention_limit_skip_with_profile_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "Bleach" / "episode.mkv"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(b"x" * 20)
+
+            details = {
+                "path": source,
+                "status": "ok",
+                "metadata": {"file_size_bytes": source.stat().st_size, "video_codec": "h264"},
+                "score": 0.0,
+                "skip_reason": "under_retention_size_limit",
+                "candidate_reason": "under_retention_size_limit",
+                "profile_mismatch_reasons": ["video_codec_mismatch:h264!=h265,hevc", "pix_fmt_mismatch:yuv420p!=yuv420p10le"],
+                "retention_size_policy": {"enabled": True, "oversized": False, "actual_mb": 1960.0, "limit_mb": 2584.0},
+            }
+
+            with patch("simpleripper.inspect_candidate", return_value=details):
+                selected = app.pick_next_candidate([source])
+
+            self.assertIsNone(selected)
+            joined = "\n".join(simpleripper.tail_text_lines(simpleripper.app_log_path(config), 20))
+            self.assertIn("candidate_skip_under_retention_limit", joined)
+            self.assertIn("skip_profile_mismatch_because_under_limit", joined)
+            self.assertIn("video_codec_mismatch:h264!=h265,hevc", joined)
+
     def test_history_summary_fields_flattens_before_after_values(self) -> None:
         source_meta = {"file_size_bytes": 1000, "video_codec": "h264", "audio_stream_count": 2, "subtitle_stream_count": 1}
         output_meta = {"file_size_bytes": 400, "video_codec": "hevc", "audio_stream_count": 1, "subtitle_stream_count": 1}

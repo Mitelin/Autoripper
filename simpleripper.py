@@ -2247,13 +2247,17 @@ def inspect_candidate(config: dict[str, Any], source: Path, media_type: str) -> 
     if should_reprocess_hevc(config, metadata):
         score += 35.0
     codec = str(metadata.get("video_codec") or "").lower()
+    retention_enabled = bool(retention_size_policy.get("enabled"))
+    oversized = bool(retention_size_policy.get("oversized"))
     candidate_reason = None
-    if retention_size_policy.get("oversized") and codec in {"hevc", "h265"}:
+    if retention_enabled and oversized and codec in {"hevc", "h265"}:
         candidate_reason = "hevc_oversized"
         score += 40.0
-    elif retention_size_policy.get("oversized") and codec == "av1":
+    elif retention_enabled and oversized and codec == "av1":
         candidate_reason = "av1_oversized"
         score += 40.0
+    elif retention_enabled and not oversized and profile_mismatch_reasons:
+        candidate_reason = "under_retention_size_limit"
     elif codec in {"hevc", "h265"} and not profile_matches:
         candidate_reason = "hevc_not_normalized"
     elif codec == "av1" and not profile_matches:
@@ -2279,8 +2283,10 @@ def skip_reason(config: dict[str, Any], metadata: dict[str, Any], track_policy_r
         return "skip_4k"
     if rules.get("skip_hdr", True) and metadata.get("is_hdr") and not oversized_reprocess:
         return "skip_hdr"
-    profile_matches, _profile_mismatch_reasons = source_matches_target_profile(config, metadata, media_type, track_policy_result)
+    profile_matches, profile_mismatch_reasons = source_matches_target_profile(config, metadata, media_type, track_policy_result)
     oversized = bool(retention_size_policy.get("oversized"))
+    if retention_size_policy.get("enabled") and not oversized and profile_mismatch_reasons:
+        return "under_retention_size_limit"
     if rules.get("skip_hevc", True) and codec in {"hevc", "h265"} and profile_matches and not oversized:
         return "already_hevc"
     if rules.get("skip_av1", True) and codec == "av1" and profile_matches and not oversized:
@@ -3579,6 +3585,15 @@ class SimpleRipperApp:
                 log_event(self.config, "candidate_probe_failed", source_path=str(candidate), error=details.get("error"))
                 continue
             if details.get("skip_reason"):
+                if details.get("skip_reason") == "under_retention_size_limit" and details.get("profile_mismatch_reasons"):
+                    log_event(
+                        self.config,
+                        "candidate_skip_under_retention_limit",
+                        source_path=str(candidate),
+                        reasons=details.get("profile_mismatch_reasons"),
+                        retention_size_policy=details.get("retention_size_policy"),
+                        decision="skip_profile_mismatch_because_under_limit",
+                    )
                 log_event(self.config, "candidate_scan_skipped", source_path=str(candidate), reason=details.get("skip_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"), retention_size_policy=details.get("retention_size_policy"))
                 continue
             log_event(self.config, "candidate_ready", source_path=str(details["path"]), score=details.get("score"), codec=(details.get("metadata") or {}).get("video_codec"), candidate_reason=details.get("candidate_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"), retention_size_policy=details.get("retention_size_policy"))
@@ -3702,6 +3717,16 @@ class SimpleRipperApp:
                     self.config,
                     {"path": source, "status": "ok", "metadata": source_meta, "skip_reason": reason, "score": candidate_priority_score(source_meta), "retention_size_policy": retention_size_policy},
                 )
+                if reason == "under_retention_size_limit" and profile_mismatch_reasons:
+                    log_event(
+                        self.config,
+                        "candidate_skip_under_retention_limit",
+                        job_id=job_id,
+                        source_path=str(source),
+                        reasons=profile_mismatch_reasons,
+                        retention_size_policy=retention_size_policy,
+                        decision="skip_profile_mismatch_because_under_limit",
+                    )
                 log_event(self.config, "candidate_skipped", job_id=job_id, source_path=str(source), reason=reason, profile_mismatch_reasons=profile_mismatch_reasons, retention_size_policy=retention_size_policy)
                 with self._lock:
                     self.state.last_processed = ([{"source_path": str(source), "finished_at": utc_now(), "status": "skipped", "reason": reason}] + (self.state.last_processed or []))[:20]
