@@ -156,16 +156,17 @@ def resume_request_path(config: dict[str, Any]) -> Path:
 def load_runtime_control(config: dict[str, Any]) -> dict[str, Any]:
     path = runtime_control_path(config)
     if not path.exists():
-        return {"running_requested": False}
+        return {"running_requested": False, "stop_reason": None}
     try:
         payload = read_json(path)
     except (OSError, json.JSONDecodeError):
-        return {"running_requested": False}
-    return {"running_requested": bool(payload.get("running_requested", False))}
+        return {"running_requested": False, "stop_reason": None}
+    stop_reason = str(payload.get("stop_reason") or "").strip() or None
+    return {"running_requested": bool(payload.get("running_requested", False)), "stop_reason": stop_reason}
 
 
-def set_running_requested(config: dict[str, Any], requested: bool) -> None:
-    write_json(runtime_control_path(config), {"running_requested": bool(requested), "updated_at": utc_now()})
+def set_running_requested(config: dict[str, Any], requested: bool, stop_reason: str | None = None) -> None:
+    write_json(runtime_control_path(config), {"running_requested": bool(requested), "stop_reason": stop_reason, "updated_at": utc_now()})
 
 
 def load_resume_request(config: dict[str, Any]) -> dict[str, Any] | None:
@@ -2752,6 +2753,8 @@ def recover_runtime_state(config: dict[str, Any]) -> None:
     path = current_job_path(config)
     if not path.exists():
         return
+    runtime_control = load_runtime_control(config)
+    stop_reason = str(runtime_control.get("stop_reason") or "").strip() or None
     try:
         payload = read_json(path)
     except (OSError, json.JSONDecodeError):
@@ -2832,7 +2835,7 @@ def recover_runtime_state(config: dict[str, Any]) -> None:
         current_job_exists=path.exists(),
     )
     if recovered_status:
-        if source_path and phase in incomplete_phases and source_path.exists():
+        if source_path and phase in incomplete_phases and source_path.exists() and stop_reason != "force_stop":
             write_resume_request(config, source_path, phase, job_id)
             recovery_details["resume_requested"] = True
             log_event(
@@ -2852,7 +2855,7 @@ def recover_runtime_state(config: dict[str, Any]) -> None:
                 source_path=str(source_path),
                 phase=phase,
                 recovery_status=recovered_status,
-                reason="missing_source",
+                reason="user_force_stop_requested" if stop_reason == "force_stop" and source_path.exists() else "missing_source",
             )
         event = {"job_id": payload.get("job_id"), "source_path": str(source_path) if source_path else None, "status": recovered_status, "recovered_at": utc_now(), "previous_phase": phase, **recovery_details}
         append_jsonl(history_dir(config) / "jobs.jsonl", event)
@@ -3462,14 +3465,14 @@ class SimpleRipperApp:
             self.state.force_stop = False
             self._thread = threading.Thread(target=self._run_loop, name="simpleripper-worker", daemon=True)
             self._thread.start()
-        set_running_requested(self.config, True)
+        set_running_requested(self.config, True, stop_reason=None)
         log_event(self.config, "loop_start_requested", reason=reason)
 
     def stop_after_current(self) -> None:
         with self._lock:
             self._running_requested = False
             self.state.stop_after_current = True
-        set_running_requested(self.config, False)
+        set_running_requested(self.config, False, stop_reason="stop_after_current")
         log_event(self.config, "stop_after_current_requested")
 
     def force_stop(self) -> None:
@@ -3477,7 +3480,8 @@ class SimpleRipperApp:
             self._running_requested = False
             self.state.force_stop = True
             process = self._ffmpeg
-        set_running_requested(self.config, False)
+        clear_resume_request(self.config)
+        set_running_requested(self.config, False, stop_reason="force_stop")
         log_event(self.config, "force_stop_requested", ffmpeg_pid=(process.pid if process else None))
         if process and process.poll() is None:
             terminate_process_gracefully(process)
@@ -3502,7 +3506,7 @@ class SimpleRipperApp:
             self.state.current_file = None
             self.state.ffmpeg_progress = None
             self.state.output_size_bytes = 0
-        set_running_requested(self.config, False)
+        set_running_requested(self.config, False, stop_reason="update")
 
     def perform_update(self, server: ThreadingHTTPServer) -> None:
         repo_root = Path(__file__).resolve().parent

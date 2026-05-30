@@ -853,6 +853,55 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertFalse(Path(config["paths"]["inspection_dir"]).exists())
             self.assertFalse(simpleripper.temp_upload_path(simpleripper.target_output_path(source)).exists())
 
+    def test_force_stop_persists_idle_intent_in_runtime_control(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+
+            app.force_stop()
+
+            runtime_control = simpleripper.load_runtime_control(config)
+            self.assertFalse(runtime_control["running_requested"])
+            self.assertEqual(runtime_control["stop_reason"], "force_stop")
+            self.assertFalse(simpleripper.resume_request_path(config).exists())
+
+    def test_recover_runtime_state_does_not_resume_after_force_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_text("source", encoding="utf-8")
+            local_output = root / "work" / "current" / "output" / "movie.mkv"
+            local_output.parent.mkdir(parents=True)
+            local_output.write_text("partial", encoding="utf-8")
+            simpleripper.set_running_requested(config, False, stop_reason="force_stop")
+            simpleripper.write_json(
+                simpleripper.current_job_path(config),
+                {
+                    "job_id": "job-force-stop",
+                    "phase": "encoding",
+                    "source_path": str(source),
+                    "local_output_path": str(local_output),
+                    "ffmpeg_pid": 999999,
+                },
+            )
+
+            with patch("simpleripper.is_local_pid_running", return_value=False):
+                simpleripper.recover_runtime_state(config)
+
+            self.assertIsNone(simpleripper.load_resume_request(config))
+            joined = "\n".join(simpleripper.tail_text_lines(simpleripper.app_log_path(config), 20))
+            self.assertIn("crash_recovery_rerun_skipped", joined)
+            self.assertIn("user_force_stop_requested", joined)
+
+            with patch.object(simpleripper.SimpleRipperApp, "start", autospec=True) as start_mock:
+                app = simpleripper.SimpleRipperApp(config)
+
+            self.assertFalse(app.status()["running"])
+            start_mock.assert_not_called()
+
     def test_run_loop_waits_one_hour_when_no_usable_job_is_found(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1857,7 +1906,7 @@ class SimpleRipperTests(unittest.TestCase):
     def test_skip_reason_flags_already_simpleripper(self) -> None:
         self.assertEqual(simpleripper.skip_reason({}, {"encoded_by": "SimpleRipper"}), "already_simpleripper")
 
-    def test_hevc_source_with_wrong_pix_fmt_and_extra_audio_is_not_skipped(self) -> None:
+    def test_hevc_source_with_wrong_pix_fmt_and_extra_audio_is_skipped_under_retention_limit(self) -> None:
         config = self.make_config(Path("."))
         config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}, "series": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
         config["skip_rules"] = {"skip_hevc": True, "skip_4k": True, "skip_hdr": True}
@@ -1884,7 +1933,7 @@ class SimpleRipperTests(unittest.TestCase):
         matches, reasons = simpleripper.source_matches_target_profile(config, metadata, "series", track_policy)
 
         self.assertFalse(matches)
-        self.assertIsNone(simpleripper.skip_reason(config, metadata, track_policy))
+        self.assertEqual(simpleripper.skip_reason(config, metadata, track_policy), "under_retention_size_limit")
         self.assertIn("pix_fmt_mismatch:yuv420p!=yuv420p10le", reasons)
         self.assertIn("audio_policy_mismatch:extra_eng_audio", reasons)
 
@@ -1997,7 +2046,7 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIsNone(simpleripper.skip_reason(config, metadata, track_policy))
         self.assertIn("retention_size_exceeded:700.0MB>500.0MB", reasons)
 
-    def test_inspect_candidate_marks_hevc_not_normalized_as_usable(self) -> None:
+    def test_inspect_candidate_marks_under_limit_hevc_mismatch_as_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self.make_config(root)
@@ -2020,8 +2069,8 @@ class SimpleRipperTests(unittest.TestCase):
                 result = simpleripper.inspect_candidate(config, source, "series")
 
             self.assertEqual(result["status"], "ok")
-            self.assertIsNone(result["skip_reason"])
-            self.assertEqual(result["candidate_reason"], "hevc_not_normalized")
+            self.assertEqual(result["skip_reason"], "under_retention_size_limit")
+            self.assertEqual(result["candidate_reason"], "under_retention_size_limit")
             self.assertIn("pix_fmt_mismatch:yuv420p!=yuv420p10le", result["profile_mismatch_reasons"])
 
     def test_inspect_candidate_marks_oversized_hevc_as_usable(self) -> None:
