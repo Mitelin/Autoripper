@@ -100,10 +100,22 @@ retention_size_policy:
 
 track_policy:
   enabled: true
-  target_audio_languages:
-    - cze
-  drop_other_audio_if_target_found: true
-  keep_subtitles: true
+  global:
+    copy_selected_subtitles: true
+  anime:
+    target_audio_languages:
+      - eng
+    drop_other_audio_if_target_found: true
+  series:
+    target_audio_languages:
+      - cze
+    drop_other_audio_if_target_found: true
+  movie:
+    target_audio_languages:
+      - cze
+    drop_other_audio_if_target_found: true
+  unknown:
+    cleanup_enabled: false
 
 skip_rules:
   skip_hevc: true

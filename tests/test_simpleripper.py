@@ -1537,6 +1537,7 @@ class SimpleRipperTests(unittest.TestCase):
 
     def test_track_policy_selects_target_audio(self) -> None:
         source = {
+            "media_type": "series",
             "audio_stream_count": 2,
             "subtitle_stream_count": 1,
             "audio_streams": [
@@ -1551,6 +1552,90 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertEqual(result["expected_audio_stream_count"], 1)
         self.assertIn("0:2", result["map_arguments"])
         self.assertNotIn("0:1", result["map_arguments"])
+
+    def test_track_policy_uses_legacy_media_type_config_for_anime(self) -> None:
+        source = {
+            "media_type": "anime",
+            "audio_stream_count": 2,
+            "subtitle_stream_count": 1,
+            "audio_streams": [
+                {"index": 1, "language": "eng", "title": "English"},
+                {"index": 2, "language": "cze", "title": "Czech"},
+            ],
+            "subtitle_streams": [{"index": 3, "language": "eng", "title": "English"}],
+        }
+
+        result = simpleripper.select_streams(
+            {
+                "track_policy": {
+                    "enabled": True,
+                    "global": {"copy_selected_subtitles": True},
+                    "anime": {"target_audio_languages": ["eng"], "drop_other_audio_if_target_found": True},
+                    "series": {"target_audio_languages": ["cze"], "drop_other_audio_if_target_found": True},
+                    "movie": {"target_audio_languages": ["cze"], "drop_other_audio_if_target_found": True},
+                    "unknown": {"cleanup_enabled": False},
+                }
+            },
+            source,
+        )
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["expected_audio_stream_count"], 1)
+        self.assertIn("0:1", result["map_arguments"])
+        self.assertNotIn("0:2", result["map_arguments"])
+        self.assertIn("0:s?", result["map_arguments"])
+
+    def test_track_policy_uses_legacy_unknown_cleanup_disabled(self) -> None:
+        source = {
+            "media_type": "unknown",
+            "audio_stream_count": 2,
+            "subtitle_stream_count": 0,
+            "audio_streams": [
+                {"index": 1, "language": "eng", "title": "English"},
+                {"index": 2, "language": "cze", "title": "Czech"},
+            ],
+        }
+
+        result = simpleripper.select_streams(
+            {
+                "track_policy": {
+                    "enabled": True,
+                    "anime": {"target_audio_languages": ["eng"], "drop_other_audio_if_target_found": True},
+                    "unknown": {"cleanup_enabled": False},
+                }
+            },
+            source,
+        )
+
+        self.assertFalse(result["applied"])
+        self.assertEqual(result["expected_audio_stream_count"], 2)
+
+    def test_track_policy_keeps_all_streams_when_target_audio_is_not_detected(self) -> None:
+        source = {
+            "media_type": "anime",
+            "audio_stream_count": 2,
+            "subtitle_stream_count": 1,
+            "audio_streams": [
+                {"index": 1, "language": "jpn", "title": "Japanese"},
+                {"index": 2, "language": "und", "title": "Unknown"},
+            ],
+            "subtitle_streams": [{"index": 3, "language": "eng", "title": "English"}],
+        }
+
+        result = simpleripper.select_streams(
+            {
+                "track_policy": {
+                    "enabled": True,
+                    "anime": {"target_audio_languages": ["eng"], "drop_other_audio_if_target_found": True},
+                }
+            },
+            source,
+        )
+
+        self.assertFalse(result["applied"])
+        self.assertEqual(result["map_arguments"], ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"])
+        self.assertEqual(result["expected_audio_stream_count"], 2)
+        self.assertEqual(result["expected_subtitle_stream_count"], 1)
 
     def test_build_ffmpeg_command_enables_progress_pipe(self) -> None:
         command = simpleripper.build_ffmpeg_command(

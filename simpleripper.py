@@ -1021,6 +1021,43 @@ def bitrate_kbps(value: Any) -> int | None:
     return None if number is None else round(number / 1000)
 
 
+def resolved_track_policy(config: dict[str, Any], media_type: str | None) -> dict[str, Any]:
+    policy = config.get("track_policy") or {}
+    raw_media_type = str(media_type or "unknown").strip().lower()
+    normalized_media_type = "unknown" if raw_media_type == "unknown" else media_type_value(media_type)
+    global_policy = policy.get("global") if isinstance(policy.get("global"), dict) else {}
+    media_policy = policy.get(normalized_media_type) if isinstance(policy.get(normalized_media_type), dict) else {}
+    fallback_unknown_policy = policy.get("unknown") if isinstance(policy.get("unknown"), dict) else {}
+    cleanup_enabled = media_policy.get("cleanup_enabled")
+    if cleanup_enabled is None and normalized_media_type == "unknown":
+        cleanup_enabled = fallback_unknown_policy.get("cleanup_enabled")
+    target_audio_languages = media_policy.get("target_audio_languages")
+    if target_audio_languages is None and normalized_media_type == "unknown":
+        target_audio_languages = fallback_unknown_policy.get("target_audio_languages")
+    if target_audio_languages is None:
+        target_audio_languages = policy.get("target_audio_languages")
+    drop_other_audio = media_policy.get("drop_other_audio_if_target_found")
+    if drop_other_audio is None and normalized_media_type == "unknown":
+        drop_other_audio = fallback_unknown_policy.get("drop_other_audio_if_target_found")
+    if drop_other_audio is None:
+        drop_other_audio = policy.get("drop_other_audio_if_target_found", True)
+    keep_subtitles = media_policy.get("keep_subtitles")
+    if keep_subtitles is None and normalized_media_type == "unknown":
+        keep_subtitles = fallback_unknown_policy.get("keep_subtitles")
+    if keep_subtitles is None:
+        keep_subtitles = policy.get("keep_subtitles")
+    if keep_subtitles is None:
+        keep_subtitles = global_policy.get("copy_selected_subtitles", True)
+    return {
+        "enabled": bool(policy.get("enabled", True)),
+        "media_type": normalized_media_type,
+        "cleanup_enabled": True if cleanup_enabled is None else bool(cleanup_enabled),
+        "target_audio_languages": [str(item).strip().lower() for item in (target_audio_languages or []) if str(item).strip()],
+        "drop_other_audio_if_target_found": bool(drop_other_audio),
+        "keep_subtitles": bool(keep_subtitles),
+    }
+
+
 def extract_metadata(path: Path, probe: dict[str, Any], media_type: str = "default") -> dict[str, Any]:
     streams = probe.get("streams") or []
     fmt = probe.get("format") or {}
@@ -1050,9 +1087,9 @@ def extract_metadata(path: Path, probe: dict[str, Any], media_type: str = "defau
 
 
 def select_streams(config: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
-    policy = config.get("track_policy") or {}
+    policy = resolved_track_policy(config, str(source.get("media_type") or "unknown"))
     default_maps = ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]
-    if not policy.get("enabled", True):
+    if not policy.get("enabled", True) or not policy.get("cleanup_enabled", True):
         return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count")}
     target_languages = set(policy.get("target_audio_languages") or ["cze"])
     audio_streams = source.get("audio_streams") or []
@@ -2448,7 +2485,7 @@ def source_matches_target_profile(config: dict[str, Any], source_meta: dict[str,
         expected_audio = int(stream_policy.get("expected_audio_stream_count") or 0)
         actual_audio = int(source_meta.get("audio_stream_count") or 0)
         if actual_audio != expected_audio:
-            target_languages = set((config.get("track_policy") or {}).get("target_audio_languages") or ["cze"])
+            target_languages = set(resolved_track_policy(config, media_type).get("target_audio_languages") or ["cze"])
             extra_languages: list[str] = []
             for stream in source_meta.get("audio_streams") or []:
                 language = detect_language(stream)[0]
