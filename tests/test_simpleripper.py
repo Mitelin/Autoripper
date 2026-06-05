@@ -1449,6 +1449,32 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertTrue(str(quarantine).startswith(str(quarantine_root / "SERIALY" / "Czech" / "Fallout" / "file.mkv")))
 
+    def test_quarantine_leaf_name_keeps_original_name_when_within_limit(self) -> None:
+        leaf = simpleripper.quarantine_leaf_name("file.mkv", 123)
+
+        self.assertEqual(leaf, "file.mkv.123.original")
+
+    def test_quarantine_path_falls_back_to_hashed_leaf_for_long_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            quarantine_root = root / ".simpleripper_quarantine"
+            relative_root = root / "nas-backup"
+            long_name = ("[ToonsHub] HELL MODE The Hardcore Gamer Dominates in Another World with Garbage Balancing " * 3) + ".mkv"
+            source = relative_root / "ANIME" / "Japanese" / "HELL MODE" / long_name
+            source.parent.mkdir(parents=True)
+            config = self.make_config(root)
+            config["paths"]["quarantine_dir"] = str(quarantine_root)
+            config["paths"]["quarantine_relative_root"] = str(relative_root)
+            config["libraries"]["roots"] = [str(relative_root / "ANIME")]
+
+            quarantine = simpleripper.quarantine_path_for_source(source, config)
+
+            self.assertEqual(quarantine.parent, quarantine_root / "ANIME" / "Japanese" / "HELL MODE")
+            self.assertLessEqual(len(quarantine.name.encode("utf-8")), simpleripper.MAX_SAFE_FILENAME_BYTES)
+            self.assertIn(".original", quarantine.name)
+            self.assertNotEqual(quarantine.name, f"{source.name}.original")
+            self.assertRegex(quarantine.name, r"\.[0-9a-f]{16}\.\d+\.original$")
+
     def test_rollback_replacement_restores_quarantined_original(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1636,6 +1662,8 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertEqual(result["map_arguments"], ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"])
         self.assertEqual(result["expected_audio_stream_count"], 2)
         self.assertEqual(result["expected_subtitle_stream_count"], 1)
+        self.assertEqual(result["decision_summary"], "track_policy_no_target_audio_found_fallback_keep_all_audio")
+        self.assertEqual(result["dropped_audio_streams"], [])
 
     def test_build_ffmpeg_command_enables_progress_pipe(self) -> None:
         command = simpleripper.build_ffmpeg_command(
@@ -1664,6 +1692,19 @@ class SimpleRipperTests(unittest.TestCase):
 
         self.assertIn("-threads", command)
         self.assertEqual(command[command.index("-threads") + 1], "6")
+
+    def test_build_ffmpeg_command_does_not_add_thread_limit_by_default(self) -> None:
+        config = self.make_config(Path("."))
+
+        command = simpleripper.build_ffmpeg_command(
+            config,
+            Path("input.mkv"),
+            Path("output.mkv"),
+            {"media_type": "default"},
+            {"map_arguments": ["-map", "0"]},
+        )
+
+        self.assertNotIn("-threads", command)
 
     def test_downscale_settings_applies_for_4k_series(self) -> None:
         config = self.make_config(Path("."))
@@ -2143,7 +2184,87 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertFalse(matches)
         self.assertEqual(simpleripper.skip_reason(config, metadata, track_policy), "under_retention_size_limit")
         self.assertIn("pix_fmt_mismatch:yuv420p!=yuv420p10le", reasons)
-        self.assertIn("audio_policy_mismatch:extra_eng_audio", reasons)
+        self.assertIn("audio_policy_mismatch:target_audio_found_keep_cze_drop_extra_eng", reasons)
+
+    def test_process_one_logs_track_policy_applied_with_selected_and_dropped_streams(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["skip_rules"] = {"skip_hevc": False, "skip_av1": False, "skip_4k": False, "skip_hdr": False, "min_duration_seconds": 0, "min_size_mb": 0}
+            config["retention_size_policy"]["enabled"] = False
+            config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}, "anime": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+            config["track_policy"] = {
+                "enabled": True,
+                "anime": {"target_audio_languages": ["eng"], "drop_other_audio_if_target_found": True},
+                "unknown": {"cleanup_enabled": False},
+            }
+            source = root / "library" / "anime" / "episode.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 4096)
+            app = simpleripper.SimpleRipperApp(config)
+
+            def fake_probe(_test_config: dict, path: Path, media_type: str) -> tuple[dict, dict]:
+                return {}, {
+                    "media_type": "anime",
+                    "duration_seconds": 10.0,
+                    "audio_stream_count": 2,
+                    "subtitle_stream_count": 1,
+                    "video_codec": "hevc",
+                    "video_pix_fmt": "yuv420p10le",
+                    "overall_bitrate_kbps": 1500,
+                    "audio_streams": [
+                        {"index": 1, "codec": "aac", "language": "eng", "title": "English"},
+                        {"index": 2, "codec": "aac", "language": "jpn", "title": "Japanese"},
+                    ],
+                    "subtitle_streams": [{"index": 3, "codec": "subrip", "language": "eng", "title": "English"}],
+                }
+
+            with patch("simpleripper.ffprobe_metadata", side_effect=fake_probe), patch("simpleripper.log_event") as log_mock, patch("simpleripper.subprocess.Popen", side_effect=OSError("stop after audit event")):
+                app.process_one(source)
+
+            event_names = [call.args[1] for call in log_mock.call_args_list if len(call.args) >= 2]
+            self.assertIn("track_policy_applied", event_names)
+            track_policy_call = next(call for call in log_mock.call_args_list if len(call.args) >= 2 and call.args[1] == "track_policy_applied")
+            self.assertEqual(track_policy_call.kwargs["target_audio_languages"], ["eng"])
+            self.assertEqual(track_policy_call.kwargs["selected_audio_streams"], [{"index": 1, "language": "eng", "title": "English", "confidence": "high"}])
+            self.assertEqual(track_policy_call.kwargs["dropped_audio_streams"], [{"index": 2, "language": "jpn", "title": "Japanese", "confidence": "high"}])
+
+    def test_process_one_logs_no_target_audio_fallback_without_dropped_streams(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["skip_rules"] = {"skip_hevc": False, "skip_av1": False, "skip_4k": False, "skip_hdr": False, "min_duration_seconds": 0, "min_size_mb": 0}
+            config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}, "anime": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+            config["track_policy"] = {"enabled": True, "anime": {"target_audio_languages": ["eng"], "drop_other_audio_if_target_found": True}}
+            source = root / "library" / "anime" / "episode.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 4096)
+            app = simpleripper.SimpleRipperApp(config)
+
+            def fake_probe(_test_config: dict, path: Path, media_type: str) -> tuple[dict, dict]:
+                return {}, {
+                    "media_type": "anime",
+                    "duration_seconds": 10.0,
+                    "audio_stream_count": 2,
+                    "subtitle_stream_count": 1,
+                    "video_codec": "hevc",
+                    "video_pix_fmt": "yuv420p10le",
+                    "overall_bitrate_kbps": 1500,
+                    "audio_streams": [
+                        {"index": 1, "codec": "aac", "language": "jpn", "title": "Japanese"},
+                        {"index": 2, "codec": "aac", "language": "und", "title": "Unknown"},
+                    ],
+                    "subtitle_streams": [{"index": 3, "codec": "subrip", "language": "eng", "title": "English"}],
+                }
+
+            with patch("simpleripper.ffprobe_metadata", side_effect=fake_probe), patch("simpleripper.log_event") as log_mock, patch("simpleripper.subprocess.Popen", side_effect=OSError("stop after audit event")):
+                app.process_one(source)
+
+            event_names = [call.args[1] for call in log_mock.call_args_list if len(call.args) >= 2]
+            self.assertIn("track_policy_no_target_audio_found_fallback_keep_all_audio", event_names)
+            track_policy_call = next(call for call in log_mock.call_args_list if len(call.args) >= 2 and call.args[1] == "track_policy_no_target_audio_found_fallback_keep_all_audio")
+            self.assertEqual(track_policy_call.kwargs["target_audio_languages"], ["eng"])
+            self.assertNotIn("dropped_audio_streams", track_policy_call.kwargs)
 
     def test_hevc_source_matching_target_profile_is_skipped_as_normalized(self) -> None:
         config = self.make_config(Path("."))

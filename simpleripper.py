@@ -32,6 +32,7 @@ APP_NAME = "SimpleRipper"
 SCAN_SCOPE_SCHEMA_VERSION = 1
 POLICY_HASH_SCHEMA_VERSION = 2
 WORKER_CACHE_BUSY_TIMEOUT_MS = 30000
+MAX_SAFE_FILENAME_BYTES = 255
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v", ".ts"}
 LANGUAGE_ALIASES = {
     "cze": {"cze", "ces", "cz", "czech", "cestina", "cesky", "cz dabing", "czech dub"},
@@ -876,6 +877,21 @@ def detect_language(stream: dict[str, Any]) -> tuple[str, str]:
     return "und", "low"
 
 
+def describe_audio_stream(stream: dict[str, Any]) -> dict[str, Any]:
+    language, confidence = detect_language(stream)
+    return {
+        "index": stream.get("index"),
+        "language": language,
+        "title": stream.get("title"),
+        "confidence": confidence,
+    }
+
+
+def language_summary_token(streams: list[dict[str, Any]]) -> str:
+    values = sorted({str(item.get("language") or "und").strip().lower() or "und" for item in streams})
+    return "_".join(values) if values else "none"
+
+
 def is_local_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -1089,22 +1105,47 @@ def extract_metadata(path: Path, probe: dict[str, Any], media_type: str = "defau
 def select_streams(config: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
     policy = resolved_track_policy(config, str(source.get("media_type") or "unknown"))
     default_maps = ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]
+    target_languages = sorted(set(policy.get("target_audio_languages") or ["cze"]))
+    fallback_base = {
+        "target_audio_languages": target_languages,
+        "cleanup_enabled": bool(policy.get("cleanup_enabled", True)),
+        "fallback_used": True,
+        "selected_audio_streams": [],
+        "dropped_audio_streams": [],
+    }
     if not policy.get("enabled", True) or not policy.get("cleanup_enabled", True):
-        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count")}
-    target_languages = set(policy.get("target_audio_languages") or ["cze"])
+        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count"), "decision_summary": "track_policy_cleanup_disabled_fallback_keep_all_audio", **fallback_base}
+    target_language_set = set(target_languages)
     audio_streams = source.get("audio_streams") or []
-    target_audio = [stream for stream in audio_streams if detect_language(stream)[0] in target_languages]
-    if not target_audio or len(audio_streams) <= 1 or not policy.get("drop_other_audio_if_target_found", True):
-        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count")}
+    target_audio = [stream for stream in audio_streams if detect_language(stream)[0] in target_language_set]
+    if len(audio_streams) <= 1:
+        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count"), "decision_summary": "track_policy_single_audio_fallback_keep_all_audio", **fallback_base}
+    if not target_audio:
+        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count"), "decision_summary": "track_policy_no_target_audio_found_fallback_keep_all_audio", **fallback_base}
+    if not policy.get("drop_other_audio_if_target_found", True):
+        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count"), "decision_summary": "track_policy_drop_other_audio_disabled_fallback_keep_all_audio", **fallback_base}
     args = ["-map", "0:v:0"]
     for stream in target_audio:
         args.extend(["-map", f"0:{stream['index']}"])
+    selected_audio_streams = [describe_audio_stream(stream) for stream in target_audio]
+    dropped_audio_streams = [describe_audio_stream(stream) for stream in audio_streams if stream not in target_audio]
     expected_subtitle_count = 0
     if policy.get("keep_subtitles", True):
         args.extend(["-map", "0:s?"])
         expected_subtitle_count = source.get("subtitle_stream_count")
     args.extend(["-map", "0:t?"])
-    return {"applied": True, "map_arguments": args, "expected_audio_stream_count": len(target_audio), "expected_subtitle_stream_count": expected_subtitle_count}
+    return {
+        "applied": True,
+        "map_arguments": args,
+        "expected_audio_stream_count": len(target_audio),
+        "expected_subtitle_stream_count": expected_subtitle_count,
+        "target_audio_languages": target_languages,
+        "cleanup_enabled": bool(policy.get("cleanup_enabled", True)),
+        "fallback_used": False,
+        "selected_audio_streams": selected_audio_streams,
+        "dropped_audio_streams": dropped_audio_streams,
+        "decision_summary": f"track_policy_applied_keep_{language_summary_token(selected_audio_streams)}_drop_extra_{language_summary_token(dropped_audio_streams)}",
+    }
 
 
 def downscale_settings(config: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
@@ -2485,15 +2526,14 @@ def source_matches_target_profile(config: dict[str, Any], source_meta: dict[str,
         expected_audio = int(stream_policy.get("expected_audio_stream_count") or 0)
         actual_audio = int(source_meta.get("audio_stream_count") or 0)
         if actual_audio != expected_audio:
-            target_languages = set(resolved_track_policy(config, media_type).get("target_audio_languages") or ["cze"])
-            extra_languages: list[str] = []
-            for stream in source_meta.get("audio_streams") or []:
-                language = detect_language(stream)[0]
-                if language not in target_languages:
-                    extra_languages.append(language)
-            if extra_languages:
-                for language in sorted(set(extra_languages)):
-                    reasons.append(f"audio_policy_mismatch:extra_{language}_audio")
+            selected_audio_streams = list(stream_policy.get("selected_audio_streams") or [])
+            dropped_audio_streams = list(stream_policy.get("dropped_audio_streams") or [])
+            if dropped_audio_streams:
+                reasons.append(
+                    "audio_policy_mismatch:"
+                    f"target_audio_found_keep_{language_summary_token(selected_audio_streams)}"
+                    f"_drop_extra_{language_summary_token(dropped_audio_streams)}"
+                )
             else:
                 reasons.append(f"audio_policy_mismatch:expected_{expected_audio}_actual_{actual_audio}")
         expected_subtitles = stream_policy.get("expected_subtitle_stream_count")
@@ -2533,14 +2573,39 @@ def temp_upload_path(final_target: Path) -> Path:
     return final_target.with_name(f".{final_target.name}.simpleripper.tmp")
 
 
+def quarantine_leaf_name(source_name: str, timestamp: int, max_bytes: int = MAX_SAFE_FILENAME_BYTES) -> str:
+    candidate = f"{source_name}.{timestamp}.original"
+    if len(candidate.encode("utf-8")) <= max_bytes:
+        return candidate
+    digest = hashlib.sha256(source_name.encode("utf-8", errors="replace")).hexdigest()[:16]
+    suffix = f".{digest}.{timestamp}.original"
+    budget = max_bytes - len(suffix.encode("utf-8"))
+    if budget <= 0:
+        return f"{digest}.{timestamp}.original"
+    encoded_name = source_name.encode("utf-8", errors="replace")
+    trimmed = encoded_name[:budget]
+    while trimmed:
+        try:
+            prefix = trimmed.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            trimmed = trimmed[:-1]
+    else:
+        prefix = "source"
+    prefix = prefix.rstrip(" .") or "source"
+    return f"{prefix}{suffix}"
+
+
 def quarantine_path_for_source(source: Path, config: dict[str, Any]) -> Path:
     root = Path(str((config.get("paths") or {}).get("quarantine_dir") or "quarantine"))
+    timestamp = int(time.time())
+    leaf_name = quarantine_leaf_name(source.name, timestamp)
     relative_root_text = str((config.get("paths") or {}).get("quarantine_relative_root") or "").strip()
     if relative_root_text:
         try:
             relative_root = Path(relative_root_text).resolve()
             relative = source.resolve().relative_to(relative_root)
-            return root / relative.with_name(relative.name + f".{int(time.time())}.original")
+            return root / relative.with_name(leaf_name)
         except ValueError:
             log_event(
                 config,
@@ -2551,10 +2616,10 @@ def quarantine_path_for_source(source: Path, config: dict[str, Any]) -> Path:
     for library_root in [Path(item) for item in ((config.get("libraries") or {}).get("roots") or [])]:
         try:
             relative = source.resolve().relative_to(library_root.resolve())
-            return root / relative.with_name(relative.name + f".{int(time.time())}.original")
+            return root / relative.with_name(leaf_name)
         except ValueError:
             continue
-    return root / f"{source.name}.{int(time.time())}.original"
+    return root / leaf_name
 
 
 def is_test_mode(config: dict[str, Any]) -> bool:
@@ -3877,6 +3942,32 @@ class SimpleRipperApp:
                 crf = downscale_plan["crf_override"]
             command = build_ffmpeg_command(self.config, copied_source, output, source_meta, stream_policy, downscale_plan)
             job_summary["ffmpeg_command"] = command
+            if stream_policy.get("applied"):
+                log_event(
+                    self.config,
+                    "track_policy_applied",
+                    job_id=job_id,
+                    source_path=str(source),
+                    media_type=source_meta.get("media_type"),
+                    target_audio_languages=stream_policy.get("target_audio_languages"),
+                    selected_audio_streams=stream_policy.get("selected_audio_streams"),
+                    dropped_audio_streams=stream_policy.get("dropped_audio_streams"),
+                    cleanup_enabled=stream_policy.get("cleanup_enabled"),
+                    fallback_used=stream_policy.get("fallback_used"),
+                    map_arguments=stream_policy.get("map_arguments"),
+                )
+            elif stream_policy.get("decision_summary") == "track_policy_no_target_audio_found_fallback_keep_all_audio":
+                log_event(
+                    self.config,
+                    "track_policy_no_target_audio_found_fallback_keep_all_audio",
+                    job_id=job_id,
+                    source_path=str(source),
+                    media_type=source_meta.get("media_type"),
+                    target_audio_languages=stream_policy.get("target_audio_languages"),
+                    cleanup_enabled=stream_policy.get("cleanup_enabled"),
+                    fallback_used=stream_policy.get("fallback_used"),
+                    map_arguments=stream_policy.get("map_arguments"),
+                )
             if downscale_plan.get("applied"):
                 log_event(
                     self.config,
