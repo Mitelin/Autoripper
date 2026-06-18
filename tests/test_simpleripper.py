@@ -167,6 +167,30 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(simpleripper.scan_candidates([library], config_b), [])
             self.assertTrue(simpleripper.history_index_path(config_b, processed).exists())
 
+    def test_cached_scan_skips_file_from_shared_nas_history_written_by_other_machine(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_a = self.make_config(root)
+            config_b = self.make_config(root)
+            config_b["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            config_b["paths"]["history_dir"] = str(root / "history-second-machine")
+            library = root / "library"
+            library.mkdir()
+            processed = library / "processed.mkv"
+            processed.write_text("same", encoding="utf-8")
+            payload = {
+                "status": "done",
+                "job_id": "job-1",
+                "source_signature": simpleripper.source_signature(processed),
+                "updated_at": simpleripper.utc_now(),
+            }
+
+            simpleripper.write_shared_worker_history(config_a, processed, payload)
+
+            self.assertFalse(simpleripper.history_index_path(config_b, processed).exists())
+            self.assertEqual(simpleripper.scan_candidates([library], config_b), [])
+            self.assertTrue(simpleripper.history_index_path(config_b, processed).exists())
+
     def test_scan_candidates_returns_largest_files_first(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -2031,6 +2031,12 @@ def cached_candidate_paths(config: dict[str, Any], folders: list[Path] | None = 
             path = cache_path_row(row)
             if scope_entries and not path_in_scope(path, scope_entries):
                 continue
+            if is_history_done_for_current_source(config, path):
+                connection.execute(
+                    "UPDATE file_index SET decision = 'done', decision_reason = 'history_done', policy_hash = ?, updated_at = ? WHERE path = ?",
+                    (current_policy_hash, utc_now(), str(path)),
+                )
+                continue
             marker = marker_path(path, config)
             if not path.exists() or (marker is not None and marker.exists()) or source_lock_path(path, config).exists():
                 continue
@@ -2232,6 +2238,7 @@ def uncached_scan_candidates(folders: list[Path], config: dict[str, Any]) -> lis
 
 def scan_candidates(folders: list[Path], config: dict[str, Any]) -> list[Path]:
     if scan_cache_enabled(config):
+        sync_history_from_shared_workers(config)
         current_scope = scan_scope_fingerprint(config, folders)
         log_event(config, "scan_scope_fingerprint", current=current_scope)
         stored_scope = scan_state_get(config, "candidate_queue_scope_fingerprint")
