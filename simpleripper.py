@@ -2374,19 +2374,21 @@ def summarize_current_state(state: "RuntimeState") -> dict[str, Any]:
 def merged_runtime_status(config: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
     merged = dict(snapshot)
     current_summary = dict(merged.get("current_summary") or {})
-    current_job = try_read_json(current_job_path(config)) or {}
-    ffmpeg_log = try_read_json(ffmpeg_current_log_path(config)) or {}
+    runtime_control = load_runtime_control(config)
+    runtime_active = bool(merged.get("running")) or bool(runtime_control.get("running_requested"))
+    current_job = (try_read_json(current_job_path(config)) or {}) if runtime_active else {}
+    ffmpeg_log = (try_read_json(ffmpeg_current_log_path(config)) or {}) if runtime_active else {}
     progress = merged.get("ffmpeg_progress") if isinstance(merged.get("ffmpeg_progress"), dict) else None
-    if not progress:
+    if runtime_active and not progress:
         current_job_progress = current_job.get("progress") if isinstance(current_job.get("progress"), dict) else None
         ffmpeg_log_progress = ffmpeg_log.get("progress") if isinstance(ffmpeg_log.get("progress"), dict) else None
         progress = current_job_progress or ffmpeg_log_progress
     current_file = merged.get("current_file") or current_job.get("source_path") or current_summary.get("source_path")
     current_phase = merged.get("current_phase")
-    if (not current_phase or current_phase == "idle") and (current_job.get("phase") or current_job.get("status")):
+    if runtime_active and (not current_phase or current_phase == "idle") and (current_job.get("phase") or current_job.get("status")):
         current_phase = current_job.get("phase") or current_job.get("status")
     output_size_bytes = merged.get("output_size_bytes")
-    if not output_size_bytes:
+    if runtime_active and not output_size_bytes:
         output_size_bytes = current_job.get("output_size_bytes")
     duration_seconds = current_summary.get("duration_seconds")
     if duration_seconds is None:
@@ -3864,6 +3866,8 @@ class SimpleRipperApp:
                 if self.state.current_phase != "stopped":
                     self.state.current_phase = "idle"
                 self._ffmpeg = None
+            safe_unlink(ffmpeg_current_log_path(self.config))
+            current_job_path(self.config).unlink(missing_ok=True)
 
     def process_one(self, source: Path) -> None:
         lock_path = write_source_lock(source, self.config)

@@ -938,6 +938,48 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(runtime_control["stop_reason"], "force_stop")
             self.assertFalse(simpleripper.resume_request_path(config).exists())
 
+    def test_status_ignores_stale_current_job_when_worker_is_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "missing.mkv"
+
+            simpleripper.write_json(
+                simpleripper.current_job_path(config),
+                {
+                    "phase": "scanning_inventory",
+                    "status": "scanning_inventory",
+                    "source_path": str(source),
+                    "progress": {"fps": "99.0"},
+                    "output_size_bytes": 123,
+                },
+            )
+
+            status = app.status()
+
+            self.assertFalse(status["running"])
+            self.assertEqual(status["current_phase"], "idle")
+            self.assertIsNone(status["current_file"])
+            self.assertEqual(status["current_summary"]["status"], "idle")
+
+    def test_run_loop_scan_failure_cleans_current_job_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            app.state.running = True
+            app._running_requested = True
+
+            with patch("simpleripper.scan_candidates", side_effect=FileNotFoundError("missing scan file")):
+                app._run_loop()
+
+            status = app.status()
+            self.assertFalse(status["running"])
+            self.assertEqual(status["current_phase"], "idle")
+            self.assertFalse(simpleripper.current_job_path(config).exists())
+            self.assertEqual(status["errors"][0]["message"], "missing scan file")
+
     def test_recover_runtime_state_does_not_resume_after_force_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
