@@ -1434,6 +1434,24 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertEqual(candidates, [wanted_a, wanted_b])
 
+    def test_cached_candidate_paths_removes_missing_stale_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            source = root / "library" / "missing-after-scan.mkv"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(b"x" * 20)
+            simpleripper.fast_inventory_scan([source.parent], config)
+            source.unlink()
+
+            self.assertEqual(simpleripper.cached_candidate_paths(config, [source.parent]), [])
+
+            with simpleripper.open_worker_cache(config) as connection:
+                row = connection.execute("SELECT path FROM file_index WHERE path = ?", (str(source),)).fetchone()
+
+            self.assertIsNone(row)
+
     def test_pick_next_candidate_returns_none_when_no_usable_job_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

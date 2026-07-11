@@ -2034,6 +2034,10 @@ def cached_candidate_paths(config: dict[str, Any], folders: list[Path] | None = 
             path = cache_path_row(row)
             if scope_entries and not path_in_scope(path, scope_entries):
                 continue
+            if not path.exists():
+                connection.execute("DELETE FROM file_index WHERE path = ?", (str(path),))
+                log_event(config, "candidate_cache_entry_removed", source_path=str(path), reason="missing_source")
+                continue
             if is_history_done_for_current_source(config, path):
                 connection.execute(
                     "UPDATE file_index SET decision = 'done', decision_reason = 'history_done', policy_hash = ?, updated_at = ? WHERE path = ?",
@@ -2041,11 +2045,13 @@ def cached_candidate_paths(config: dict[str, Any], folders: list[Path] | None = 
                 )
                 continue
             marker = marker_path(path, config)
-            if not path.exists() or (marker is not None and marker.exists()) or source_lock_path(path, config).exists():
+            if (marker is not None and marker.exists()) or source_lock_path(path, config).exists():
                 continue
             try:
                 stat = path.stat()
             except OSError:
+                connection.execute("DELETE FROM file_index WHERE path = ?", (str(path),))
+                log_event(config, "candidate_cache_entry_removed", source_path=str(path), reason="stat_failed")
                 continue
             if int(row["size_bytes"] or 0) != int(stat.st_size) or int(row["mtime_ns"] or 0) != int(stat.st_mtime_ns):
                 connection.execute(
