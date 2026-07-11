@@ -1856,7 +1856,10 @@ def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str
                 continue
             if source_lock_path(path, config).exists():
                 continue
-            stat = path.stat()
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
             path_text = str(path)
             row = connection.execute("SELECT size_bytes, mtime_ns FROM file_index WHERE path = ?", (path_text,)).fetchone()
             same_file = bool(row and int(row["size_bytes"]) == int(stat.st_size) and int(row["mtime_ns"]) == int(stat.st_mtime_ns))
@@ -2378,7 +2381,7 @@ def merged_runtime_status(config: dict[str, Any], snapshot: dict[str, Any]) -> d
     runtime_active = bool(merged.get("running")) or bool(runtime_control.get("running_requested"))
     current_job = (try_read_json(current_job_path(config)) or {}) if runtime_active else {}
     ffmpeg_log = (try_read_json(ffmpeg_current_log_path(config)) or {}) if runtime_active else {}
-    progress = merged.get("ffmpeg_progress") if isinstance(merged.get("ffmpeg_progress"), dict) else None
+    progress = merged.get("ffmpeg_progress") if runtime_active and isinstance(merged.get("ffmpeg_progress"), dict) else None
     if runtime_active and not progress:
         current_job_progress = current_job.get("progress") if isinstance(current_job.get("progress"), dict) else None
         ffmpeg_log_progress = ffmpeg_log.get("progress") if isinstance(ffmpeg_log.get("progress"), dict) else None
@@ -2387,10 +2390,10 @@ def merged_runtime_status(config: dict[str, Any], snapshot: dict[str, Any]) -> d
     current_phase = merged.get("current_phase")
     if runtime_active and (not current_phase or current_phase == "idle") and (current_job.get("phase") or current_job.get("status")):
         current_phase = current_job.get("phase") or current_job.get("status")
-    output_size_bytes = merged.get("output_size_bytes")
+    output_size_bytes = merged.get("output_size_bytes") if runtime_active else 0
     if runtime_active and not output_size_bytes:
         output_size_bytes = current_job.get("output_size_bytes")
-    duration_seconds = current_summary.get("duration_seconds")
+    duration_seconds = current_summary.get("duration_seconds") if runtime_active else None
     if duration_seconds is None:
         source_metadata = current_job.get("source_metadata") if isinstance(current_job.get("source_metadata"), dict) else {}
         duration_seconds = to_float(source_metadata.get("duration_seconds"))
@@ -3835,7 +3838,13 @@ class SimpleRipperApp:
                     continue
                 log_event(self.config, "scan_start", folders=[str(path) for path in folders])
                 self.set_phase("scanning_inventory")
-                candidates = scan_candidates(folders, self.config)
+                try:
+                    candidates = scan_candidates(folders, self.config)
+                except OSError as exc:
+                    self.log_error(str(exc))
+                    if not self.schedule_rescan_wait(300, "scan_error"):
+                        break
+                    continue
                 self.set_phase("loading_queue")
                 log_event(self.config, "scan_end", candidates=len(candidates))
                 if not candidates:
@@ -3860,9 +3869,13 @@ class SimpleRipperApp:
         finally:
             with self._lock:
                 self.state.running = False
+                self.state.next_scan_at = None
+                self.state.current_duration_seconds = None
                 self.state.current_file = None
                 self.state.stop_after_current = False
                 self.state.force_stop = False
+                self.state.ffmpeg_progress = None
+                self.state.output_size_bytes = 0
                 if self.state.current_phase != "stopped":
                     self.state.current_phase = "idle"
                 self._ffmpeg = None
@@ -3890,6 +3903,7 @@ class SimpleRipperApp:
         tmp_output = temp_upload_path(replacement_path)
         job_summary: dict[str, Any] = {"job_id": job_id, "source_path": str(source), "replacement_path": str(replacement_path), "started_at": utc_now(), "status": "running"}
         succeeded = False
+        discard_work_dir = False
         ffmpeg_started = False
         ffmpeg_completed = False
         try:
@@ -4081,6 +4095,15 @@ class SimpleRipperApp:
             log_event(self.config, "force_stop_completed", job_id=job_id, source_path=str(source), phase=self.state.current_phase)
             self.reset_runtime_state(clear_errors=True, preserve_force_stop=True)
         except Exception as exc:
+            if isinstance(exc, FileNotFoundError) and not source.exists():
+                discard_work_dir = True
+                job_summary.update({"status": "skipped", "skip_reason": "source_missing_during_processing", "finished_at": utc_now()})
+                append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
+                log_event(self.config, "candidate_missing_source", job_id=job_id, source_path=str(source), phase=self.state.current_phase)
+                refresh_folder_state_upwards(self.config, source)
+                with self._lock:
+                    self.state.last_processed = ([{"source_path": str(source), "finished_at": utc_now(), "status": "skipped", "reason": "source_missing_during_processing"}] + (self.state.last_processed or []))[:20]
+                return
             failure_type = "ffmpeg" if isinstance(exc, VerificationFailedError) or isinstance(exc, FfmpegFailedError) or ffmpeg_completed else "job"
             previous_failure_count = 0
             previous_payload = load_history_index(self.config, source)
@@ -4138,7 +4161,7 @@ class SimpleRipperApp:
             lock_path.unlink(missing_ok=True)
             tmp_output.unlink(missing_ok=True)
             safe_unlink(ffmpeg_current_log_path(self.config))
-            if succeeded or self.state.current_phase == "idle" or not bool((self.config.get("paths") or {}).get("keep_failed_output_for_inspection", True)):
+            if succeeded or discard_work_dir or self.state.current_phase == "idle" or not bool((self.config.get("paths") or {}).get("keep_failed_output_for_inspection", True)):
                 shutil.rmtree(work_dir_path, ignore_errors=True)
             current_job_path(self.config).unlink(missing_ok=True)
 

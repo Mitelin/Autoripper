@@ -902,6 +902,31 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertFalse(Path(config["paths"]["inspection_dir"]).exists())
             self.assertFalse(simpleripper.temp_upload_path(simpleripper.target_output_path(source)).exists())
 
+    def test_process_one_missing_source_is_discarded_without_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 4096)
+
+            def fake_copy(_source: Path, _destination: Path, _should_stop: object, chunk_size: int = 8 * 1024 * 1024) -> None:
+                source.unlink(missing_ok=True)
+                raise FileNotFoundError(2, "No such file or directory", str(source))
+
+            with patch("simpleripper.copy_file_interruptible", side_effect=fake_copy):
+                app.process_one(source)
+
+            status = app.status()
+            self.assertEqual(status["errors"], [])
+            self.assertFalse(simpleripper.current_job_path(config).exists())
+            self.assertFalse((Path(config["paths"]["local_work_dir"]) / "current").exists())
+            self.assertFalse(Path(config["paths"]["inspection_dir"]).exists())
+            self.assertEqual(status["last_processed"][0]["status"], "skipped")
+            self.assertEqual(status["last_processed"][0]["reason"], "source_missing_during_processing")
+            self.assertIsNone(simpleripper.load_history_index(config, source))
+
     def test_run_loop_stops_after_force_stop_from_process_one(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -944,6 +969,9 @@ class SimpleRipperTests(unittest.TestCase):
             config = self.make_config(root)
             app = simpleripper.SimpleRipperApp(config)
             source = root / "library" / "missing.mkv"
+            app.state.current_duration_seconds = 2400
+            app.state.ffmpeg_progress = {"out_time": "00:10:00.00", "fps": "99.0", "speed": "9.9x"}
+            app.state.output_size_bytes = 123
 
             simpleripper.write_json(
                 simpleripper.current_job_path(config),
@@ -961,24 +989,37 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertFalse(status["running"])
             self.assertEqual(status["current_phase"], "idle")
             self.assertIsNone(status["current_file"])
+            self.assertIsNone(status["ffmpeg_progress"])
             self.assertEqual(status["current_summary"]["status"], "idle")
+            self.assertIsNone(status["current_summary"]["duration_seconds"])
+            self.assertIsNone(status["current_summary"]["progress_time"])
+            self.assertEqual(status["current_summary"]["output_size_bytes"], 0)
 
-    def test_run_loop_scan_failure_cleans_current_job_state(self) -> None:
+    def test_run_loop_scan_failure_waits_for_retry_instead_of_stopping(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self.make_config(root)
             app = simpleripper.SimpleRipperApp(config)
             app.state.running = True
             app._running_requested = True
+            app.state.current_duration_seconds = 1440
+            app.state.ffmpeg_progress = {"out_time": "00:23:59.808000", "fps": "30.63", "speed": "1.28x"}
+            app.state.output_size_bytes = 187170816
 
-            with patch("simpleripper.scan_candidates", side_effect=FileNotFoundError("missing scan file")):
+            with patch("simpleripper.scan_candidates", side_effect=[FileNotFoundError("missing scan file"), []]) as scan_mock, patch.object(app, "schedule_rescan_wait", side_effect=[True, False]) as wait_mock:
                 app._run_loop()
 
             status = app.status()
+            self.assertEqual(scan_mock.call_count, 2)
+            self.assertEqual(wait_mock.call_args_list[0].args, (300, "scan_error"))
+            self.assertEqual(wait_mock.call_args_list[1].args, (3600, "no_candidates"))
             self.assertFalse(status["running"])
             self.assertEqual(status["current_phase"], "idle")
             self.assertFalse(simpleripper.current_job_path(config).exists())
             self.assertEqual(status["errors"][0]["message"], "missing scan file")
+            self.assertIsNone(status["ffmpeg_progress"])
+            self.assertEqual(status["output_size_bytes"], 0)
+            self.assertIsNone(status["current_summary"]["duration_seconds"])
 
     def test_recover_runtime_state_does_not_resume_after_force_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
