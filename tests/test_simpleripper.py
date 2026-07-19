@@ -2764,6 +2764,35 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertIn("skip_profile_mismatch_because_under_limit", joined)
             self.assertIn("video_codec_mismatch:h264!=h265,hevc", joined)
 
+    def test_pick_next_candidate_logs_probe_and_cache_refresh_durations_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "Movie" / "movie.mkv"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(b"x" * 20)
+            simpleripper.fast_inventory_scan([source.parent], config)
+
+            details = {
+                "path": source,
+                "status": "ok",
+                "metadata": {"file_size_bytes": source.stat().st_size, "video_codec": "h264", "media_type": "movie"},
+                "score": 10.0,
+                "skip_reason": None,
+                "candidate_reason": "needs_encode",
+            }
+
+            with patch("simpleripper.inspect_candidate", return_value=details):
+                selected = app.pick_next_candidate([source])
+
+            self.assertEqual(selected, source)
+            joined = "\n".join(simpleripper.tail_text_lines(simpleripper.app_log_path(config), 40))
+            self.assertIn("candidate_probe_done", joined)
+            self.assertIn("candidate_cache_refresh_done", joined)
+            self.assertIn('duration_ms=', joined)
+
     def test_history_summary_fields_flattens_before_after_values(self) -> None:
         source_meta = {"file_size_bytes": 1000, "video_codec": "h264", "audio_stream_count": 2, "subtitle_stream_count": 1}
         output_meta = {"file_size_bytes": 400, "video_codec": "hevc", "audio_stream_count": 1, "subtitle_stream_count": 1}

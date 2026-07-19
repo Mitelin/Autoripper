@@ -3901,8 +3901,9 @@ class SimpleRipperApp:
             self.set_phase("probing_candidate", candidate)
             log_event(self.config, "candidate_selected", source_path=str(candidate))
             log_event(self.config, "candidate_probe_start", source_path=str(candidate))
+            probe_started_at = time.perf_counter()
             details = inspect_candidate(self.config, candidate, self.media_type_for_source(candidate))
-            update_cache_deep_check(self.config, details)
+            probe_duration_ms = int((time.perf_counter() - probe_started_at) * 1000)
             log_event(
                 self.config,
                 "candidate_probe_done",
@@ -3911,7 +3912,12 @@ class SimpleRipperApp:
                 skip_reason=details.get("skip_reason"),
                 candidate_reason=details.get("candidate_reason"),
                 score=details.get("score"),
+                duration_ms=probe_duration_ms,
             )
+            cache_refresh_started_at = time.perf_counter()
+            update_cache_deep_check(self.config, details)
+            cache_refresh_duration_ms = int((time.perf_counter() - cache_refresh_started_at) * 1000)
+            log_event(self.config, "candidate_cache_refresh_done", source_path=str(candidate), status=details.get("status"), decision=("skip" if details.get("skip_reason") else "encode_candidate" if details.get("status") == "ok" else "failed"), duration_ms=cache_refresh_duration_ms)
             if details.get("status") != "ok":
                 log_event(self.config, "candidate_probe_failed", source_path=str(candidate), error=details.get("error"))
                 continue
