@@ -121,9 +121,24 @@ def save_config(config: dict[str, Any]) -> None:
     config_path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=False), encoding="utf-8")
 
 
+def is_transient_file_lock_error(exc: OSError) -> bool:
+    winerror = getattr(exc, "winerror", None)
+    if winerror == 32:
+        return True
+    return exc.errno in {errno.EACCES, errno.EPERM}
+
+
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    for attempt in range(5):
+        try:
+            path.write_text(payload, encoding="utf-8")
+            return
+        except OSError as exc:
+            if not is_transient_file_lock_error(exc) or attempt == 4:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -659,6 +674,91 @@ def source_signature(path: Path) -> dict[str, Any]:
     return {"size_bytes": stat_result.st_size, "mtime_ns": getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))}
 
 
+def configured_history_roots(config: dict[str, Any]) -> list[dict[str, str]]:
+    roots: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_root(value: Any) -> None:
+        text = str(value or "").strip()
+        normalized = normalize_path_for_prefix_match(text)
+        if not normalized:
+            return
+        label = normalized.split("/")[-1]
+        key = (label, normalized)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append({"label": label, "root": text, "normalized_root": normalized})
+
+    for root in ((config.get("libraries") or {}).get("roots") or []):
+        add_root(root)
+    for section in (((config.get("verification") or {}).get("linux-nas") or {}), (config.get("linux-nas") or {})):
+        libraries = section.get("libraries") or {}
+        if isinstance(libraries, dict):
+            for items in libraries.values():
+                for root in items or []:
+                    add_root(root)
+    roots.sort(key=lambda item: len(item["normalized_root"]), reverse=True)
+    return roots
+
+
+def legacy_history_entry_id(value: str | Path) -> str:
+    text = str(value)
+    if text.startswith("\\\\") or re.match(r"^[A-Za-z]:[\\/]", text):
+        return file_lock_id(Path(text))
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def shared_history_identity(config: dict[str, Any], source: Path) -> tuple[str, str | None, str | None, str | None]:
+    source_text = str(source)
+    source_norm = normalize_path_for_prefix_match(source_text)
+    roots = configured_history_roots(config)
+    for entry in roots:
+        suffix = split_mapped_suffix(source_text, entry["root"])
+        if suffix is None:
+            continue
+        suffix_norm = normalize_path_for_prefix_match(suffix)
+        return f"{entry['label']}{suffix_norm}", entry["label"], suffix_norm, suffix
+    labels = sorted({item["label"] for item in roots}, key=len, reverse=True)
+    for label in labels:
+        match = re.search(rf"(^|/){re.escape(label)}(?P<suffix>/.*|$)", source_norm)
+        if not match:
+            continue
+        suffix_norm = match.group("suffix") or ""
+        raw_match = re.search(rf"(^|/){re.escape(label)}(?P<suffix>/.*|$)", re.sub(r"/+", "/", source_text.replace("\\", "/")), flags=re.IGNORECASE)
+        raw_suffix = raw_match.group("suffix") if raw_match else suffix_norm
+        return f"{label}{suffix_norm}", label, suffix_norm, raw_suffix
+    return source_norm, None, None, None
+
+
+def join_history_root_and_suffix(root: str, suffix_text: str) -> str:
+    root_text = str(root or "")
+    suffix_slash = re.sub(r"/+", "/", str(suffix_text or "").replace("\\", "/"))
+    if root_text.startswith("\\\\"):
+        return root_text.rstrip("\\/") + suffix_slash.replace("/", "\\")
+    normalized_root = re.sub(r"/+", "/", root_text.replace("\\", "/")).rstrip("/")
+    return normalized_root + suffix_slash
+
+
+def history_entry_id_candidates(config: dict[str, Any], source: Path) -> list[str]:
+    shared_identity, label, suffix_norm, suffix_text = shared_history_identity(config, source)
+    candidate_ids: list[str] = [legacy_history_entry_id(shared_identity)]
+    if label and suffix_norm is not None:
+        for entry in configured_history_roots(config):
+            if entry["label"] != label:
+                continue
+            candidate_ids.append(legacy_history_entry_id(join_history_root_and_suffix(entry["root"], suffix_text or suffix_norm)))
+    candidate_ids.append(file_lock_id(source))
+    unique_ids: list[str] = []
+    seen: set[str] = set()
+    for item in candidate_ids:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique_ids.append(item)
+    return unique_ids
+
+
 def shared_history_root(config: dict[str, Any]) -> Path:
     explicit = str(((config.get("paths") or {}).get("shared_history_dir") or "")).strip()
     if explicit:
@@ -685,17 +785,28 @@ def shared_worker_history_path(config: dict[str, Any]) -> Path:
 
 
 def history_index_path(config: dict[str, Any], source: Path) -> Path:
-    return history_dir(config) / "source_index" / f"{file_lock_id(source)}.json"
+    return history_dir(config) / "source_index" / f"{history_entry_id_candidates(config, source)[0]}.json"
+
+
+def history_index_candidate_paths(config: dict[str, Any], source: Path) -> list[Path]:
+    return [history_dir(config) / "source_index" / f"{item}.json" for item in history_entry_id_candidates(config, source)]
 
 
 def load_history_index(config: dict[str, Any], source: Path) -> dict[str, Any] | None:
-    path = history_index_path(config, source)
-    if not path.exists():
-        return None
-    try:
-        return read_json(path)
-    except (OSError, json.JSONDecodeError):
-        return None
+    latest_payload: dict[str, Any] | None = None
+    latest_updated_at = ""
+    for path in history_index_candidate_paths(config, source):
+        if not path.exists():
+            continue
+        try:
+            payload = read_json(path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        updated_at = str(payload.get("updated_at") or "")
+        if latest_payload is None or updated_at >= latest_updated_at:
+            latest_payload = payload
+            latest_updated_at = updated_at
+    return latest_payload
 
 
 def is_history_done_for_current_source(config: dict[str, Any], source: Path) -> bool:
@@ -764,7 +875,7 @@ def write_shared_worker_history(config: dict[str, Any], source: Path, payload: d
         except (OSError, json.JSONDecodeError):
             pass
     sources = document.get("sources") if isinstance(document.get("sources"), dict) else {}
-    sources[file_lock_id(source)] = shared_payload
+    sources[history_entry_id_candidates(config, source)[0]] = shared_payload
     document["hostname"] = socket.gethostname()
     document["updated_at"] = utc_now()
     document["sources"] = sources
@@ -796,12 +907,7 @@ def sync_history_from_shared_workers(config: dict[str, Any]) -> dict[str, int]:
             entries_seen += 1
             source = Path(source_path)
             local_path = history_index_path(config, source)
-            current: dict[str, Any] = {}
-            if local_path.exists():
-                try:
-                    current = read_json(local_path)
-                except (OSError, json.JSONDecodeError):
-                    current = {}
+            current = load_history_index(config, source) or {}
             if str(current.get("updated_at") or "") >= str(entry.get("updated_at") or ""):
                 continue
             write_json(local_path, entry)
@@ -936,13 +1042,13 @@ class LocalInstanceLock:
             host = str(payload.get("hostname") or "")
             if host == socket.gethostname() and is_local_pid_running(pid):
                 raise InstanceLockError(f"Another local SimpleRipper instance is already running: pid={pid}, lock={self.path}")
-            self.path.unlink(missing_ok=True)
+            safe_unlink(self.path)
         write_json(self.path, {"app": APP_NAME, "hostname": socket.gethostname(), "pid": os.getpid(), "started_at": utc_now()})
         self.acquired = True
 
     def release(self) -> None:
         if self.acquired:
-            self.path.unlink(missing_ok=True)
+            safe_unlink(self.path)
             self.acquired = False
 
     def __enter__(self) -> "LocalInstanceLock":
@@ -2957,10 +3063,16 @@ def jellyfin_lookup_item(server_url: str, api_key: str, source: Path, candidate_
 
 
 def safe_unlink(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
+    for attempt in range(5):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if not is_transient_file_lock_error(exc) or attempt == 4:
+                return
+            time.sleep(0.05 * (attempt + 1))
 
 
 def recover_runtime_state(config: dict[str, Any]) -> None:
@@ -3192,7 +3304,7 @@ class SimpleRipperApp:
                 self.state.current_duration_seconds = to_float(source_metadata.get("duration_seconds"))
             elif file and previous_file != self.state.current_file:
                 self.state.current_duration_seconds = None
-            existing = read_json(current_job_path(self.config)) if current_job_path(self.config).exists() else {}
+            existing = try_read_json(current_job_path(self.config)) or {}
             payload = {
                 "status": phase,
                 "phase": phase,
@@ -3622,7 +3734,7 @@ class SimpleRipperApp:
             tmp_output_path.unlink(missing_ok=True)
             safe_unlink(ffmpeg_current_log_path(self.config))
             shutil.rmtree(work_dir_path, ignore_errors=True)
-            current_job_path(self.config).unlink(missing_ok=True)
+            safe_unlink(current_job_path(self.config))
         return result
 
     def reset_runtime_state(self, clear_errors: bool = False, preserve_force_stop: bool = False, preserve_stop_after_current: bool = False) -> None:
@@ -3638,7 +3750,7 @@ class SimpleRipperApp:
             if clear_errors:
                 self.state.errors = []
         safe_unlink(ffmpeg_current_log_path(self.config))
-        current_job_path(self.config).unlink(missing_ok=True)
+        safe_unlink(current_job_path(self.config))
         clear_resume_request(self.config)
 
     def set_selected_folders(self, folders: list[Any]) -> None:
@@ -3886,7 +3998,7 @@ class SimpleRipperApp:
                     self.state.current_phase = "idle"
                 self._ffmpeg = None
             safe_unlink(ffmpeg_current_log_path(self.config))
-            current_job_path(self.config).unlink(missing_ok=True)
+            safe_unlink(current_job_path(self.config))
 
     def process_one(self, source: Path) -> None:
         lock_path = write_source_lock(source, self.config)
@@ -4169,7 +4281,7 @@ class SimpleRipperApp:
             safe_unlink(ffmpeg_current_log_path(self.config))
             if succeeded or discard_work_dir or self.state.current_phase == "idle" or not bool((self.config.get("paths") or {}).get("keep_failed_output_for_inspection", True)):
                 shutil.rmtree(work_dir_path, ignore_errors=True)
-            current_job_path(self.config).unlink(missing_ok=True)
+            safe_unlink(current_job_path(self.config))
 
 
 def guess_media_type(path: Path) -> str:

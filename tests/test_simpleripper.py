@@ -191,6 +191,108 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(simpleripper.scan_candidates([library], config_b), [])
             self.assertTrue(simpleripper.history_index_path(config_b, processed).exists())
 
+    def test_history_index_path_matches_windows_and_linux_equivalents(self) -> None:
+        config = self.make_config(Path("."))
+        config["libraries"] = {"roots": [r"\\192.168.50.23\admin\FILMY"]}
+        config["verification"]["linux-nas"] = {"libraries": {"movie": ["/mnt/nas-backup/FILMY"]}}
+        windows_source = Path(r"\\192.168.50.23\admin\FILMY\English\Movie\movie.mkv")
+        linux_source = Path("/mnt/nas-backup/FILMY/English/Movie/movie.mkv")
+
+        self.assertEqual(simpleripper.history_index_path(config, windows_source), simpleripper.history_index_path(config, linux_source))
+
+    def test_load_history_index_reads_legacy_unc_entry_for_linux_equivalent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["libraries"] = {"roots": [r"\\192.168.50.23\admin\FILMY"]}
+            config["verification"]["linux-nas"] = {"libraries": {"movie": ["/mnt/nas-backup/FILMY"]}}
+            windows_source = Path(r"\\192.168.50.23\admin\FILMY\English\Movie\movie.mkv")
+            linux_source = Path("/mnt/nas-backup/FILMY/English/Movie/movie.mkv")
+            payload = {"status": "done", "job_id": "job-1", "updated_at": simpleripper.utc_now()}
+            legacy_path = Path(config["paths"]["history_dir"]) / "source_index" / f"{simpleripper.file_lock_id(windows_source)}.json"
+
+            simpleripper.write_json(legacy_path, payload)
+
+            self.assertEqual(simpleripper.load_history_index(config, linux_source), payload)
+
+    def test_load_history_index_reads_legacy_linux_entry_for_unc_equivalent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["libraries"] = {"roots": [r"\\192.168.50.23\admin\FILMY"]}
+            config["verification"]["linux-nas"] = {"libraries": {"movie": ["/mnt/nas-backup/FILMY"]}}
+            windows_source = Path(r"\\192.168.50.23\admin\FILMY\English\Movie\movie.mkv")
+            linux_source = Path("/mnt/nas-backup/FILMY/English/Movie/movie.mkv")
+            payload = {"status": "done", "job_id": "job-2", "updated_at": simpleripper.utc_now()}
+            legacy_linux_id = simpleripper.legacy_history_entry_id("/mnt/nas-backup/FILMY/English/Movie/movie.mkv")
+            legacy_path = Path(config["paths"]["history_dir"]) / "source_index" / f"{legacy_linux_id}.json"
+
+            simpleripper.write_json(legacy_path, payload)
+
+            self.assertEqual(simpleripper.load_history_index(config, windows_source), payload)
+
+    def test_sync_history_from_shared_workers_reads_new_windows_entry_for_linux_equivalent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            writer_config = self.make_config(root)
+            reader_config = self.make_config(root)
+            writer_config["libraries"] = {"roots": [r"\\192.168.50.23\admin\FILMY"]}
+            writer_config["verification"]["linux-nas"] = {"libraries": {"movie": ["/mnt/nas-backup/FILMY"]}}
+            writer_config["paths"]["shared_history_dir"] = str(root / "shared-state")
+            reader_config["libraries"] = dict(writer_config["libraries"])
+            reader_config["verification"]["linux-nas"] = dict(writer_config["verification"]["linux-nas"])
+            reader_config["paths"]["history_dir"] = str(root / "history-linux-reader")
+            reader_config["paths"]["shared_history_dir"] = str(root / "shared-state")
+            windows_source = Path(r"\\192.168.50.23\admin\FILMY\English\Movie\movie.mkv")
+            linux_source = Path("/mnt/nas-backup/FILMY/English/Movie/movie.mkv")
+            payload = {"status": "done", "job_id": "job-win", "updated_at": simpleripper.utc_now()}
+
+            simpleripper.write_shared_worker_history(writer_config, windows_source, payload)
+
+            self.assertEqual(simpleripper.sync_history_from_shared_workers(reader_config), {"files": 1, "entries": 1, "updated": 1})
+            self.assertEqual(simpleripper.load_history_index(reader_config, linux_source), {**payload, "source_path": str(windows_source), "hostname": socket.gethostname()})
+
+    def test_sync_history_from_shared_workers_reads_new_linux_entry_for_windows_equivalent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            writer_config = self.make_config(root)
+            reader_config = self.make_config(root)
+            writer_config["libraries"] = {"roots": [r"\\192.168.50.23\admin\FILMY"]}
+            writer_config["verification"]["linux-nas"] = {"libraries": {"movie": ["/mnt/nas-backup/FILMY"]}}
+            writer_config["paths"]["shared_history_dir"] = str(root / "shared-state")
+            reader_config["libraries"] = dict(writer_config["libraries"])
+            reader_config["verification"]["linux-nas"] = dict(writer_config["verification"]["linux-nas"])
+            reader_config["paths"]["history_dir"] = str(root / "history-windows-reader")
+            reader_config["paths"]["shared_history_dir"] = str(root / "shared-state")
+            windows_source = Path(r"\\192.168.50.23\admin\FILMY\English\Movie\movie.mkv")
+            linux_source = Path("/mnt/nas-backup/FILMY/English/Movie/movie.mkv")
+            payload = {"status": "done", "job_id": "job-linux", "updated_at": simpleripper.utc_now()}
+
+            simpleripper.write_shared_worker_history(writer_config, linux_source, payload)
+
+            self.assertEqual(simpleripper.sync_history_from_shared_workers(reader_config), {"files": 1, "entries": 1, "updated": 1})
+            self.assertEqual(simpleripper.load_history_index(reader_config, windows_source), {**payload, "source_path": str(linux_source), "hostname": socket.gethostname()})
+
+    def test_write_shared_worker_history_uses_one_canonical_key_for_equivalent_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["libraries"] = {"roots": [r"\\192.168.50.23\admin\FILMY"]}
+            config["verification"]["linux-nas"] = {"libraries": {"movie": ["/mnt/nas-backup/FILMY"]}}
+            config["paths"]["shared_history_dir"] = str(root / "shared-state")
+            windows_source = Path(r"\\192.168.50.23\admin\FILMY\English\Movie\movie.mkv")
+            linux_source = Path("/mnt/nas-backup/FILMY/English/Movie/movie.mkv")
+            first_payload = {"status": "done", "job_id": "job-1", "updated_at": "2026-07-19T21:31:00+00:00"}
+            second_payload = {"status": "done", "job_id": "job-2", "updated_at": "2026-07-19T21:32:00+00:00"}
+
+            simpleripper.write_shared_worker_history(config, windows_source, first_payload)
+            simpleripper.write_shared_worker_history(config, linux_source, second_payload)
+
+            document = simpleripper.read_json(simpleripper.shared_worker_history_path(config))
+            canonical_key = simpleripper.history_entry_id_candidates(config, windows_source)[0]
+            self.assertEqual(list((document.get("sources") or {}).keys()), [canonical_key])
+            self.assertEqual((document.get("sources") or {})[canonical_key], {**second_payload, "source_path": str(linux_source), "hostname": socket.gethostname()})
+
     def test_scan_candidates_returns_largest_files_first(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -606,6 +708,35 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(payload["source_path"], str(source))
             self.assertEqual(payload["job_id"], "job-1")
             self.assertIn("started_at", payload)
+
+    def test_set_phase_tolerates_locked_existing_current_job_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir()
+            source.write_text("x", encoding="utf-8")
+            simpleripper.write_json(simpleripper.current_job_path(config), {"started_at": "2026-07-14T00:00:00+00:00"})
+
+            with patch("simpleripper.read_json", side_effect=PermissionError(errno.EACCES, "sharing violation")):
+                app.set_phase("encoding", source, {"job_id": "job-1"})
+
+            payload = simpleripper.read_json(simpleripper.current_job_path(config))
+            self.assertEqual(payload["phase"], "encoding")
+            self.assertEqual(payload["job_id"], "job-1")
+
+    def test_reset_runtime_state_ignores_locked_current_job_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            simpleripper.write_json(simpleripper.current_job_path(config), {"phase": "encoding"})
+
+            with patch("pathlib.Path.unlink", side_effect=PermissionError(errno.EACCES, "sharing violation")):
+                app.reset_runtime_state()
+
+            self.assertEqual(app.state.current_phase, "idle")
 
     def test_configured_folder_suggestions_use_windows_roots(self) -> None:
         config = {
