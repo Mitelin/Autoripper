@@ -927,6 +927,9 @@ def sync_history_from_shared_workers(config: dict[str, Any]) -> dict[str, int]:
             local_path = history_index_path(config, source)
             current = load_history_index(config, source) or {}
             if str(current.get("updated_at") or "") >= str(entry.get("updated_at") or ""):
+                if not local_path.exists() and current:
+                    write_json(local_path, current)
+                    updated += 1
                 continue
             write_json(local_path, entry)
             updated += 1

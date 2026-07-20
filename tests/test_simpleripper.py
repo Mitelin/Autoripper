@@ -324,6 +324,33 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(simpleripper.sync_history_from_shared_workers(reader_config), {"files": 1, "entries": 1, "updated": 1})
             self.assertEqual(simpleripper.load_history_index(reader_config, windows_source), {**payload, "source_path": str(linux_source), "hostname": socket.gethostname()})
 
+    def test_sync_history_from_shared_workers_materializes_canonical_alias_from_legacy_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            writer_config = self.make_config(root)
+            reader_config = self.make_config(root)
+            writer_config["libraries"] = {"roots": [r"\\192.168.50.23\admin\FILMY"]}
+            writer_config["verification"]["linux-nas"] = {"libraries": {"movie": ["/mnt/nas-backup/FILMY"]}}
+            writer_config["paths"]["shared_history_dir"] = str(root / "shared-state")
+            reader_config["libraries"] = dict(writer_config["libraries"])
+            reader_config["verification"]["linux-nas"] = dict(writer_config["verification"]["linux-nas"])
+            reader_config["paths"]["history_dir"] = str(root / "history-linux-reader")
+            reader_config["paths"]["shared_history_dir"] = str(root / "shared-state")
+            windows_source = Path(r"\\192.168.50.23\admin\FILMY\Czech\Movie\movie.mkv")
+            linux_source = Path("/mnt/nas-backup/FILMY/Czech/Movie/movie.mkv")
+            payload = {"status": "done", "job_id": "job-win", "updated_at": simpleripper.utc_now()}
+            legacy_windows_path = Path(reader_config["paths"]["history_dir"]) / "source_index" / f"{simpleripper.file_lock_id(windows_source)}.json"
+
+            simpleripper.write_shared_worker_history(writer_config, windows_source, payload)
+            simpleripper.write_json(legacy_windows_path, {**payload, "source_path": str(windows_source), "hostname": socket.gethostname()})
+
+            canonical_linux_path = simpleripper.history_index_path(reader_config, linux_source)
+            self.assertFalse(canonical_linux_path.exists())
+
+            self.assertEqual(simpleripper.sync_history_from_shared_workers(reader_config), {"files": 1, "entries": 1, "updated": 1})
+            self.assertTrue(canonical_linux_path.exists())
+            self.assertEqual(simpleripper.load_history_index(reader_config, linux_source), {**payload, "source_path": str(windows_source), "hostname": socket.gethostname()})
+
     def test_write_shared_worker_history_uses_one_canonical_key_for_equivalent_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
