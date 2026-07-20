@@ -129,6 +129,29 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertEqual(simpleripper.scan_candidates([library], config), [])
 
+    def test_scan_skips_history_done_file_even_when_signature_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            library = root / "library"
+            library.mkdir()
+            processed = library / "processed.mkv"
+            processed.write_text("same", encoding="utf-8")
+            signature = simpleripper.source_signature(processed)
+
+            simpleripper.write_history_index(
+                config,
+                processed,
+                {
+                    "status": "done",
+                    "job_id": "job-1",
+                    "source_signature": {**signature, "size_bytes": int(signature["size_bytes"]) + 1234},
+                    "updated_at": simpleripper.utc_now(),
+                },
+            )
+
+            self.assertEqual(simpleripper.scan_candidates([library], config), [])
+
     def test_recent_ffmpeg_failure_tolerates_small_cross_host_mtime_difference(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

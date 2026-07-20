@@ -829,11 +829,7 @@ def load_history_index(config: dict[str, Any], source: Path) -> dict[str, Any] |
 
 def is_history_done_for_current_source(config: dict[str, Any], source: Path) -> bool:
     payload = load_history_index(config, source)
-    if not payload or payload.get("status") != "done":
-        return False
-    signature = payload.get("source_signature") or {}
-    current = source_signature(source)
-    return source_signature_matches(signature, current)
+    return bool(payload and payload.get("status") == "done")
 
 
 def parse_utc_datetime(value: Any) -> datetime | None:
