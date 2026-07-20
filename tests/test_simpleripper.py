@@ -106,6 +106,57 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertEqual(simpleripper.scan_candidates([library], config), [])
 
+    def test_scan_skips_history_done_file_with_small_cross_host_mtime_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            library = root / "library"
+            library.mkdir()
+            processed = library / "processed.mkv"
+            processed.write_text("same", encoding="utf-8")
+            signature = simpleripper.source_signature(processed)
+
+            simpleripper.write_history_index(
+                config,
+                processed,
+                {
+                    "status": "done",
+                    "job_id": "job-1",
+                    "source_signature": {**signature, "mtime_ns": int(signature["mtime_ns"]) + 1_500_000_000},
+                    "updated_at": simpleripper.utc_now(),
+                },
+            )
+
+            self.assertEqual(simpleripper.scan_candidates([library], config), [])
+
+    def test_recent_ffmpeg_failure_tolerates_small_cross_host_mtime_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            library = root / "library"
+            library.mkdir()
+            failed = library / "failed.mkv"
+            failed.write_bytes(b"x" * 10)
+            signature = simpleripper.source_signature(failed)
+            simpleripper.write_history_index(
+                config,
+                failed,
+                {
+                    "status": "error",
+                    "failure_type": "ffmpeg",
+                    "failure_count": 1,
+                    "job_id": "job-1",
+                    "source_signature": {**signature, "mtime_ns": int(signature["mtime_ns"]) + 1_500_000_000},
+                    "updated_at": simpleripper.utc_now(),
+                    "error": "ffmpeg failed",
+                },
+            )
+
+            info = simpleripper.recent_ffmpeg_failure_info(config, failed)
+
+            self.assertIsNotNone(info)
+            self.assertEqual(info["failure_count"], 1)
+
     def test_cached_scan_skips_source_after_successful_job(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

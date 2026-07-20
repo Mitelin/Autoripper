@@ -674,6 +674,24 @@ def source_signature(path: Path) -> dict[str, Any]:
     return {"size_bytes": stat_result.st_size, "mtime_ns": getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))}
 
 
+def source_signature_matches(stored: dict[str, Any] | None, current: dict[str, Any] | None, mtime_tolerance_ns: int = 2_000_000_000) -> bool:
+    if not isinstance(stored, dict) or not isinstance(current, dict):
+        return False
+    try:
+        stored_size = int(stored.get("size_bytes"))
+        current_size = int(current.get("size_bytes"))
+    except (TypeError, ValueError):
+        return False
+    if stored_size != current_size:
+        return False
+    try:
+        stored_mtime = int(stored.get("mtime_ns"))
+        current_mtime = int(current.get("mtime_ns"))
+    except (TypeError, ValueError):
+        return False
+    return abs(stored_mtime - current_mtime) <= int(mtime_tolerance_ns)
+
+
 def configured_history_roots(config: dict[str, Any]) -> list[dict[str, str]]:
     roots: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -815,7 +833,7 @@ def is_history_done_for_current_source(config: dict[str, Any], source: Path) -> 
         return False
     signature = payload.get("source_signature") or {}
     current = source_signature(source)
-    return signature.get("size_bytes") == current["size_bytes"] and signature.get("mtime_ns") == current["mtime_ns"]
+    return source_signature_matches(signature, current)
 
 
 def parse_utc_datetime(value: Any) -> datetime | None:
@@ -834,7 +852,7 @@ def recent_ffmpeg_failure_info(config: dict[str, Any], source: Path) -> dict[str
         return None
     signature = payload.get("source_signature") or {}
     current = source_signature(source)
-    if signature.get("size_bytes") != current["size_bytes"] or signature.get("mtime_ns") != current["mtime_ns"]:
+    if not source_signature_matches(signature, current):
         return None
     scan_settings = config.get("scan") or {}
     try:
@@ -4233,7 +4251,7 @@ class SimpleRipperApp:
             previous_payload = load_history_index(self.config, source)
             current_signature = source_signature(source) if source.exists() else None
             previous_signature = (previous_payload or {}).get("source_signature") or {}
-            if previous_payload and previous_payload.get("failure_type") == failure_type and current_signature and previous_signature.get("size_bytes") == current_signature.get("size_bytes") and previous_signature.get("mtime_ns") == current_signature.get("mtime_ns"):
+            if previous_payload and previous_payload.get("failure_type") == failure_type and current_signature and source_signature_matches(previous_signature, current_signature):
                 previous_failure_count = int(previous_payload.get("failure_count") or 0)
             job_summary.update({"status": "error", "finished_at": utc_now(), "error": str(exc)})
             append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
