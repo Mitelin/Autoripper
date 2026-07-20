@@ -217,6 +217,15 @@ def resume_request_path(config: dict[str, Any]) -> Path:
     return runtime_dir(config) / "resume_request.json"
 
 
+def pending_decisions_path(config: dict[str, Any]) -> Path:
+    return runtime_dir(config) / "pending_decisions.json"
+
+
+def pending_decisions_workspace_dir(config: dict[str, Any]) -> Path:
+    inspection_root = Path(str((config.get("paths") or {}).get("inspection_dir") or "inspection"))
+    return inspection_root / "pending_decisions"
+
+
 def load_runtime_control(config: dict[str, Any]) -> dict[str, Any]:
     path = runtime_control_path(config)
     if not path.exists():
@@ -263,6 +272,69 @@ def write_resume_request(config: dict[str, Any], source_path: Path, phase: str, 
 
 def clear_resume_request(config: dict[str, Any]) -> None:
     safe_unlink(resume_request_path(config))
+
+
+def load_pending_decision_state(config: dict[str, Any]) -> dict[str, Any]:
+    path = pending_decisions_path(config)
+    if not path.exists():
+        return {"pending_decisions": {}, "queued_error_actions": []}
+    payload = try_read_json(path)
+    if not isinstance(payload, dict):
+        safe_unlink(path)
+        return {"pending_decisions": {}, "queued_error_actions": []}
+    pending_payload = payload.get("pending_decisions")
+    queue_payload = payload.get("queued_error_actions")
+    pending_decisions = pending_payload if isinstance(pending_payload, dict) else {}
+    queued_error_actions = queue_payload if isinstance(queue_payload, list) else []
+    return {"pending_decisions": pending_decisions, "queued_error_actions": queued_error_actions}
+
+
+def write_pending_decision_state(config: dict[str, Any], pending_decisions: dict[str, dict[str, Any]] | None, queued_error_actions: list[dict[str, str]] | None) -> None:
+    pending_map = {str(key): value for key, value in (pending_decisions or {}).items() if isinstance(value, dict)}
+    queue_items = [item for item in (queued_error_actions or []) if isinstance(item, dict)]
+    path = pending_decisions_path(config)
+    if not pending_map and not queue_items:
+        safe_unlink(path)
+        return
+    write_json(
+        path,
+        {
+            "pending_decisions": pending_map,
+            "queued_error_actions": queue_items,
+            "updated_at": utc_now(),
+        },
+    )
+
+
+def cleanup_stale_pending_decision_workspaces(config: dict[str, Any], pending_decisions: dict[str, dict[str, Any]] | None) -> list[str]:
+    workspace_root = pending_decisions_workspace_dir(config)
+    if not workspace_root.exists():
+        return []
+    active_paths: set[Path] = set()
+    for pending in (pending_decisions or {}).values():
+        if not isinstance(pending, dict):
+            continue
+        work_dir_text = str(pending.get("work_dir_path") or "").strip()
+        if not work_dir_text:
+            continue
+        active_paths.add(Path(work_dir_text).resolve())
+    removed: list[str] = []
+    for child in workspace_root.iterdir():
+        try:
+            resolved_child = child.resolve()
+        except OSError:
+            resolved_child = child
+        if resolved_child in active_paths:
+            continue
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+            removed.append(str(child))
+        except OSError:
+            continue
+    return removed
 
 
 def worker_cache_path(config: dict[str, Any]) -> Path:
@@ -3238,12 +3310,20 @@ class SimpleRipperApp:
         self.custom_folder_entries: list[dict[str, str]] = custom_entries
         self.selected_folders: list[Path] = [Path(item["path"]) for item in self.selected_folder_entries]
         self.custom_folders: list[Path] = [Path(item["path"]) for item in self.custom_folder_entries]
-        self.state = RuntimeState(last_processed=[], errors=[], pending_decisions={}, queued_error_actions=[], test_mode=is_test_mode(config))
+        persisted_pending_state = load_pending_decision_state(config)
+        self.state = RuntimeState(
+            last_processed=[],
+            errors=[],
+            pending_decisions=dict(persisted_pending_state.get("pending_decisions") or {}),
+            queued_error_actions=list(persisted_pending_state.get("queued_error_actions") or []),
+            test_mode=is_test_mode(config),
+        )
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._ffmpeg: subprocess.Popen[Any] | None = None
         self._resume_request = load_resume_request(config)
         self._running_requested = bool(load_runtime_control(config).get("running_requested"))
+        self._restore_pending_decision_errors()
         log_event(self.config, "app_initialized", selected_folders=self.selected_folder_entries, custom_folders=self.custom_folder_entries)
         if self._running_requested:
             if self._resume_request:
@@ -3278,6 +3358,61 @@ class SimpleRipperApp:
                 "recent_log_lines": tail_text_lines(app_log_path(self.config), 60),
             }
             return merged_runtime_status(self.config, snapshot)
+
+    def _persist_pending_decision_state(self) -> None:
+        with self._lock:
+            pending_map = {
+                str(key): dict(value)
+                for key, value in (self.state.pending_decisions or {}).items()
+                if isinstance(value, dict)
+            }
+            queued_actions = [dict(item) for item in (self.state.queued_error_actions or []) if isinstance(item, dict)]
+        write_pending_decision_state(self.config, pending_map, queued_actions)
+        removed = cleanup_stale_pending_decision_workspaces(self.config, pending_map)
+        for path in removed:
+            log_event(self.config, "pending_decision_workspace_removed", path=path, reason="stale")
+
+    def _restore_pending_decision_errors(self) -> None:
+        pending_map = self.state.pending_decisions or {}
+        if not pending_map:
+            self._persist_pending_decision_state()
+            return
+        queued_by_id = {
+            str(item.get("id") or ""): str(item.get("action") or "")
+            for item in (self.state.queued_error_actions or [])
+            if isinstance(item, dict) and str(item.get("id") or "")
+        }
+        restored_errors: list[dict[str, Any]] = []
+        for decision_id, pending in pending_map.items():
+            if not isinstance(pending, dict):
+                continue
+            message = str(pending.get("message") or "").strip() or str(pending.get("summary") or "").strip() or str(pending.get("source_path") or "")
+            queued_action = queued_by_id.get(str(decision_id)) or str(pending.get("queued_action") or "") or None
+            error_entry = {
+                "id": str(decision_id),
+                "at": str(pending.get("created_at") or utc_now()),
+                "message": message,
+                "summary": str(pending.get("summary") or message),
+                "details": list(pending.get("details") or []),
+                "source_path": str(pending.get("source_path") or "") or None,
+                "failure_type": str(pending.get("failure_type") or "verification") or "verification",
+                "stage": str(pending.get("stage") or "verification"),
+                "actions": [] if queued_action else ["approve", "skip"],
+                "action_required": True,
+            }
+            if queued_action:
+                error_entry["queued_action"] = queued_action
+                if pending.get("queued_at"):
+                    error_entry["queued_at"] = pending.get("queued_at")
+            restored_errors.append(error_entry)
+        with self._lock:
+            existing_non_actionable = [
+                item
+                for item in (self.state.errors or [])
+                if not (isinstance(item, dict) and item.get("action_required"))
+            ]
+            self.state.errors = restored_errors + existing_non_actionable
+        self._persist_pending_decision_state()
 
     def persist_selected_folders(self, previous_entries: list[dict[str, str]] | None = None) -> None:
         old_entries = list(previous_entries or [])
@@ -3390,6 +3525,7 @@ class SimpleRipperApp:
                 "actions": ["approve", "skip"],
                 "action_required": True,
             }] + existing)[:100]
+        self._persist_pending_decision_state()
         log_event(self.config, "error_action_required", message=message, source_path=source_path, failure_type=failure_type, decision_id=decision_id, stage=stage)
 
     def clear_error(self, decision_id: str) -> None:
@@ -3398,6 +3534,7 @@ class SimpleRipperApp:
                 item for item in (self.state.errors or [])
                 if not (isinstance(item, dict) and str(item.get("id") or "") == decision_id)
             ]
+        self._persist_pending_decision_state()
 
     def queue_manual_error_action(self, decision_id: str, action: str) -> dict[str, Any]:
         action_name = str(action or "").strip().lower()
@@ -3425,6 +3562,7 @@ class SimpleRipperApp:
                 else:
                     errors.append(item)
             self.state.errors = errors
+        self._persist_pending_decision_state()
         log_event(self.config, "verification_error_action_queued", decision_id=decision_id, action=action_name, source_path=str(pending.get("source_path") or ""))
         if not self.state.running:
             return self.process_next_queued_error_action()
@@ -3437,6 +3575,7 @@ class SimpleRipperApp:
                 return {"status": "idle"}
             next_item = dict(queue.pop(0))
             self.state.queued_error_actions = queue
+        self._persist_pending_decision_state()
         self.set_phase("processing_error_action")
         try:
             return self.resolve_error_action(str(next_item.get("id") or ""), str(next_item.get("action") or ""))
@@ -3450,6 +3589,15 @@ class SimpleRipperApp:
             self.log_error(f"Queued error action failed: {exc}", failure_type="queued_error_action", source_path=str((self.state.pending_decisions or {}).get(decision_id, {}).get("source_path") or None))
             log_event(self.config, "queued_error_action_failed", decision_id=decision_id, action=action, error=str(exc))
             return {"status": "error", "decision_id": decision_id, "action": action, "error": str(exc)}
+
+    def _drain_queued_error_actions(self) -> bool:
+        processed_any = False
+        while True:
+            with self._lock:
+                if not self.state.queued_error_actions:
+                    return processed_any
+            self.process_next_queued_error_action()
+            processed_any = True
 
     def restore_pending_error_action(self, decision_id: str) -> None:
         with self._lock:
@@ -3469,6 +3617,7 @@ class SimpleRipperApp:
                 else:
                     restored_errors.append(item)
             self.state.errors = restored_errors
+            self._persist_pending_decision_state()
 
     def has_pending_decisions(self) -> bool:
         with self._lock:
@@ -3515,6 +3664,10 @@ class SimpleRipperApp:
             "track_policy": dict(stream_policy),
             "downscale": dict(downscale_plan),
             "verification": dict(verification),
+            "message": f"{source}: {error.summary}",
+            "summary": error.summary,
+            "details": list(error.details),
+            "failure_type": "verification",
             "quarantine_path": str(quarantine_path) if quarantine_path is not None else None,
             "created_at": utc_now(),
             "queued_action": None,
@@ -3523,6 +3676,7 @@ class SimpleRipperApp:
             pending_map = self.state.pending_decisions or {}
             pending_map[decision_id] = pending
             self.state.pending_decisions = pending_map
+        self._persist_pending_decision_state()
         self.log_actionable_error(
             f"{source}: {error.summary}",
             source_path=str(source),
@@ -3747,6 +3901,7 @@ class SimpleRipperApp:
                 if not pending_map and self.state.current_phase in {"awaiting_user_decision", "processing_error_action"}:
                     self.state.current_phase = "idle"
                     self.state.current_file = None
+            self._persist_pending_decision_state()
             self.clear_error(decision_id)
             tmp_output_path.unlink(missing_ok=True)
             safe_unlink(ffmpeg_current_log_path(self.config))
@@ -3961,12 +4116,10 @@ class SimpleRipperApp:
                     folders = list(self.selected_folders)
                     stop_after_current = self.state.stop_after_current
                     force_stop = self.state.force_stop
-                    queued_actions = bool(self.state.queued_error_actions)
                 if force_stop:
                     self.reset_runtime_state(clear_errors=False)
                     break
-                if queued_actions:
-                    self.process_next_queued_error_action()
+                if self._drain_queued_error_actions():
                     continue
                 if stop_after_current:
                     self.reset_runtime_state(clear_errors=False)
@@ -3983,12 +4136,16 @@ class SimpleRipperApp:
                     candidates = scan_candidates(folders, self.config)
                 except OSError as exc:
                     self.log_error(str(exc))
+                    if self._drain_queued_error_actions():
+                        continue
                     if not self.schedule_rescan_wait(300, "scan_error"):
                         break
                     continue
                 self.set_phase("loading_queue")
                 log_event(self.config, "scan_end", candidates=len(candidates))
                 if not candidates:
+                    if self._drain_queued_error_actions():
+                        continue
                     if not self.schedule_rescan_wait(3600, "no_candidates"):
                         break
                     continue
@@ -3996,6 +4153,8 @@ class SimpleRipperApp:
                 candidate = self.pick_next_candidate(candidates)
                 if candidate is None:
                     if scan_cache_enabled(self.config) and cached_candidate_paths(self.config):
+                        continue
+                    if self._drain_queued_error_actions():
                         continue
                     if not self.schedule_rescan_wait(3600, "no_usable_candidates"):
                         break

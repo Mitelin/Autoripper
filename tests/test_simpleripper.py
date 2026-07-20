@@ -3460,6 +3460,120 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual((app.state.errors or [])[0]["actions"], [])
             self.assertEqual((app.state.errors or [])[0]["queued_action"], "approve")
 
+    def test_pending_decision_and_queued_action_are_restored_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            decision_id = "verify:test:local"
+            app.state.running = True
+            app.state.pending_decisions = {
+                decision_id: {
+                    "id": decision_id,
+                    "source_path": "movie.mkv",
+                    "replacement_path": "movie.mkv",
+                    "work_dir_path": str(root / "inspection" / "pending" / "movie"),
+                    "local_output_path": str(root / "inspection" / "pending" / "movie" / "output.mkv"),
+                    "temp_output_path": str(root / "inspection" / "pending" / "movie" / "temp.mkv"),
+                    "job_id": "job-1",
+                    "stage": "local_verification",
+                    "source_before_signature": {"size_bytes": 1},
+                    "source_metadata": {"path": "movie.mkv"},
+                    "output_metadata": {"path": "movie.mkv"},
+                    "track_policy": {"applied": False},
+                    "downscale": {"applied": False},
+                    "verification": {"status": "failed"},
+                    "message": "movie.mkv: Local verification failed: size_reduction_ok",
+                    "summary": "Local verification failed: size_reduction_ok",
+                    "details": ["size_reduction_ok"],
+                    "failure_type": "verification",
+                    "created_at": "2026-07-20T10:00:00+00:00",
+                    "queued_action": None,
+                }
+            }
+            app.state.errors = [{"id": decision_id, "summary": "needs decision", "source_path": "movie.mkv", "actions": ["approve", "skip"]}]
+
+            result = app.queue_manual_error_action(decision_id, "skip")
+
+            self.assertEqual(result["status"], "queued")
+
+            restarted = simpleripper.SimpleRipperApp(config)
+
+            self.assertIn(decision_id, restarted.state.pending_decisions or {})
+            self.assertEqual(restarted.state.queued_error_actions, [{"id": decision_id, "action": "skip"}])
+            restored_error = next(item for item in (restarted.state.errors or []) if isinstance(item, dict) and item.get("id") == decision_id)
+            self.assertEqual(restored_error["queued_action"], "skip")
+            self.assertEqual(restored_error["actions"], [])
+
+            processed: list[tuple[str, str]] = []
+
+            def fake_resolve(decision_id_arg: str, action_arg: str) -> dict[str, str]:
+                processed.append((decision_id_arg, action_arg))
+                with restarted._lock:
+                    pending_map = restarted.state.pending_decisions or {}
+                    pending_map.pop(decision_id_arg, None)
+                    restarted.state.pending_decisions = pending_map
+                restarted.clear_error(decision_id_arg)
+                return {"status": "done", "decision_id": decision_id_arg, "action": action_arg}
+
+            with patch.object(restarted, "resolve_error_action", side_effect=fake_resolve):
+                processed_result = restarted.process_next_queued_error_action()
+
+            self.assertEqual(processed_result["status"], "done")
+            self.assertEqual(processed, [(decision_id, "skip")])
+            self.assertEqual(restarted.state.queued_error_actions, [])
+            self.assertEqual(restarted.state.pending_decisions, {})
+            self.assertEqual(restarted.state.errors, [])
+            self.assertFalse(simpleripper.pending_decisions_path(config).exists())
+
+    def test_restart_cleans_up_stale_pending_decision_workspace_without_active_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            stale_dir = root / "inspection" / "pending_decisions" / "stale-decision"
+            stale_dir.mkdir(parents=True)
+            (stale_dir / "artifact.txt").write_text("stale", encoding="utf-8")
+
+            app = simpleripper.SimpleRipperApp(config)
+
+            self.assertFalse(stale_dir.exists())
+            self.assertFalse(simpleripper.pending_decisions_path(config).exists())
+            self.assertEqual(app.state.pending_decisions, {})
+
+    def test_persisted_pending_state_keeps_active_workspace_and_removes_orphan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            active_dir = root / "inspection" / "pending_decisions" / "active-decision"
+            stale_dir = root / "inspection" / "pending_decisions" / "stale-decision"
+            active_dir.mkdir(parents=True)
+            stale_dir.mkdir(parents=True)
+            (active_dir / "keep.txt").write_text("active", encoding="utf-8")
+            (stale_dir / "remove.txt").write_text("stale", encoding="utf-8")
+
+            simpleripper.write_pending_decision_state(
+                config,
+                {
+                    "verify:test:local": {
+                        "id": "verify:test:local",
+                        "source_path": "movie.mkv",
+                        "work_dir_path": str(active_dir),
+                        "message": "movie.mkv: Local verification failed: size_reduction_ok",
+                        "summary": "Local verification failed: size_reduction_ok",
+                        "details": ["size_reduction_ok"],
+                        "failure_type": "verification",
+                        "created_at": "2026-07-20T10:00:00+00:00",
+                    }
+                },
+                [],
+            )
+
+            app = simpleripper.SimpleRipperApp(config)
+
+            self.assertTrue(active_dir.exists())
+            self.assertFalse(stale_dir.exists())
+            self.assertIn("verify:test:local", app.state.pending_decisions or {})
+
     def test_run_loop_continues_to_next_item_after_pending_verification_decision(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3830,6 +3944,38 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(app.state.queued_error_actions, [])
             self.assertEqual(app.state.pending_decisions, {})
             self.assertEqual(app.state.errors, [])
+
+    def test_run_loop_processes_queued_error_action_before_rescan_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            app = simpleripper.SimpleRipperApp(config)
+            decision_id = "verify:test:local"
+            app.state.running = True
+            app._running_requested = True
+            app.state.pending_decisions = {decision_id: {"id": decision_id, "source_path": "movie.mkv", "queued_action": "skip"}}
+            app.state.errors = [{"id": decision_id, "summary": "needs decision", "source_path": "movie.mkv", "actions": [], "queued_action": "skip"}]
+
+            scan_calls = {"count": 0}
+            processed: list[tuple[str, str]] = []
+
+            def fake_scan(_folders: list[Path], _config: dict[str, object]) -> list[Path]:
+                scan_calls["count"] += 1
+                if scan_calls["count"] == 1:
+                    app.state.queued_error_actions = [{"id": decision_id, "action": "skip"}]
+                return []
+
+            def fake_process_next() -> dict[str, str]:
+                processed.append((decision_id, "skip"))
+                app.state.queued_error_actions = []
+                return {"status": "done", "decision_id": decision_id, "action": "skip"}
+
+            with patch("simpleripper.scan_candidates", side_effect=fake_scan), patch.object(app, "process_next_queued_error_action", side_effect=fake_process_next), patch.object(app, "schedule_rescan_wait", return_value=False) as wait_mock:
+                app._run_loop()
+
+            self.assertEqual(processed, [(decision_id, "skip")])
+            self.assertEqual(scan_calls["count"], 2)
+            wait_mock.assert_called_once_with(3600, "no_candidates")
 
 
 if __name__ == "__main__":
