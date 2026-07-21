@@ -2894,6 +2894,107 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertIn("candidate_cache_refresh_done", joined)
             self.assertIn('duration_ms=', joined)
 
+    def test_pick_next_candidate_reports_cache_refresh_phase_without_stale_ffmpeg_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "Movie" / "movie.mkv"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(b"x" * 20)
+            simpleripper.fast_inventory_scan([source.parent], config)
+
+            app.state.ffmpeg_progress = {"out_time": "03:17:08.640000", "fps": "17.65", "speed": "0.736x"}
+            app.state.output_size_bytes = 6054477824
+            app.state.current_phase = "encoding"
+            app.state.current_file = "old-file.mkv"
+
+            details = {
+                "path": source,
+                "status": "ok",
+                "metadata": {"file_size_bytes": source.stat().st_size, "video_codec": "h264", "media_type": "movie", "duration_seconds": 120.0},
+                "score": 10.0,
+                "skip_reason": None,
+                "candidate_reason": "needs_encode",
+            }
+            seen_statuses: list[dict[str, Any]] = []
+
+            def fake_refresh(_config: dict[str, Any], _details: dict[str, Any], refresh_folder_states: bool = True) -> None:
+                seen_statuses.append(app.status())
+
+            with patch("simpleripper.inspect_candidate", return_value=details), patch("simpleripper.update_cache_deep_check", side_effect=fake_refresh):
+                selected = app.pick_next_candidate([source])
+
+            self.assertEqual(selected, source)
+            self.assertEqual(len(seen_statuses), 1)
+            status = seen_statuses[0]
+            self.assertEqual(status["current_phase"], "refreshing_candidate_cache")
+            self.assertEqual(status["current_summary"]["status"], "refreshing_candidate_cache")
+            self.assertEqual(status["current_file"], str(source))
+            self.assertIsNone(status["ffmpeg_progress"])
+            self.assertIsNone(status["current_summary"]["progress_time"])
+            self.assertEqual(status["output_size_bytes"], 0)
+
+    def test_pick_next_candidate_batches_folder_state_refresh_until_selection_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            app = simpleripper.SimpleRipperApp(config)
+            first = root / "library" / "Series" / "Show" / "Season 01" / "episode1.mkv"
+            second = root / "library" / "Series" / "Show" / "Season 01" / "episode2.mkv"
+            third = root / "library" / "Series" / "Show" / "Season 02" / "episode3.mkv"
+            for path in (first, second, third):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x" * 20)
+            simpleripper.fast_inventory_scan([root / "library"], config)
+
+            details = [
+                {"path": first, "status": "ok", "metadata": {"file_size_bytes": first.stat().st_size, "video_codec": "h264", "media_type": "series"}, "score": 1.0, "skip_reason": "under_retention_size_limit", "candidate_reason": "under_retention_size_limit", "profile_mismatch_reasons": ["video_codec_mismatch:h264!=h265,hevc"], "retention_size_policy": {"enabled": True, "oversized": False}},
+                {"path": second, "status": "ok", "metadata": {"file_size_bytes": second.stat().st_size, "video_codec": "h264", "media_type": "series"}, "score": 2.0, "skip_reason": "under_retention_size_limit", "candidate_reason": "under_retention_size_limit", "profile_mismatch_reasons": ["video_codec_mismatch:h264!=h265,hevc"], "retention_size_policy": {"enabled": True, "oversized": False}},
+                {"path": third, "status": "ok", "metadata": {"file_size_bytes": third.stat().st_size, "video_codec": "h264", "media_type": "series"}, "score": 3.0, "skip_reason": None, "candidate_reason": "needs_encode", "profile_mismatch_reasons": [], "retention_size_policy": {"enabled": True, "oversized": True}},
+            ]
+            refreshed_batches: list[list[Path]] = []
+
+            def fake_refresh_batch(_config: dict[str, Any], sources: list[Path] | tuple[Path, ...] | set[Path]) -> None:
+                refreshed_batches.append(list(sources))
+
+            with patch("simpleripper.inspect_candidate", side_effect=details), patch("simpleripper.refresh_folder_state_batch", side_effect=fake_refresh_batch):
+                selected = app.pick_next_candidate([first, second, third])
+
+            self.assertEqual(selected, third)
+            self.assertEqual(refreshed_batches, [[first, second, third]])
+
+    def test_refresh_folder_state_batch_reuses_shared_ancestors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            first = root / "library" / "Series" / "Show" / "Season 01" / "episode1.mkv"
+            second = root / "library" / "Series" / "Show" / "Season 02" / "episode2.mkv"
+            for path in (first, second):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x" * 20)
+
+            visited: list[Path] = []
+
+            def fake_refresh(_connection: object, folder: Path, _config: dict[str, Any], inventory_generation_id: str | None = None) -> str:
+                visited.append(folder)
+                return "partial"
+
+            with patch("simpleripper.refresh_folder_state", side_effect=fake_refresh):
+                simpleripper.refresh_folder_state_batch(config, [first, second])
+
+            expected = [
+                root / "library" / "Series" / "Show" / "Season 01",
+                root / "library" / "Series" / "Show" / "Season 02",
+                root / "library" / "Series" / "Show",
+                root / "library" / "Series",
+                root / "library",
+            ]
+            self.assertEqual(visited, expected)
+
     def test_history_summary_fields_flattens_before_after_values(self) -> None:
         source_meta = {"file_size_bytes": 1000, "video_codec": "h264", "audio_stream_count": 2, "subtitle_stream_count": 1}
         output_meta = {"file_size_bytes": 400, "video_codec": "hevc", "audio_stream_count": 1, "subtitle_stream_count": 1}

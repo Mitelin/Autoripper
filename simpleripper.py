@@ -1978,9 +1978,9 @@ def refresh_folder_state(connection: sqlite3.Connection, folder: Path, config: d
     return state
 
 
-def refresh_folder_state_upwards(config: dict[str, Any], source: Path) -> None:
+def folder_state_refresh_paths(config: dict[str, Any], source: Path) -> list[Path]:
     if not folder_state_cache_enabled(config):
-        return
+        return []
     root_candidates = [Path(path) for path in ((config.get("libraries") or {}).get("roots") or [])]
     root_candidates.extend(Path(item["path"]) for item in normalize_selected_folder_entries((config.get("scan") or {}).get("selected_folders") or []))
     try:
@@ -1996,20 +1996,42 @@ def refresh_folder_state_upwards(config: dict[str, Any], source: Path) -> None:
         except (OSError, ValueError):
             continue
     stop_root = max(roots, key=lambda item: len(str(item)), default=source.parent.resolve() if source.parent.exists() else source.parent)
+    paths: list[Path] = []
+    current = source.parent if source.suffix else source
+    while True:
+        paths.append(current)
+        try:
+            current_resolved = current.resolve()
+        except OSError:
+            current_resolved = current
+        if current_resolved == stop_root:
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return paths
+
+
+def refresh_folder_state_batch(config: dict[str, Any], sources: list[Path] | tuple[Path, ...] | set[Path]) -> None:
+    if not folder_state_cache_enabled(config):
+        return
+    unique_paths: dict[str, Path] = {}
+    for source in sources:
+        for folder in folder_state_refresh_paths(config, source):
+            key = str(folder)
+            if key not in unique_paths:
+                unique_paths[key] = folder
+    if not unique_paths:
+        return
+    folders = sorted(unique_paths.values(), key=lambda item: len(item.parts), reverse=True)
     with open_worker_cache(config) as connection:
-        current = source.parent if source.suffix else source
-        while True:
-            refresh_folder_state(connection, current, config)
-            try:
-                current_resolved = current.resolve()
-            except OSError:
-                current_resolved = current
-            if current_resolved == stop_root:
-                break
-            parent = current.parent
-            if parent == current:
-                break
-            current = parent
+        for folder in folders:
+            refresh_folder_state(connection, folder, config)
+
+
+def refresh_folder_state_upwards(config: dict[str, Any], source: Path) -> None:
+    refresh_folder_state_batch(config, [source])
 
 
 def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str, Any]:
@@ -2274,7 +2296,7 @@ def estimated_saved_bytes_from_details(details: dict[str, Any]) -> int | None:
         return None
 
 
-def update_cache_deep_check(config: dict[str, Any], details: dict[str, Any]) -> None:
+def update_cache_deep_check(config: dict[str, Any], details: dict[str, Any], refresh_folder_states: bool = True) -> None:
     if not scan_cache_enabled(config):
         return
     source = Path(str(details.get("path")))
@@ -2347,7 +2369,8 @@ def update_cache_deep_check(config: dict[str, Any], details: dict[str, Any]) -> 
             log_event(config, "candidate_blocked", source_path=str(source), error=last_error, failure_count=failure_count)
         else:
             log_event(config, "candidate_retry_scheduled", source_path=str(source), error=last_error, failure_count=failure_count, retry_after=retry_after)
-    refresh_folder_state_upwards(config, source)
+    if refresh_folder_states:
+        refresh_folder_state_upwards(config, source)
 
 
 def update_cache_job_success(config: dict[str, Any], source: Path, replacement: Path | None = None) -> None:
@@ -4069,7 +4092,11 @@ class SimpleRipperApp:
     def pick_next_candidate(self, candidates: list[Path]) -> Path | None:
         if not candidates:
             return None
+        refresh_sources: list[Path] = []
         for candidate in candidates:
+            with self._lock:
+                self.state.ffmpeg_progress = None
+                self.state.output_size_bytes = 0
             self.set_phase("probing_candidate", candidate)
             log_event(self.config, "candidate_selected", source_path=str(candidate))
             log_event(self.config, "candidate_probe_start", source_path=str(candidate))
@@ -4086,8 +4113,17 @@ class SimpleRipperApp:
                 score=details.get("score"),
                 duration_ms=probe_duration_ms,
             )
+            with self._lock:
+                self.state.ffmpeg_progress = None
+                self.state.output_size_bytes = 0
+            self.set_phase(
+                "refreshing_candidate_cache",
+                candidate,
+                extra={"source_metadata": details.get("metadata")} if isinstance(details.get("metadata"), dict) else None,
+            )
             cache_refresh_started_at = time.perf_counter()
-            update_cache_deep_check(self.config, details)
+            update_cache_deep_check(self.config, details, refresh_folder_states=False)
+            refresh_sources.append(candidate)
             cache_refresh_duration_ms = int((time.perf_counter() - cache_refresh_started_at) * 1000)
             log_event(self.config, "candidate_cache_refresh_done", source_path=str(candidate), status=details.get("status"), decision=("skip" if details.get("skip_reason") else "encode_candidate" if details.get("status") == "ok" else "failed"), duration_ms=cache_refresh_duration_ms)
             if details.get("status") != "ok":
@@ -4105,8 +4141,10 @@ class SimpleRipperApp:
                     )
                 log_event(self.config, "candidate_scan_skipped", source_path=str(candidate), reason=details.get("skip_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"), retention_size_policy=details.get("retention_size_policy"))
                 continue
+            refresh_folder_state_batch(self.config, refresh_sources)
             log_event(self.config, "candidate_ready", source_path=str(details["path"]), score=details.get("score"), codec=(details.get("metadata") or {}).get("video_codec"), candidate_reason=details.get("candidate_reason"), profile_mismatch_reasons=details.get("profile_mismatch_reasons"), retention_size_policy=details.get("retention_size_policy"))
             return Path(details["path"])
+        refresh_folder_state_batch(self.config, refresh_sources)
         return None
 
     def _run_loop(self) -> None:
