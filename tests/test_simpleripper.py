@@ -1039,10 +1039,44 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("restoreDisclosureState(openDisclosures)", simpleripper.INDEX_HTML)
 
     def test_web_ui_renders_approve_and_skip_actions_for_actionable_errors(self) -> None:
-        self.assertIn("function approveError(id){post('/api/errors/action',{id:id,action:'approve'})}", simpleripper.INDEX_HTML)
-        self.assertIn("function skipError(id){post('/api/errors/action',{id:id,action:'skip'})}", simpleripper.INDEX_HTML)
+        self.assertIn("function approveError(id){post('/api/errors/action',{id:id,action:'approve'},{pendingMessage:'Queuing approve decision…',optimisticUpdate:(status)=>optimisticQueueErrorStatus(status,id,'approve')})}", simpleripper.INDEX_HTML)
+        self.assertIn("function skipError(id){post('/api/errors/action',{id:id,action:'skip'},{pendingMessage:'Queuing skip decision…',optimisticUpdate:(status)=>optimisticQueueErrorStatus(status,id,'skip')})}", simpleripper.INDEX_HTML)
         self.assertIn("Approve</button>", simpleripper.INDEX_HTML)
         self.assertIn("Skip</button>", simpleripper.INDEX_HTML)
+
+    def test_web_ui_shows_pending_feedback_helpers(self) -> None:
+        self.assertIn("let pendingUiAction=''", simpleripper.INDEX_HTML)
+        self.assertIn("function setPendingUiAction(message)", simpleripper.INDEX_HTML)
+        self.assertIn("function cloneStatus(status)", simpleripper.INDEX_HTML)
+        self.assertIn("function optimisticQueueErrorStatus(status,id,action)", simpleripper.INDEX_HTML)
+        self.assertIn("await getStatus()", simpleripper.INDEX_HTML)
+
+    def test_error_action_post_returns_fast_acknowledgement(self) -> None:
+        class FakeApp:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def queue_manual_error_action(self, decision_id: str, action: str) -> None:
+                self.calls.append((decision_id, action))
+
+        class FakeHandler:
+            def __init__(self, app: FakeApp) -> None:
+                self.app = app
+                self.path = "/api/errors/action"
+                self.responses: list[tuple[object, int]] = []
+
+            def read_payload(self) -> dict[str, str]:
+                return {"id": "verify:test", "action": "skip"}
+
+            def send_json(self, payload: object, status: int = 200) -> None:
+                self.responses.append((payload, status))
+
+        handler = FakeHandler(FakeApp())
+
+        simpleripper.SimpleRipperHandler.do_POST(handler)  # type: ignore[arg-type]
+
+        self.assertEqual(handler.app.calls, [("verify:test", "skip")])
+        self.assertEqual(handler.responses, [({"ok": True}, 200)])
 
     def test_web_ui_marks_queued_error_as_warning(self) -> None:
         self.assertIn(".err.warn,.err-card.warn{background:var(--warn-soft)", simpleripper.INDEX_HTML)
