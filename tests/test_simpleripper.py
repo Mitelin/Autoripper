@@ -3082,7 +3082,7 @@ class SimpleRipperTests(unittest.TestCase):
             jobs = (root / "history" / "jobs.jsonl").read_text(encoding="utf-8")
             self.assertIn("interrupted", jobs)
 
-    def test_recover_runtime_state_cleans_workspace_before_writing_resume_request(self) -> None:
+    def test_recover_runtime_state_preserves_post_encode_workspace_before_writing_resume_request(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self.make_config(root)
@@ -3110,10 +3110,10 @@ class SimpleRipperTests(unittest.TestCase):
 
             original_write_resume_request = simpleripper.write_resume_request
 
-            def checking_write_resume_request(test_config: dict, resume_source: Path, phase: str, job_id: str | None = None) -> None:
-                self.assertFalse(work_current.exists())
+            def checking_write_resume_request(test_config: dict, resume_source: Path, phase: str, job_id: str | None = None, extra: dict[str, Any] | None = None) -> None:
+                self.assertTrue(work_current.exists())
                 self.assertFalse(simpleripper.current_job_path(test_config).exists())
-                original_write_resume_request(test_config, resume_source, phase, job_id)
+                original_write_resume_request(test_config, resume_source, phase, job_id, extra=extra)
 
             with patch("simpleripper.write_resume_request", side_effect=checking_write_resume_request):
                 simpleripper.recover_runtime_state(config)
@@ -3121,11 +3121,11 @@ class SimpleRipperTests(unittest.TestCase):
             resume_request = simpleripper.load_resume_request(config)
             self.assertIsNotNone(resume_request)
             self.assertEqual((resume_request or {})["source_path"], str(source))
-            self.assertFalse(work_current.exists())
+            self.assertTrue(work_current.exists())
             self.assertFalse(simpleripper.current_job_path(config).exists())
 
-    def test_recover_runtime_state_requeues_all_incomplete_pre_swap_phases(self) -> None:
-        phases = ["copying_source", "probing_source", "encoding", "probing_output", "verifying", "uploading"]
+    def test_recover_runtime_state_requeues_early_incomplete_phases_from_start(self) -> None:
+        phases = ["copying_source", "probing_source", "encoding"]
         for phase in phases:
             with self.subTest(phase=phase):
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -3160,6 +3160,48 @@ class SimpleRipperTests(unittest.TestCase):
                     self.assertEqual((resume_request or {})["source_path"], str(source))
                     self.assertEqual((resume_request or {})["phase"], phase)
                     self.assertFalse(work_current.exists())
+                    self.assertFalse(simpleripper.current_job_path(config).exists())
+
+    def test_recover_runtime_state_preserves_workdir_for_post_encode_resume_phases(self) -> None:
+        phases = ["probing_output", "verifying", "uploading"]
+        for phase in phases:
+            with self.subTest(phase=phase):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    config = self.make_config(root)
+                    source = root / "library" / "movie.mkv"
+                    source.parent.mkdir(parents=True)
+                    source.write_text("source", encoding="utf-8")
+                    work_current = root / "work" / "current"
+                    local_output = work_current / "output" / "movie.mkv"
+                    temp_output = work_current / "temp" / "movie.mkv"
+                    local_output.parent.mkdir(parents=True)
+                    temp_output.parent.mkdir(parents=True)
+                    local_output.write_text("encoded", encoding="utf-8")
+                    temp_output.write_text("temp", encoding="utf-8")
+                    simpleripper.write_json(
+                        simpleripper.current_job_path(config),
+                        {
+                            "job_id": f"job-{phase}",
+                            "phase": phase,
+                            "source_path": str(source),
+                            "replacement_path": str(source),
+                            "local_output_path": str(local_output),
+                            "temp_output_path": str(temp_output),
+                            "source_metadata": {"media_type": "default", "file_size_bytes": source.stat().st_size, "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0},
+                            "track_policy": {"applied": False},
+                            "downscale": {"applied": False},
+                        },
+                    )
+
+                    simpleripper.recover_runtime_state(config)
+
+                    resume_request = simpleripper.load_resume_request(config)
+                    self.assertIsNotNone(resume_request)
+                    self.assertEqual((resume_request or {})["source_path"], str(source))
+                    self.assertEqual((resume_request or {})["phase"], phase)
+                    self.assertTrue(work_current.exists())
+                    self.assertTrue(local_output.exists())
                     self.assertFalse(simpleripper.current_job_path(config).exists())
 
     def test_recover_runtime_state_writes_explicit_crash_recovery_log_events(self) -> None:
@@ -3223,7 +3265,7 @@ class SimpleRipperTests(unittest.TestCase):
             app.state.running = True
             processed: list[Path] = []
 
-            def fake_process_one(path: Path) -> None:
+            def fake_process_one(path: Path, resume_payload: dict[str, Any] | None = None) -> None:
                 processed.append(path)
                 app.state.force_stop = True
 
@@ -3232,6 +3274,65 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertEqual(processed, [source])
             scan_candidates_mock.assert_not_called()
+            self.assertFalse(simpleripper.resume_request_path(config).exists())
+
+    def test_process_resume_request_verifying_resumes_existing_output_without_reencoding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["retention_size_policy"]["enabled"] = False
+            source = root / "library" / "movie.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_text("source", encoding="utf-8")
+            work_current = root / "work" / "current"
+            local_input = work_current / "input" / "movie.mkv"
+            local_output = work_current / "output" / "movie.mkv"
+            local_input.parent.mkdir(parents=True)
+            local_output.parent.mkdir(parents=True)
+            local_input.write_text("copied-source", encoding="utf-8")
+            local_output.write_text("encoded-output", encoding="utf-8")
+            app = simpleripper.SimpleRipperApp(config)
+            app._resume_request = {
+                "source_path": str(source),
+                "phase": "verifying",
+                "job_id": "job-verify-resume",
+                "replacement_path": str(source),
+                "local_input_path": str(local_input),
+                "local_output_path": str(local_output),
+                "temp_output_path": str(root / "work" / "temp-upload" / "movie.mkv"),
+                "source_metadata": {"media_type": "default", "file_size_bytes": source.stat().st_size, "duration_seconds": 10.0, "audio_stream_count": 1, "subtitle_stream_count": 0},
+                "track_policy": {"applied": False},
+                "downscale": {"applied": False},
+            }
+
+            def fake_ffprobe(_config: dict[str, Any], path: Path, media_type: str) -> tuple[dict[str, Any], dict[str, Any]]:
+                return {}, {
+                    "path": str(path),
+                    "media_type": media_type,
+                    "file_size_bytes": path.stat().st_size,
+                    "duration_seconds": 10.0,
+                    "video_codec": "h264",
+                    "video_pix_fmt": "yuv420p10le",
+                    "audio_stream_count": 1,
+                    "subtitle_stream_count": 0,
+                    "video_height": 1080,
+                }
+
+            def fake_verify(_config: dict[str, Any], source_meta: dict[str, Any], output_path: Path, output_meta: dict[str, Any], stream_policy: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+                return {
+                    "status": "ok",
+                    "output_size_bytes": output_path.stat().st_size,
+                    "output_to_source_ratio": 0.5,
+                    "overall_bitrate_kbps": 1000,
+                }, []
+
+            with patch("simpleripper.subprocess.Popen", side_effect=AssertionError("ffmpeg should not restart during verifying resume")), patch("simpleripper.ffprobe_metadata", side_effect=fake_ffprobe), patch("simpleripper.verify_output", side_effect=fake_verify), patch("simpleripper.refresh_jellyfin", return_value={"status": "ok"}):
+                processed = app.process_resume_request()
+
+            self.assertTrue(processed)
+            jobs = (root / "history" / "jobs.jsonl").read_text(encoding="utf-8")
+            self.assertIn("resume_post_encode_processing", "\n".join(simpleripper.tail_text_lines(simpleripper.app_log_path(config), 40)))
+            self.assertIn('"status": "done"', jobs)
             self.assertFalse(simpleripper.resume_request_path(config).exists())
 
     def test_recover_runtime_state_requeues_final_verify_from_start(self) -> None:

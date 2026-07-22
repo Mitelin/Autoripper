@@ -258,15 +258,18 @@ def load_resume_request(config: dict[str, Any]) -> dict[str, Any] | None:
     return payload
 
 
-def write_resume_request(config: dict[str, Any], source_path: Path, phase: str, job_id: str | None = None) -> None:
+def write_resume_request(config: dict[str, Any], source_path: Path, phase: str, job_id: str | None = None, extra: dict[str, Any] | None = None) -> None:
+    payload = {
+        "source_path": str(source_path),
+        "phase": phase,
+        "job_id": job_id,
+        "requested_at": utc_now(),
+    }
+    if isinstance(extra, dict):
+        payload.update(extra)
     write_json(
         resume_request_path(config),
-        {
-            "source_path": str(source_path),
-            "phase": phase,
-            "job_id": job_id,
-            "requested_at": utc_now(),
-        },
+        payload,
     )
 
 
@@ -3208,6 +3211,8 @@ def recover_runtime_state(config: dict[str, Any]) -> None:
     job_id = str(payload.get("job_id") or "").strip() or None
     recovered_status = None
     recovery_details: dict[str, Any] = {}
+    preserve_work_current = False
+    resume_extra: dict[str, Any] | None = None
     incomplete_phases = {"copying_source", "probing_source", "encoding", "probing_output", "verifying", "uploading", "swapping", "final_verify", "refreshing_jellyfin"}
     log_event(
         config,
@@ -3228,6 +3233,10 @@ def recover_runtime_state(config: dict[str, Any]) -> None:
         if local_output_path and local_output_path.exists():
             safe_unlink(local_output_path)
         recovered_status = "interrupted"
+    elif phase in {"probing_output", "verifying", "uploading"} and local_output_path and local_output_path.exists():
+        recovered_status = "resume_post_encode"
+        preserve_work_current = True
+        resume_extra = dict(payload)
     elif phase in {"copying_source", "probing_source", "probing_output", "verifying"}:
         if local_output_path and local_output_path.exists():
             safe_unlink(local_output_path)
@@ -3258,9 +3267,11 @@ def recover_runtime_state(config: dict[str, Any]) -> None:
         source_path=str(source_path) if source_path else None,
         phase=phase,
         recovery_status=recovered_status,
+        preserve_work_current=preserve_work_current,
         work_current_path=str(work_dir(config) / "current"),
     )
-    shutil.rmtree(work_dir(config) / "current", ignore_errors=True)
+    if not preserve_work_current:
+        shutil.rmtree(work_dir(config) / "current", ignore_errors=True)
     safe_unlink(path)
     log_event(
         config,
@@ -3269,12 +3280,13 @@ def recover_runtime_state(config: dict[str, Any]) -> None:
         source_path=str(source_path) if source_path else None,
         phase=phase,
         recovery_status=recovered_status,
+        preserve_work_current=preserve_work_current,
         work_current_exists=(work_dir(config) / "current").exists(),
         current_job_exists=path.exists(),
     )
     if recovered_status:
         if source_path and phase in incomplete_phases and source_path.exists() and stop_reason != "force_stop":
-            write_resume_request(config, source_path, phase, job_id)
+            write_resume_request(config, source_path, phase, job_id, extra=resume_extra)
             recovery_details["resume_requested"] = True
             log_event(
                 config,
@@ -3511,7 +3523,7 @@ class SimpleRipperApp:
             log_event(self.config, "resume_request_skipped", source_path=str(source), phase=phase, job_id=job_id, reason="missing_source")
             return False
         log_event(self.config, "resume_request_processing", source_path=str(source), phase=phase, job_id=job_id)
-        self.process_one(source)
+        self.process_one(source, resume_payload=payload)
         return True
 
     def log_error(self, message: str, source_path: str | None = None, failure_type: str | None = None, summary: str | None = None, details: list[str] | None = None) -> None:
@@ -4220,43 +4232,64 @@ class SimpleRipperApp:
             safe_unlink(ffmpeg_current_log_path(self.config))
             safe_unlink(current_job_path(self.config))
 
-    def process_one(self, source: Path) -> None:
+    def process_one(self, source: Path, resume_payload: dict[str, Any] | None = None) -> None:
         lock_path = write_source_lock(source, self.config)
         if lock_path is None:
             log_event(self.config, "candidate_locked", source_path=str(source))
             return
-        job_id = f"{int(time.time())}-{file_lock_id(source)[:12]}"
+        resume_payload = dict(resume_payload or {})
+        resume_phase = str(resume_payload.get("phase") or "").strip()
+        resume_job_id = str(resume_payload.get("job_id") or "").strip() or None
+        resume_local_output_text = str(resume_payload.get("local_output_path") or "").strip()
+        resume_local_output = Path(resume_local_output_text) if resume_local_output_text else None
+        resume_signature = resume_payload.get("source_before_signature") if isinstance(resume_payload.get("source_before_signature"), dict) else None
+        current_signature = source_signature(source) if source.exists() else None
+        can_resume_post_encode = bool(
+            resume_phase in {"probing_output", "verifying", "uploading"}
+            and resume_local_output is not None
+            and resume_local_output.exists()
+            and (not resume_signature or source_signature_matches(resume_signature, current_signature or {}))
+        )
+        job_id = resume_job_id or f"{int(time.time())}-{file_lock_id(source)[:12]}"
         work_root = work_dir(self.config)
         work_dir_path = work_root / "current"
-        if work_dir_path.exists():
+        if work_dir_path.exists() and not can_resume_post_encode:
             shutil.rmtree(work_dir_path, ignore_errors=True)
         work_dir_path.mkdir(parents=True, exist_ok=True)
-        replacement_path = target_output_path(source)
-        output = work_dir_path / "output" / replacement_path.name
+        replacement_text = str(resume_payload.get("replacement_path") or "").strip()
+        replacement_path = Path(replacement_text) if replacement_text else target_output_path(source)
+        output = resume_local_output if can_resume_post_encode and resume_local_output is not None else work_dir_path / "output" / replacement_path.name
         output.parent.mkdir(parents=True, exist_ok=True)
-        copied_source = work_dir_path / "input" / source.name
+        copied_source_text = str(resume_payload.get("local_input_path") or "").strip()
+        copied_source = Path(copied_source_text) if can_resume_post_encode and copied_source_text else work_dir_path / "input" / source.name
         copied_source.parent.mkdir(parents=True, exist_ok=True)
         metadata_dir = work_dir_path / "metadata"
         metadata_dir.mkdir(parents=True, exist_ok=True)
-        tmp_output = temp_upload_path(replacement_path)
-        job_summary: dict[str, Any] = {"job_id": job_id, "source_path": str(source), "replacement_path": str(replacement_path), "started_at": utc_now(), "status": "running"}
+        temp_output_text = str(resume_payload.get("temp_output_path") or "").strip()
+        tmp_output = Path(temp_output_text) if can_resume_post_encode and temp_output_text else temp_upload_path(replacement_path)
+        job_summary: dict[str, Any] = {"job_id": job_id, "source_path": str(source), "replacement_path": str(replacement_path), "started_at": str(resume_payload.get("started_at") or utc_now()), "status": "running"}
         succeeded = False
         discard_work_dir = False
         ffmpeg_started = False
         ffmpeg_completed = False
         try:
             log_event(self.config, "candidate_selected", job_id=job_id, source_path=str(source))
-            ensure_local_free_space(self.config, source.stat().st_size)
-            self.set_phase("copying_source", source, {"job_id": job_id, "replacement_path": str(replacement_path), "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output)})
-            log_event(self.config, "copy_source_start", job_id=job_id, source_path=str(source), local_input_path=str(copied_source))
-            copy_file_interruptible(source, copied_source, lambda: bool(self.state.force_stop))
-            log_event(self.config, "copy_source_done", job_id=job_id, bytes=copied_source.stat().st_size)
-            self.set_phase("probing_source", source, {"job_id": job_id, "replacement_path": str(replacement_path), "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output)})
-            source_probe, source_meta = ffprobe_metadata(self.config, copied_source, self.media_type_for_source(source))
+            if not can_resume_post_encode:
+                ensure_local_free_space(self.config, source.stat().st_size)
+                self.set_phase("copying_source", source, {"job_id": job_id, "replacement_path": str(replacement_path), "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output)})
+                log_event(self.config, "copy_source_start", job_id=job_id, source_path=str(source), local_input_path=str(copied_source))
+                copy_file_interruptible(source, copied_source, lambda: bool(self.state.force_stop))
+                log_event(self.config, "copy_source_done", job_id=job_id, bytes=copied_source.stat().st_size)
+                self.set_phase("probing_source", source, {"job_id": job_id, "replacement_path": str(replacement_path), "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output)})
+                source_probe, source_meta = ffprobe_metadata(self.config, copied_source, self.media_type_for_source(source))
+            else:
+                log_event(self.config, "resume_post_encode_processing", job_id=job_id, source_path=str(source), phase=resume_phase, local_output_path=str(output), temp_output_path=str(tmp_output))
+                source_probe, source_meta = ffprobe_metadata(self.config, source, self.media_type_for_source(source))
             source_meta["file_size_bytes"] = source.stat().st_size
-            source_before_signature = source_signature(source)
+            source_before_signature = dict(resume_signature or current_signature or source_signature(source))
             write_json(metadata_dir / "source.ffprobe.json", {"probe": source_probe, "metadata": source_meta})
             recovery_context = {"source_metadata": source_meta, "replacement_path": str(replacement_path)}
+            recovery_context["source_before_signature"] = source_before_signature
             stream_policy = select_streams(self.config, source_meta)
             downscale_plan = downscale_settings(self.config, source_meta)
             profile_matches, profile_mismatch_reasons = source_matches_target_profile(self.config, source_meta, str(source_meta.get("media_type") or "default"), stream_policy)
@@ -4298,7 +4331,6 @@ class SimpleRipperApp:
                 return
             if profile_mismatch_reasons:
                 log_event(self.config, "candidate_profile_mismatch", job_id=job_id, source_path=str(source), reasons=profile_mismatch_reasons, retention_size_policy=retention_size_policy)
-            self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
             settings = (self.config.get("quality_profiles") or {}).get(source_meta.get("media_type") or "default") or (self.config.get("quality_profiles") or {}).get("default") or {}
             crf = settings.get("crf", 24)
             if downscale_plan.get("applied") and downscale_plan.get("crf_override") is not None:
@@ -4343,40 +4375,42 @@ class SimpleRipperApp:
                     media_type=downscale_plan.get("media_type"),
                     bucket=downscale_plan.get("bucket"),
                 )
-            (work_dir_path / "logs").mkdir(parents=True, exist_ok=True)
-            ffmpeg_log = work_dir_path / "logs" / "ffmpeg.log"
-            log_event(self.config, "ffmpeg_start", job_id=job_id, command=command)
-            with ffmpeg_log.open("w", encoding="utf-8", errors="replace") as log_handle:
-                ffmpeg_started = True
-                self._ffmpeg = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=log_handle, text=True, encoding="utf-8", errors="replace")
-                self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "ffmpeg_pid": self._ffmpeg.pid, **recovery_context})
-                progress_state: dict[str, Any] = {}
-
-                def update_progress(snapshot: dict[str, Any]) -> None:
-                    with self._lock:
-                        progress_state.clear()
-                        progress_state.update(snapshot)
-
-                progress_thread = threading.Thread(target=consume_ffmpeg_progress, args=(self._ffmpeg.stdout, update_progress), daemon=True)
-                progress_thread.start()
-                while self._ffmpeg.poll() is None:
-                    with self._lock:
-                        self.state.output_size_bytes = output.stat().st_size if output.exists() else 0
-                        progress_snapshot = dict(progress_state)
-                        progress_snapshot["size_bytes"] = self.state.output_size_bytes
-                        self.state.ffmpeg_progress = progress_snapshot
-                        force = self.state.force_stop
-                    write_json(ffmpeg_current_log_path(self.config), {"job_id": job_id, "source_path": str(source), "updated_at": utc_now(), "progress": progress_snapshot})
+            if not can_resume_post_encode:
+                self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
+                (work_dir_path / "logs").mkdir(parents=True, exist_ok=True)
+                ffmpeg_log = work_dir_path / "logs" / "ffmpeg.log"
+                log_event(self.config, "ffmpeg_start", job_id=job_id, command=command)
+                with ffmpeg_log.open("w", encoding="utf-8", errors="replace") as log_handle:
+                    ffmpeg_started = True
+                    self._ffmpeg = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=log_handle, text=True, encoding="utf-8", errors="replace")
                     self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "ffmpeg_pid": self._ffmpeg.pid, **recovery_context})
-                    if force:
-                        terminate_process_gracefully(self._ffmpeg)
-                        raise ForceStopRequested("force stop requested")
-                    time.sleep(0.5)
-                progress_thread.join(timeout=1)
-                if self._ffmpeg.returncode != 0:
-                    raise FfmpegFailedError(f"ffmpeg failed with exit code {self._ffmpeg.returncode}")
-            ffmpeg_completed = True
-            log_event(self.config, "ffmpeg_done", job_id=job_id, returncode=self._ffmpeg.returncode)
+                    progress_state: dict[str, Any] = {}
+
+                    def update_progress(snapshot: dict[str, Any]) -> None:
+                        with self._lock:
+                            progress_state.clear()
+                            progress_state.update(snapshot)
+
+                    progress_thread = threading.Thread(target=consume_ffmpeg_progress, args=(self._ffmpeg.stdout, update_progress), daemon=True)
+                    progress_thread.start()
+                    while self._ffmpeg.poll() is None:
+                        with self._lock:
+                            self.state.output_size_bytes = output.stat().st_size if output.exists() else 0
+                            progress_snapshot = dict(progress_state)
+                            progress_snapshot["size_bytes"] = self.state.output_size_bytes
+                            self.state.ffmpeg_progress = progress_snapshot
+                            force = self.state.force_stop
+                        write_json(ffmpeg_current_log_path(self.config), {"job_id": job_id, "source_path": str(source), "updated_at": utc_now(), "progress": progress_snapshot})
+                        self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "ffmpeg_pid": self._ffmpeg.pid, **recovery_context})
+                        if force:
+                            terminate_process_gracefully(self._ffmpeg)
+                            raise ForceStopRequested("force stop requested")
+                        time.sleep(0.5)
+                    progress_thread.join(timeout=1)
+                    if self._ffmpeg.returncode != 0:
+                        raise FfmpegFailedError(f"ffmpeg failed with exit code {self._ffmpeg.returncode}")
+                ffmpeg_completed = True
+                log_event(self.config, "ffmpeg_done", job_id=job_id, returncode=self._ffmpeg.returncode)
             self.set_phase("probing_output", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
             output_probe, output_meta = ffprobe_metadata(self.config, output, source_meta.get("media_type") or "default")
             write_json(metadata_dir / "output.ffprobe.json", {"probe": output_probe, "metadata": output_meta})
