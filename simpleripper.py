@@ -540,6 +540,17 @@ def initialize_worker_cache(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS jellyfin_lookup_cache (
+            normalized_path TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            path TEXT,
+            name TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS folder_index (
             path TEXT PRIMARY KEY,
             normalized_path TEXT,
@@ -624,6 +635,7 @@ def clear_worker_folder_cache(config: dict[str, Any]) -> None:
 def clear_worker_file_cache(config: dict[str, Any]) -> None:
     with open_worker_cache(config) as connection:
         connection.execute("DELETE FROM file_index")
+        connection.execute("DELETE FROM jellyfin_lookup_cache")
         connection.execute("DELETE FROM folder_index")
         for key in ("last_fast_inventory_scan_at", "last_policy_hash", "last_skipped_folder", "last_completed_inventory_generation_id", "current_inventory_generation_id"):
             connection.execute("DELETE FROM scan_state WHERE key = ?", (key,))
@@ -649,6 +661,7 @@ def worker_cache_summary(config: dict[str, Any]) -> dict[str, Any]:
         "blocked": 0,
         "queue_size": settings.get("queue_size"),
         "candidate_queue_count": 0,
+        "jellyfin_lookup_cache_entries": 0,
         "folder_states": {"clean": 0, "partial": 0, "dirty": 0, "stale": 0, "blocked": 0},
         "last_skipped_folder": None,
     }
@@ -662,6 +675,7 @@ def worker_cache_summary(config: dict[str, Any]) -> dict[str, Any]:
         folder_rows = connection.execute("SELECT state, COUNT(*) AS count FROM folder_index GROUP BY state").fetchall()
         folder_counts = {str(row["state"]): int(row["count"]) for row in folder_rows}
         queue_row = connection.execute("SELECT COUNT(*) AS count FROM file_index WHERE decision IS NULL OR decision = 'encode_candidate'").fetchone()
+        jellyfin_cache_row = connection.execute("SELECT COUNT(*) AS count FROM jellyfin_lookup_cache").fetchone()
         skipped_row = connection.execute("SELECT value FROM scan_state WHERE key = 'last_skipped_folder'").fetchone()
     summary["indexed_files"] = sum(counts.values())
     summary["encode_candidates"] = counts.get("encode_candidate", 0) + counts.get("pending", 0)
@@ -669,6 +683,7 @@ def worker_cache_summary(config: dict[str, Any]) -> dict[str, Any]:
     summary["failed_cooldown"] = counts.get("failed", 0)
     summary["blocked"] = counts.get("blocked", 0)
     summary["candidate_queue_count"] = int(queue_row["count"] or 0) if queue_row else 0
+    summary["jellyfin_lookup_cache_entries"] = int(jellyfin_cache_row["count"] or 0) if jellyfin_cache_row else 0
     summary["folder_states"] = {key: folder_counts.get(key, 0) for key in summary["folder_states"]}
     summary["last_skipped_folder"] = skipped_row["value"] if skipped_row else None
     return summary
@@ -1113,6 +1128,42 @@ def is_local_pid_running(pid: int) -> bool:
     return True
 
 
+def local_process_executable(pid: int) -> str | None:
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+        if not handle:
+            return None
+        try:
+            size = ctypes.c_ulong(32768)
+            buffer = ctypes.create_unicode_buffer(int(size.value))
+            if not ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return None
+            return buffer.value or None
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        return os.readlink(f"/proc/{int(pid)}/exe")
+    except OSError:
+        return None
+
+
+def local_pid_matches_lock(payload: dict[str, Any]) -> bool:
+    pid = int(payload.get("pid") or -1)
+    host = str(payload.get("hostname") or "")
+    if host != socket.gethostname() or not is_local_pid_running(pid):
+        return False
+    expected_executable = str(payload.get("executable") or "").strip()
+    running_executable = str(local_process_executable(pid) or "").strip()
+    if expected_executable and running_executable:
+        return os.path.normcase(running_executable) == os.path.normcase(expected_executable)
+    if running_executable and os.name == "nt":
+        return Path(running_executable).name.casefold() in {"python.exe", "pythonw.exe"}
+    return True
+
+
 class InstanceLockError(RuntimeError):
     pass
 
@@ -1131,11 +1182,10 @@ class LocalInstanceLock:
             except (OSError, json.JSONDecodeError):
                 payload = {}
             pid = int(payload.get("pid") or -1)
-            host = str(payload.get("hostname") or "")
-            if host == socket.gethostname() and is_local_pid_running(pid):
+            if local_pid_matches_lock(payload):
                 raise InstanceLockError(f"Another local SimpleRipper instance is already running: pid={pid}, lock={self.path}")
             safe_unlink(self.path)
-        write_json(self.path, {"app": APP_NAME, "hostname": socket.gethostname(), "pid": os.getpid(), "started_at": utc_now()})
+        write_json(self.path, {"app": APP_NAME, "hostname": socket.gethostname(), "pid": os.getpid(), "started_at": utc_now(), "executable": sys.executable})
         self.acquired = True
 
     def release(self) -> None:
@@ -2908,10 +2958,10 @@ def refresh_jellyfin(config: dict[str, Any], source: Path, replacement: Path | N
     lookup_path = replacement or source
     mapped_paths = jellyfin_mapped_paths(settings, lookup_path)
     try:
-        lookup = jellyfin_lookup_item(server_url, api_key, lookup_path, mapped_paths, settings)
+        lookup = jellyfin_lookup_item(server_url, api_key, lookup_path, mapped_paths, settings, config)
         if lookup.get("status") != "ok":
             if replacement is not None and replacement != source:
-                parent_lookup = jellyfin_lookup_item(server_url, api_key, replacement.parent, jellyfin_mapped_paths(settings, replacement.parent), settings)
+                parent_lookup = jellyfin_lookup_item(server_url, api_key, replacement.parent, jellyfin_mapped_paths(settings, replacement.parent), settings, config)
                 if parent_lookup.get("status") != "ok":
                     return {**lookup, "fallback_status": parent_lookup.get("status"), "fallback_reason": parent_lookup.get("reason")}
                 matches = parent_lookup.get("matches") or []
@@ -3069,15 +3119,98 @@ def jellyfin_query_sqlite_path_items(settings: dict[str, Any], candidate_paths: 
     db_path = str(settings.get("sqlite_db_path") or "").strip()
     if not db_path or not Path(db_path).is_file():
         return []
-    placeholders = ", ".join("?" for _ in candidate_paths)
+    normalized_candidates = list(dict.fromkeys(normalize_path_for_match(path) for path in candidate_paths if str(path or "").strip()))
+    placeholders = ", ".join("?" for _ in normalized_candidates)
     if not placeholders:
         return []
+    connection: sqlite3.Connection | None = None
     try:
-        with sqlite3.connect(db_path) as connection:
-            rows = connection.execute(f"SELECT Id, Name, Path FROM BaseItems WHERE Path IN ({placeholders})", candidate_paths).fetchall()
+        connection = sqlite3.connect(db_path)
+        rows = connection.execute(
+            f"SELECT Id, Name, Path FROM BaseItems WHERE lower(rtrim(replace(Path, '\\', '/'), '/')) IN ({placeholders})",
+            normalized_candidates,
+        ).fetchall()
     except sqlite3.Error:
         return []
+    finally:
+        if connection is not None:
+            connection.close()
     return [{"Id": str(row[0]), "Name": row[1], "Path": row[2]} for row in rows]
+
+
+def jellyfin_local_cache_enabled(settings: dict[str, Any] | None) -> bool:
+    return bool((settings or {}).get("local_cache_enabled", True))
+
+
+def jellyfin_local_cache_ttl_hours(settings: dict[str, Any] | None) -> float:
+    try:
+        return max(0.0, float((settings or {}).get("local_cache_ttl_hours", 168)))
+    except (TypeError, ValueError):
+        return 168.0
+
+
+def jellyfin_lookup_cached_items(config: dict[str, Any] | None, settings: dict[str, Any] | None, candidate_paths: list[str]) -> list[dict[str, Any]]:
+    if config is None or not jellyfin_local_cache_enabled(settings):
+        return []
+    normalized_candidates = list(dict.fromkeys(normalize_path_for_match(path) for path in candidate_paths if str(path or "").strip()))
+    if not normalized_candidates:
+        return []
+    placeholders = ", ".join("?" for _ in normalized_candidates)
+    cutoff_timestamp = datetime.now(timezone.utc).timestamp() - jellyfin_local_cache_ttl_hours(settings) * 3600
+    matches_by_path: dict[str, dict[str, Any]] = {}
+    stale_paths: list[str] = []
+    with open_worker_cache(config) as connection:
+        rows = connection.execute(
+            f"SELECT normalized_path, item_id, path, name, updated_at FROM jellyfin_lookup_cache WHERE normalized_path IN ({placeholders})",
+            normalized_candidates,
+        ).fetchall()
+        for row in rows:
+            normalized_path = str(row["normalized_path"] or "")
+            updated_at = parse_utc_datetime(row["updated_at"])
+            if updated_at is None or updated_at.timestamp() < cutoff_timestamp:
+                stale_paths.append(normalized_path)
+                continue
+            item_id = str(row["item_id"] or "")
+            if not item_id:
+                stale_paths.append(normalized_path)
+                continue
+            path_text = str(row["path"] or "")
+            matches_by_path[normalized_path] = {"item_id": item_id, "path": path_text, "matched_path": path_text, "name": row["name"]}
+        if stale_paths:
+            connection.executemany("DELETE FROM jellyfin_lookup_cache WHERE normalized_path = ?", [(item,) for item in stale_paths])
+    matches: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate_path in candidate_paths:
+        normalized_path = normalize_path_for_match(candidate_path)
+        match = matches_by_path.get(normalized_path)
+        if not match:
+            continue
+        key = (str(match.get("item_id") or ""), normalized_path)
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        matches.append(match)
+    return matches
+
+
+def jellyfin_store_lookup_cache(config: dict[str, Any] | None, settings: dict[str, Any] | None, matches: list[dict[str, Any]]) -> None:
+    if config is None or not jellyfin_local_cache_enabled(settings):
+        return
+    now = utc_now()
+    rows: list[tuple[str, str, str, Any, str]] = []
+    for match in matches:
+        matched_path = str(match.get("matched_path") or match.get("path") or "").strip()
+        item_id = str(match.get("item_id") or "").strip()
+        if not matched_path or not item_id:
+            continue
+        rows.append((normalize_path_for_match(matched_path), item_id, matched_path, match.get("name"), now))
+    if not rows:
+        return
+    with open_worker_cache(config) as connection:
+        connection.executemany(
+            "INSERT INTO jellyfin_lookup_cache(normalized_path, item_id, path, name, updated_at) VALUES(?, ?, ?, ?, ?) ON CONFLICT(normalized_path) DO UPDATE SET item_id = excluded.item_id, path = excluded.path, name = excluded.name, updated_at = excluded.updated_at",
+            rows,
+        )
 
 
 def jellyfin_exact_path_matches(items: list[dict[str, Any]], candidate_paths: list[str]) -> list[dict[str, Any]]:
@@ -3124,25 +3257,33 @@ def jellyfin_item_score(item: dict[str, Any], source: Path, candidate_paths: lis
     return score
 
 
-def jellyfin_lookup_item(server_url: str, api_key: str, source: Path, candidate_paths: list[str], settings: dict[str, Any] | None = None) -> dict[str, Any]:
+def jellyfin_lookup_item(server_url: str, api_key: str, source: Path, candidate_paths: list[str], settings: dict[str, Any] | None = None, config: dict[str, Any] | None = None) -> dict[str, Any]:
     search_terms = jellyfin_search_terms(source)
-    items_by_id: dict[str, dict[str, Any]] = {}
-    for search_term in search_terms:
-        for item in jellyfin_query_items(server_url, api_key, search_term):
-            item_id = str(item.get("Id") or "")
-            if item_id:
-                items_by_id[item_id] = item
-    exact_matches = jellyfin_exact_path_matches(list(items_by_id.values()), candidate_paths)
-    path_lookup_used = False
+    exact_matches: list[dict[str, Any]] = []
+    cache_lookup_used = False
+    if settings is not None:
+        exact_matches = jellyfin_lookup_cached_items(config, settings, candidate_paths)
+        cache_lookup_used = bool(exact_matches)
+    sqlite_lookup_used = False
     if not exact_matches and settings is not None:
-        sqlite_matches = jellyfin_exact_path_matches(jellyfin_query_sqlite_path_items(settings, candidate_paths), candidate_paths)
-        path_lookup_used = path_lookup_used or bool(sqlite_matches)
-        exact_matches = sqlite_matches
+        exact_matches = jellyfin_exact_path_matches(jellyfin_query_sqlite_path_items(settings, candidate_paths), candidate_paths)
+        sqlite_lookup_used = bool(exact_matches)
+    items_by_id: dict[str, dict[str, Any]] = {}
+    path_lookup_used = False
+    if not exact_matches:
+        for search_term in search_terms:
+            for item in jellyfin_query_items(server_url, api_key, search_term):
+                item_id = str(item.get("Id") or "")
+                if item_id:
+                    items_by_id[item_id] = item
+        exact_matches = jellyfin_exact_path_matches(list(items_by_id.values()), candidate_paths)
     if not exact_matches and settings is not None:
         path_items = jellyfin_query_path_items(server_url, api_key, settings)
         path_lookup_used = True
         exact_matches = jellyfin_exact_path_matches(path_items, candidate_paths)
     if exact_matches:
+        if not cache_lookup_used:
+            jellyfin_store_lookup_cache(config, settings, exact_matches)
         result = {
             "status": "ok",
             "matched_count": len(exact_matches),
@@ -3150,13 +3291,15 @@ def jellyfin_lookup_item(server_url: str, api_key: str, source: Path, candidate_
             "match_type": "exact_path",
             "search_terms": search_terms,
             "candidate_paths": candidate_paths,
+            "cache_lookup_used": cache_lookup_used,
+            "sqlite_lookup_used": sqlite_lookup_used,
             "path_lookup_used": path_lookup_used,
         }
         if len(exact_matches) == 1:
             result.update({"item_id": exact_matches[0]["item_id"], "matched_path": exact_matches[0]["matched_path"], "path": exact_matches[0]["path"], "name": exact_matches[0].get("name")})
         return result
     if not items_by_id:
-        return {"status": "not_found", "search_terms": search_terms, "candidate_paths": candidate_paths, "reason": "no_exact_path_match", "path_lookup_used": path_lookup_used}
+        return {"status": "not_found", "search_terms": search_terms, "candidate_paths": candidate_paths, "reason": "no_exact_path_match", "cache_lookup_used": cache_lookup_used, "sqlite_lookup_used": sqlite_lookup_used, "path_lookup_used": path_lookup_used}
     scored = sorted(
         ((jellyfin_item_score(item, source, candidate_paths), item) for item in items_by_id.values()),
         key=lambda pair: pair[0],
@@ -3164,7 +3307,7 @@ def jellyfin_lookup_item(server_url: str, api_key: str, source: Path, candidate_
     )
     best_score, best_item = scored[0]
     if best_score <= 0:
-        return {"status": "not_found", "search_terms": search_terms, "candidate_paths": candidate_paths, "reason": "no_exact_path_match", "path_lookup_used": path_lookup_used}
+        return {"status": "not_found", "search_terms": search_terms, "candidate_paths": candidate_paths, "reason": "no_exact_path_match", "cache_lookup_used": cache_lookup_used, "sqlite_lookup_used": sqlite_lookup_used, "path_lookup_used": path_lookup_used}
     top_matches = [
         {
             "item_id": item.get("Id"),
@@ -3174,7 +3317,7 @@ def jellyfin_lookup_item(server_url: str, api_key: str, source: Path, candidate_
         }
         for score, item in scored[:10]
     ]
-    return {"status": "not_found", "reason": "no_exact_path_match", "match_count": len(scored), "top_score": best_score, "candidate_paths": candidate_paths, "search_terms": search_terms, "matches": top_matches, "path_lookup_used": path_lookup_used}
+    return {"status": "not_found", "reason": "no_exact_path_match", "match_count": len(scored), "top_score": best_score, "candidate_paths": candidate_paths, "search_terms": search_terms, "matches": top_matches, "cache_lookup_used": cache_lookup_used, "sqlite_lookup_used": sqlite_lookup_used, "path_lookup_used": path_lookup_used}
 
 
 def safe_unlink(path: Path) -> None:

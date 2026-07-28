@@ -132,6 +132,8 @@ jellyfin:
   server_url: http://127.0.0.1:8096
   api_key: ""
   path_mapping: []
+  local_cache_enabled: true
+  local_cache_ttl_hours: 168
   path_lookup_enabled: true
   path_lookup_limit: 1000
   path_lookup_max_pages: 20

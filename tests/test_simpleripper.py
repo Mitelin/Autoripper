@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import io
+import sqlite3
 import socket
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import errno
@@ -37,6 +39,20 @@ class SimpleRipperTests(unittest.TestCase):
 
             with self.assertRaises(simpleripper.InstanceLockError):
                 simpleripper.LocalInstanceLock(runtime).acquire()
+
+    def test_local_instance_lock_ignores_reused_pid_for_non_python_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+            simpleripper.write_json(runtime / "simpleripper.pid", {"hostname": socket.gethostname(), "pid": 5640, "started_at": simpleripper.utc_now()})
+
+            with patch("simpleripper.is_local_pid_running", return_value=True), patch("simpleripper.local_process_executable", return_value=r"C:\Users\Mitelin\AppData\Local\Programs\Microsoft VS Code\Code.exe"):
+                lock = simpleripper.LocalInstanceLock(runtime)
+                lock.acquire()
+
+            payload = simpleripper.read_json(runtime / "simpleripper.pid")
+            self.assertEqual(payload["pid"], os.getpid())
+            self.assertEqual(payload["executable"], sys.executable)
 
     def test_source_lock_contains_required_fields_and_blocks_second_acquire(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2408,6 +2424,81 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertEqual(result["refreshed_count"], 1)
         self.assertEqual(result["item_id"], "1")
         self.assertEqual(result["match_type"], "exact_path")
+
+    def test_jellyfin_lookup_item_prefers_sqlite_exact_path_before_network_search(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "jellyfin.db"
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute("CREATE TABLE BaseItems (Id TEXT, Name TEXT, Path TEXT)")
+                connection.execute(
+                    "INSERT INTO BaseItems (Id, Name, Path) VALUES (?, ?, ?)",
+                    ("sqlite-1", "Episode 2", r"k:\filmy\SERIALY\Czech\Fallout\Season 02\S02E02 Zlate pravidlo.mkv"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            config = self.make_config(root)
+            config["jellyfin"] = {
+                "enabled": True,
+                "server_url": "http://jellyfin.local:8096",
+                "api_key": "secret",
+                "sqlite_db_path": str(db_path),
+            }
+            source = Path("Z:/nas-backup/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv")
+            candidates = ["K:/FILMY/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv"]
+
+            with patch("simpleripper.jellyfin_query_items", side_effect=AssertionError("network search must not run when sqlite exact path matches")), patch("simpleripper.jellyfin_query_path_items", side_effect=AssertionError("path lookup must not run when sqlite exact path matches")):
+                result = simpleripper.jellyfin_lookup_item("http://jellyfin.local:8096", "secret", source, candidates, config["jellyfin"])
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["item_id"], "sqlite-1")
+            self.assertFalse(result["cache_lookup_used"])
+            self.assertTrue(result["sqlite_lookup_used"])
+            self.assertFalse(result["path_lookup_used"])
+
+    def test_refresh_jellyfin_populates_local_cache_and_reuses_it_on_next_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["jellyfin"] = {
+                "enabled": True,
+                "server_url": "http://jellyfin.local:8096",
+                "api_key": "secret",
+                "path_mapping": [{"filesystem_prefix": "Z:/nas-backup", "jellyfin_prefix": "K:/filmy"}],
+            }
+            source = Path("Z:/nas-backup/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv")
+            items = [{"Id": "1", "Path": "K:/filmy/SERIALY/Czech/Fallout/Season 02/S02E02 Zlate pravidlo.mkv", "Name": "Episode 2"}]
+            refresh_urls: list[str] = []
+
+            class FakeResponse:
+                def __enter__(self) -> "FakeResponse":
+                    return self
+
+                def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                    return None
+
+                def read(self) -> bytes:
+                    return b"{}"
+
+            def fake_urlopen(req: object, timeout: int = 10) -> FakeResponse:
+                refresh_urls.append(req.full_url)  # type: ignore[attr-defined]
+                return FakeResponse()
+
+            with patch("simpleripper.jellyfin_query_items", return_value=items), patch("simpleripper.request.urlopen", side_effect=fake_urlopen):
+                first_result = simpleripper.refresh_jellyfin(config, source)
+
+            with patch("simpleripper.jellyfin_query_items", side_effect=AssertionError("network search must not run on cache hit")), patch("simpleripper.jellyfin_query_path_items", side_effect=AssertionError("path lookup must not run on cache hit")), patch("simpleripper.request.urlopen", side_effect=fake_urlopen):
+                second_result = simpleripper.refresh_jellyfin(config, source)
+
+            self.assertEqual(first_result["status"], "ok")
+            self.assertFalse(first_result["cache_lookup_used"])
+            self.assertEqual(second_result["status"], "ok")
+            self.assertTrue(second_result["cache_lookup_used"])
+            self.assertEqual(second_result["item_id"], "1")
+            self.assertEqual(len(refresh_urls), 2)
 
     def test_refresh_jellyfin_finds_localized_episode_by_path_lookup(self) -> None:
         config = self.make_config(Path("."))
