@@ -167,10 +167,22 @@ def append_text_line(path: Path, line: str) -> None:
         handle.write(line.rstrip() + "\n")
 
 
-def tail_text_lines(path: Path, limit: int = 100) -> list[str]:
-    if not path.exists():
+def tail_text_lines(path: Path, limit: int = 100, chunk_size: int = 64 * 1024) -> list[str]:
+    if limit <= 0 or not path.exists():
         return []
-    return path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    chunks: list[bytes] = []
+    newline_count = 0
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        while position > 0 and newline_count <= limit:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            handle.seek(position)
+            chunk = handle.read(read_size)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+    return b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()[-limit:]
 
 
 def copy_file_interruptible(source: Path, destination: Path, should_stop: callable, chunk_size: int = 8 * 1024 * 1024) -> None:
@@ -3539,10 +3551,11 @@ class SimpleRipperApp:
                 "selected_folder_paths": [str(path) for path in self.selected_folders],
                 "custom_folders": list(self.custom_folder_entries),
                 "test_mode_message": "Bezi v test modu. Original nikdy nebude po uspechu smazan, zustane v karantene." if self.state.test_mode else None,
-                "scan_cache": worker_cache_summary(self.config),
-                "recent_log_lines": tail_text_lines(app_log_path(self.config), 60),
             }
-            return merged_runtime_status(self.config, snapshot)
+        return merged_runtime_status(self.config, snapshot)
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {"scan_cache": worker_cache_summary(self.config)}
 
     def _persist_pending_decision_state(self) -> None:
         with self._lock:
@@ -4874,6 +4887,9 @@ class SimpleRipperHandler(BaseHTTPRequestHandler):
         if path == "/api/logs":
             SimpleRipperHandler.send_json_response(self, {"lines": tail_text_lines(app_log_path(self.app.config), 200)}, include_body=include_body)
             return
+        if path == "/api/diagnostics":
+            SimpleRipperHandler.send_json_response(self, self.app.diagnostics(), include_body=include_body)
+            return
         if path == "/api/browse-folders":
             query = parse.parse_qs(parsed.query)
             requested_path = (query.get("path") or [None])[0]
@@ -5040,6 +5056,7 @@ pre{margin:0;padding:16px 18px;border-radius:18px;background:#09111a;color:#dce9
 .log-shell{display:grid;gap:14px}
 .log-head{display:flex;justify-content:space-between;gap:12px;align-items:center}
 .log-meta{font-size:13px;color:var(--muted)}
+#log{max-height:420px}
 .disclosure summary{cursor:pointer;user-select:none;font-weight:800;color:#3f5367}
 .disclosure[open] summary{margin-bottom:12px}
 .muted{color:var(--muted)}
@@ -5059,6 +5076,11 @@ pre{margin:0;padding:16px 18px;border-radius:18px;background:#09111a;color:#dce9
 let lastStatus=null
 let uiError=''
 let pendingUiAction=''
+let latestLogs=[]
+let latestDiagnostics={}
+let statusRequest=null
+let logsRequest=null
+let diagnosticsRequest=null
 function formatRequestError(error){return error&&error.message?error.message:String(error||'Unknown UI error')}
 async function readJsonResponse(response){const text=await response.text();let payload={};try{payload=text?JSON.parse(text):{}}catch(error){throw new Error(`Invalid server response (${response.status})`)}if(!response.ok){throw new Error(payload.error||`Request failed (${response.status})`)}return payload}
 function renderUiError(message){uiError=message;if(lastStatus){render(lastStatus);return}const errors=document.getElementById('errors');if(errors){errors.innerHTML=`<div class="err">UI<br>${escapeHtml(message)}</div>`}}
@@ -5071,7 +5093,9 @@ function optimisticQueueErrorStatus(status,id,action){const next=cloneStatus(sta
 function approveError(id){post('/api/errors/action',{id:id,action:'approve'},{pendingMessage:'Queuing approve decision…',optimisticUpdate:(status)=>optimisticQueueErrorStatus(status,id,'approve')})}
 function skipError(id){post('/api/errors/action',{id:id,action:'skip'},{pendingMessage:'Queuing skip decision…',optimisticUpdate:(status)=>optimisticQueueErrorStatus(status,id,'skip')})}
 function renderErrorEntry(entry){const item=entry&&typeof entry==='object'?entry:{message:String(entry||'')};const summary=escapeHtml(item.summary||item.message||'Unknown error');const at=escapeHtml(item.at||'');const queuedAction=item.queued_action?String(item.queued_action):'';const isQueued=queuedAction==='approve'||queuedAction==='skip';const toneClass=isQueued?'warn':'';const sourcePath=item.source_path?`<div class="err-path">${escapeHtml(item.source_path)}</div>`:'';const detailLines=Array.isArray(item.details)?item.details.filter(Boolean):[];const queuedLabel=isQueued?`<div class="err-queued">Queued ${escapeHtml(queuedAction)}</div>`:'';const actions=Array.isArray(item.actions)&&item.actions.length&&item.id?`<div class="folder-actions" style="margin-top:12px"><button class="primary" onclick="approveError('${escapeHtml(item.id)}')">Approve</button><button class="ghost" onclick="skipError('${escapeHtml(item.id)}')">Skip</button></div>`:'';if(!sourcePath&&!detailLines.length&&!actions&&!queuedLabel){return `<div class="err ${toneClass}"><div class="err-time">${at}</div><div class="err-summary">${summary}</div></div>`}const detailsHtml=detailLines.length?`<ul class="err-lines">${detailLines.map(line=>`<li>${escapeHtml(line)}</li>`).join('')}</ul>`:'';return `<details class="err-card ${toneClass}" data-ui-key="${escapeHtml(disclosureKey(item))}"><summary><div class="err-time">${at}</div><div class="err-summary">${summary}</div></summary><div class="err-detail">${queuedLabel}${sourcePath}${detailsHtml}${actions}</div></details>`}
-async function getStatus(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(readJsonResponse);uiError='';render(s)}catch(error){renderUiError(formatRequestError(error))}}
+async function getStatus(){if(statusRequest){return statusRequest}statusRequest=(async()=>{try{const s=await fetch('/api/status',{cache:'no-store'}).then(readJsonResponse);uiError='';render(s)}catch(error){renderUiError(formatRequestError(error))}finally{statusRequest=null}})();return statusRequest}
+async function getLogs(){if(logsRequest){return logsRequest}logsRequest=(async()=>{try{const payload=await fetch('/api/logs',{cache:'no-store'}).then(readJsonResponse);latestLogs=Array.isArray(payload.lines)?payload.lines:[];renderLogs()}catch(error){renderUiError(formatRequestError(error))}finally{logsRequest=null}})();return logsRequest}
+async function getDiagnostics(){if(diagnosticsRequest){return diagnosticsRequest}diagnosticsRequest=(async()=>{try{latestDiagnostics=await fetch('/api/diagnostics',{cache:'no-store'}).then(readJsonResponse);renderRawStatus()}catch(error){renderUiError(formatRequestError(error))}finally{diagnosticsRequest=null}})();return diagnosticsRequest}
 async function post(url,body={},options={}){const pendingMessage=options&&options.pendingMessage?String(options.pendingMessage):'Applying action…';const optimisticUpdate=options&&typeof options.optimisticUpdate==='function'?options.optimisticUpdate:null;try{if(optimisticUpdate&&lastStatus){const optimisticStatus=optimisticUpdate(lastStatus);if(optimisticStatus){uiError='';lastStatus=optimisticStatus;setPendingUiAction(pendingMessage);render(optimisticStatus)}else{setPendingUiAction(pendingMessage)}}else{setPendingUiAction(pendingMessage)}await fetch(url,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(readJsonResponse);uiError='';await getStatus()}catch(error){renderUiError(formatRequestError(error))}finally{pendingUiAction='';if(lastStatus){render(lastStatus)}}}
 function selectedMap(s){return Object.fromEntries((s.selected_folders||[]).map(item=>[item.path,item.media_type||'auto']))}
 function mediaTypeSelect(value, attrs=''){const current=value||'auto';return `<select ${attrs}><option value="auto" ${current==='auto'?'selected':''}>Auto</option><option value="movie" ${current==='movie'?'selected':''}>Movie</option><option value="series" ${current==='series'?'selected':''}>Series</option><option value="anime" ${current==='anime'?'selected':''}>Anime</option></select>`}
@@ -5104,9 +5128,43 @@ function triggerUpdate(){const button=document.getElementById('updateButton');if
 function toggleTestMode(){const button=document.getElementById('testModeButton');const enable=!(button&&button.getAttribute('data-enabled')==='true');post('/api/test-mode',{enabled:enable},{pendingMessage:enable?'Enabling test mode…':'Disabling test mode…'})}
 function render(s){const openDisclosures=captureDisclosureState();lastStatus=s;const selected=s.selected_folders||[];const combinedErrors=uiError?[{at:'UI',message:uiError,summary:uiError},...(s.errors||[])]:[...(s.errors||[])];const warningCount=(combinedErrors.length?1:0)+(s.last_result&&s.last_result.warning?1:0);document.getElementById('status').textContent=JSON.stringify(s,null,2);document.getElementById('current').innerHTML=renderCurrent(s.current_summary);document.getElementById('lastResult').innerHTML=renderLastResult(s.last_result);document.getElementById('errors').innerHTML=combinedErrors.length?combinedErrors.map(renderErrorEntry).join(''):'<p class="muted">No recent app-level errors.</p>';document.getElementById('log').textContent=(s.recent_log_lines||[]).join(String.fromCharCode(10));document.getElementById('logMeta').textContent=`${(s.recent_log_lines||[]).length} lines`;document.getElementById('selectedFolders').innerHTML=selected.length?selected.map(item=>`<div class="simple-item" data-path="${escapeHtml(item.path)}"><div class="simple-main"><div class="simple-title">${escapeHtml(item.path)}</div><div class="simple-sub">Selected for scan</div></div>${mediaTypeSelect(item.media_type||guessMediaType(item.path),'onchange="saveSelectedFolders()"')}<button class="ghost" data-path="${escapeHtml(item.path)}" onclick="removeFolder(this.getAttribute('data-path'))">Remove</button></div>`).join(''):'<div class="empty">No folders selected.</div>';document.getElementById('selectedCount').textContent=String(selected.length);document.getElementById('heroPhase').textContent=escapeHtml((s.current_summary&&s.current_summary.status)||s.current_phase||'Idle');document.getElementById('warningCount').textContent=String(warningCount);document.getElementById('heroSummary').textContent=heroSummary(s);document.getElementById('heroBadges').innerHTML=renderBadges(s);ensureUpdateButton();document.getElementById('updateButton').disabled=!s.can_update;document.getElementById('updateButton').textContent=s.current_phase==='updating'?'Updating...':'Update';document.getElementById('testModeButton').textContent=s.test_mode?'Test mode ON':'Test mode';document.getElementById('testModeButton').setAttribute('data-enabled',s.test_mode?'true':'false');document.getElementById('testModeBanner').innerHTML=s.test_mode?`<div class="callout info" style="margin-top:14px">${escapeHtml(s.test_mode_message||'Bezi v test modu.')}</div>`:'';document.getElementById('folderSuggestionList').innerHTML=(s.folder_suggestions||[]).map(path=>`<option value="${escapeHtml(path)}"></option>`).join('');document.getElementById('folderPickerHint').textContent=s.folder_suggestion_mode==='linux-mounts'?'Explorer fallback pouziva mount navrhy z linux configu. Sit lze zadat primo jako mount cestu.':'Explorer fallback pouziva Windows roots z configu. Kdyz sit v dialogu chybi, vlozte UNC cestu rucne.';restoreDisclosureState(openDisclosures)}
 function updateFolderPickerHint(s){const hint=document.getElementById('folderPickerHint');if(!hint){return}hint.textContent=s.folder_suggestion_mode==='linux-mounts'?'Webovy browser pouziva povolene linux mount rooty z configu. Sit lze zadat primo jako mount cestu.':'Webovy browser pouziva povolene rooty z configu. Cestu muzete stale vlozit rucne.'}
-const renderBase=render
-render=function(s){renderBase(s);updateFolderPickerHint(s)}
-setInterval(getStatus,1500);getStatus();
+function setHtmlIfChanged(id,html){const element=document.getElementById(id);if(element&&element.innerHTML!==html){element.innerHTML=html;return true}return false}
+function setTextIfChanged(id,text){const element=document.getElementById(id);const value=String(text??'');if(element&&element.textContent!==value){element.textContent=value;return true}return false}
+function renderLogs(){const text=latestLogs.join(String.fromCharCode(10));setTextIfChanged('log',text);setTextIfChanged('logMeta',`${latestLogs.length} lines`)}
+function renderRawStatus(force=false){if(!lastStatus){return}const output=document.getElementById('status');const disclosure=output?output.closest('details'):null;if(!force&&disclosure&&!disclosure.open){return}setTextIfChanged('status',JSON.stringify({...lastStatus,...latestDiagnostics},null,2))}
+render=function(s){
+ const selected=s.selected_folders||[]
+ const combinedErrors=uiError?[{at:'UI',message:uiError,summary:uiError},...(s.errors||[])]:[...(s.errors||[])]
+ const warningCount=(combinedErrors.length?1:0)+(s.last_result&&s.last_result.warning?1:0)
+ lastStatus=s
+ setHtmlIfChanged('current',renderCurrent(s.current_summary))
+ setHtmlIfChanged('lastResult',renderLastResult(s.last_result))
+ const openDisclosures=captureDisclosureState()
+ const errorsChanged=setHtmlIfChanged('errors',combinedErrors.length?combinedErrors.map(renderErrorEntry).join(''):'<p class="muted">No recent app-level errors.</p>')
+ if(errorsChanged){restoreDisclosureState(openDisclosures)}
+ setHtmlIfChanged('selectedFolders',selected.length?selected.map(item=>`<div class="simple-item" data-path="${escapeHtml(item.path)}"><div class="simple-main"><div class="simple-title">${escapeHtml(item.path)}</div><div class="simple-sub">Selected for scan</div></div>${mediaTypeSelect(item.media_type||guessMediaType(item.path),'onchange="saveSelectedFolders()"')}<button class="ghost" data-path="${escapeHtml(item.path)}" onclick="removeFolder(this.getAttribute('data-path'))">Remove</button></div>`).join(''):'<div class="empty">No folders selected.</div>')
+ setTextIfChanged('selectedCount',selected.length)
+ setTextIfChanged('heroPhase',(s.current_summary&&s.current_summary.status)||s.current_phase||'Idle')
+ setTextIfChanged('warningCount',warningCount)
+ setTextIfChanged('heroSummary',heroSummary(s))
+ setHtmlIfChanged('heroBadges',renderBadges(s))
+ ensureUpdateButton()
+ const updateButton=document.getElementById('updateButton')
+ updateButton.disabled=!s.can_update
+ setTextIfChanged('updateButton',s.current_phase==='updating'?'Updating...':'Update')
+ const testModeButton=document.getElementById('testModeButton')
+ setTextIfChanged('testModeButton',s.test_mode?'Test mode ON':'Test mode')
+ testModeButton.setAttribute('data-enabled',s.test_mode?'true':'false')
+ setHtmlIfChanged('testModeBanner',s.test_mode?`<div class="callout info" style="margin-top:14px">${escapeHtml(s.test_mode_message||'Bezi v test modu.')}</div>`:'')
+ setHtmlIfChanged('folderSuggestionList',(s.folder_suggestions||[]).map(path=>`<option value="${escapeHtml(path)}"></option>`).join(''))
+ updateFolderPickerHint(s)
+ renderRawStatus()
+}
+async function statusLoop(){await getStatus();setTimeout(statusLoop,document.hidden?10000:(lastStatus&&lastStatus.running?1000:3000))}
+async function logsLoop(){await getLogs();setTimeout(logsLoop,document.hidden?30000:10000)}
+async function diagnosticsLoop(){await getDiagnostics();setTimeout(diagnosticsLoop,document.hidden?60000:30000)}
+const rawStatusDisclosure=document.getElementById('status')?.closest('details');if(rawStatusDisclosure){rawStatusDisclosure.addEventListener('toggle',()=>{if(rawStatusDisclosure.open){renderRawStatus(true)}})}
+statusLoop();logsLoop();diagnosticsLoop();
 </script></body></html>"""
 
 

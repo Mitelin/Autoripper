@@ -1040,10 +1040,46 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(handler.headers["Content-Length"], str(len(simpleripper.INDEX_HTML.encode("utf-8"))))
             self.assertEqual(handler.wfile.getvalue(), b"")
 
+    def test_tail_text_lines_reads_last_lines_without_reading_whole_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "app.log"
+            path.write_text("".join(f"line-{index}\n" for index in range(10000)), encoding="utf-8")
+
+            lines = simpleripper.tail_text_lines(path, 3, chunk_size=32)
+
+            self.assertEqual(lines, ["line-9997", "line-9998", "line-9999"])
+
+    def test_diagnostics_endpoint_returns_cache_separately_from_live_status(self) -> None:
+        class FakeHandler:
+            def __init__(self, app: simpleripper.SimpleRipperApp) -> None:
+                self.app = app
+                self.path = "/api/diagnostics"
+                self.responses: list[tuple[object, int]] = []
+
+            def send_json(self, payload: object, status: int = 200, include_body: bool = True) -> None:
+                self.responses.append((payload, status))
+
+            def send_json_response(self, payload: object, status: int = 200, include_body: bool = True) -> None:
+                simpleripper.SimpleRipperHandler.send_json_response(self, payload, status=status, include_body=include_body)  # type: ignore[arg-type]
+
+            def handle_get_request(self, include_body: bool = True) -> None:
+                simpleripper.SimpleRipperHandler.handle_get_request(self, include_body=include_body)  # type: ignore[arg-type]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = simpleripper.SimpleRipperApp(self.make_config(Path(temp_dir)))
+            handler = FakeHandler(app)
+
+            simpleripper.SimpleRipperHandler.do_GET(handler)  # type: ignore[arg-type]
+
+            self.assertEqual(handler.responses[0][1], 200)
+            self.assertIn("scan_cache", handler.responses[0][0])  # type: ignore[operator]
+            self.assertNotIn("scan_cache", app.status())
+            self.assertNotIn("recent_log_lines", app.status())
+
     def test_web_ui_folder_picker_uses_browser_endpoint(self) -> None:
         self.assertIn("/api/browse-folders", simpleripper.INDEX_HTML)
         self.assertIn("function pickFolder(initialDir=''){browseFolder(initialDir||'')}", simpleripper.INDEX_HTML)
-        self.assertIn("function selectBrowsedFolder(path){post('/api/custom-folder',{path:path,media_type:guessMediaType(path)});closeFolderBrowser()}", simpleripper.INDEX_HTML)
+        self.assertIn("function selectBrowsedFolder(path){post('/api/custom-folder',{path:path,media_type:guessMediaType(path)},{pendingMessage:'Adding folder…'});closeFolderBrowser()}", simpleripper.INDEX_HTML)
         self.assertNotIn("function pickFolder(initialDir=''){post('/api/custom-folder'", simpleripper.INDEX_HTML)
         self.assertFalse(hasattr(simpleripper, "pick_folder_dialog"))
 
@@ -1066,6 +1102,25 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("function cloneStatus(status)", simpleripper.INDEX_HTML)
         self.assertIn("function optimisticQueueErrorStatus(status,id,action)", simpleripper.INDEX_HTML)
         self.assertIn("await getStatus()", simpleripper.INDEX_HTML)
+
+    def test_web_ui_splits_fast_status_from_slow_data_refreshes(self) -> None:
+        self.assertIn("fetch('/api/status'", simpleripper.INDEX_HTML)
+        self.assertIn("fetch('/api/logs'", simpleripper.INDEX_HTML)
+        self.assertIn("fetch('/api/diagnostics'", simpleripper.INDEX_HTML)
+        self.assertIn("document.hidden?10000:(lastStatus&&lastStatus.running?1000:3000)", simpleripper.INDEX_HTML)
+        self.assertIn("document.hidden?30000:10000", simpleripper.INDEX_HTML)
+        self.assertIn("document.hidden?60000:30000", simpleripper.INDEX_HTML)
+        self.assertNotIn("setInterval(getStatus", simpleripper.INDEX_HTML)
+
+    def test_web_ui_avoids_overlapping_requests_and_unchanged_dom_writes(self) -> None:
+        self.assertIn("if(statusRequest){return statusRequest}", simpleripper.INDEX_HTML)
+        self.assertIn("if(logsRequest){return logsRequest}", simpleripper.INDEX_HTML)
+        self.assertIn("if(diagnosticsRequest){return diagnosticsRequest}", simpleripper.INDEX_HTML)
+        self.assertIn("function setHtmlIfChanged(id,html)", simpleripper.INDEX_HTML)
+        self.assertIn("function setTextIfChanged(id,text)", simpleripper.INDEX_HTML)
+        self.assertIn("if(!force&&disclosure&&!disclosure.open){return}", simpleripper.INDEX_HTML)
+        self.assertIn("rawStatusDisclosure.addEventListener('toggle'", simpleripper.INDEX_HTML)
+        self.assertIn("#log{max-height:420px}", simpleripper.INDEX_HTML)
 
     def test_error_action_post_returns_fast_acknowledgement(self) -> None:
         class FakeApp:
