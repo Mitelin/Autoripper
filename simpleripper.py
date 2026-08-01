@@ -33,6 +33,7 @@ SCAN_SCOPE_SCHEMA_VERSION = 1
 POLICY_HASH_SCHEMA_VERSION = 2
 WORKER_CACHE_BUSY_TIMEOUT_MS = 30000
 MAX_SAFE_FILENAME_BYTES = 255
+DEFAULT_MAX_VIDEO_BITRATE_KBPS = 8000
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v", ".ts"}
 LANGUAGE_ALIASES = {
     "cze": {"cze", "ces", "cz", "czech", "cestina", "cesky", "cz dabing", "czech dub"},
@@ -1443,6 +1444,9 @@ def build_ffmpeg_command(
     settings = (config.get("quality_profiles") or {}).get(metadata.get("media_type") or "default") or (config.get("quality_profiles") or {}).get("default") or {}
     downscale_plan = downscale_plan or downscale_settings(config, metadata)
     crf = settings.get("crf", 24)
+    max_video_bitrate_kbps = to_int(settings.get("max_video_bitrate_kbps"))
+    if max_video_bitrate_kbps is None:
+        max_video_bitrate_kbps = DEFAULT_MAX_VIDEO_BITRATE_KBPS
     if downscale_plan.get("applied") and downscale_plan.get("crf_override") is not None:
         crf = downscale_plan["crf_override"]
     command = [str((config.get("tools") or {}).get("ffmpeg") or "ffmpeg"), "-hide_banner", "-nostats", "-progress", "pipe:1", "-y", "-i", str(source)]
@@ -1454,6 +1458,9 @@ def build_ffmpeg_command(
     if downscale_plan.get("applied") and downscale_plan.get("filter"):
         command.extend(["-vf", str(downscale_plan["filter"])])
     command.extend(["-c:v", str(settings.get("encoder", "libx265")), "-preset", str(settings.get("preset", "medium")), "-crf", str(crf)])
+    if max_video_bitrate_kbps is not None and max_video_bitrate_kbps > 0:
+        maxrate = f"{max_video_bitrate_kbps}k"
+        command.extend(["-maxrate", maxrate, "-bufsize", f"{max_video_bitrate_kbps * 2}k"])
     thread_limit = resolve_ffmpeg_thread_limit(core_limit=config.get("__ffmpeg_thread_limit"), cpu_total=config.get("__cpu_total"))
     if thread_limit is not None:
         command.extend(["-threads", str(thread_limit)])

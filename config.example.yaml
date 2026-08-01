@@ -64,6 +64,7 @@ quality_profiles:
   default:
     encoder: libx265
     crf: 24
+    max_video_bitrate_kbps: 8000
     preset: medium
     pix_fmt: yuv420p10le
     audio: copy
@@ -71,6 +72,7 @@ quality_profiles:
   movie:
     encoder: libx265
     crf: 23
+    max_video_bitrate_kbps: 8000
     preset: medium
     pix_fmt: yuv420p10le
     audio: copy

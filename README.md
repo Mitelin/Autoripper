@@ -156,7 +156,7 @@ Important sections:
 - `scan.priority_probe_limit`: number of large candidates that get a deeper ranking pass
 - `scan.failed_retry_cooldown_hours`, `scan.max_failures_per_file`: older scan-level cooldown controls kept for compatibility
 - `scan_cache.*`: current SQLite cache behavior for inventory, queue, folder state, retries, and block windows
-- `quality_profiles.*`: encoder, CRF, preset, pixel format, and stream-copy behavior per media type
+- `quality_profiles.*`: encoder, CRF, `max_video_bitrate_kbps` cap (defaults to `8000` when omitted), preset, pixel format, and stream-copy behavior per media type
 - `downscale.*`: optional width-capped downscale for 4K-style sources while preserving aspect ratio
 - `retention_size_policy.*`: keep suspiciously large HEVC or AV1 files eligible for re-encode
 - `track_policy.*`: select preferred audio languages and subtitle retention behavior

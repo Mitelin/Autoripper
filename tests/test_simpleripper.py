@@ -2113,6 +2113,74 @@ class SimpleRipperTests(unittest.TestCase):
 
         self.assertNotIn("-threads", command)
 
+    def test_build_ffmpeg_command_uses_default_max_video_bitrate_cap_when_omitted(self) -> None:
+        config = self.make_config(Path("."))
+
+        command = simpleripper.build_ffmpeg_command(
+            config,
+            Path("input.mkv"),
+            Path("output.mkv"),
+            {"media_type": "default"},
+            {"map_arguments": ["-map", "0"]},
+        )
+
+        self.assertIn("-maxrate", command)
+        self.assertEqual(command[command.index("-maxrate") + 1], "8000k")
+        self.assertIn("-bufsize", command)
+        self.assertEqual(command[command.index("-bufsize") + 1], "16000k")
+
+    def test_build_ffmpeg_command_adds_max_video_bitrate_cap_when_configured(self) -> None:
+        config = self.make_config(Path("."))
+        config["quality_profiles"] = {
+            "default": {
+                "encoder": "libx265",
+                "crf": 24,
+                "preset": "medium",
+                "pix_fmt": "yuv420p10le",
+                "audio": "copy",
+                "subtitles": "copy",
+                "max_video_bitrate_kbps": 8000,
+            }
+        }
+
+        command = simpleripper.build_ffmpeg_command(
+            config,
+            Path("input.mkv"),
+            Path("output.mkv"),
+            {"media_type": "default"},
+            {"map_arguments": ["-map", "0"]},
+        )
+
+        self.assertIn("-maxrate", command)
+        self.assertEqual(command[command.index("-maxrate") + 1], "8000k")
+        self.assertIn("-bufsize", command)
+        self.assertEqual(command[command.index("-bufsize") + 1], "16000k")
+
+    def test_build_ffmpeg_command_skips_invalid_max_video_bitrate_cap(self) -> None:
+        config = self.make_config(Path("."))
+        config["quality_profiles"] = {
+            "default": {
+                "encoder": "libx265",
+                "crf": 24,
+                "preset": "medium",
+                "pix_fmt": "yuv420p10le",
+                "audio": "copy",
+                "subtitles": "copy",
+                "max_video_bitrate_kbps": 0,
+            }
+        }
+
+        command = simpleripper.build_ffmpeg_command(
+            config,
+            Path("input.mkv"),
+            Path("output.mkv"),
+            {"media_type": "default"},
+            {"map_arguments": ["-map", "0"]},
+        )
+
+        self.assertNotIn("-maxrate", command)
+        self.assertNotIn("-bufsize", command)
+
     def test_downscale_settings_applies_for_4k_series(self) -> None:
         config = self.make_config(Path("."))
         config["downscale"] = {
