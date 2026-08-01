@@ -1121,6 +1121,8 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("if(!force&&disclosure&&!disclosure.open){return}", simpleripper.INDEX_HTML)
         self.assertIn("rawStatusDisclosure.addEventListener('toggle'", simpleripper.INDEX_HTML)
         self.assertIn("#log{max-height:420px}", simpleripper.INDEX_HTML)
+        self.assertNotIn("recent_log_lines", simpleripper.INDEX_HTML)
+        self.assertEqual(simpleripper.INDEX_HTML.count("function render(s){"), 1)
 
     def test_error_action_post_returns_fast_acknowledgement(self) -> None:
         class FakeApp:
