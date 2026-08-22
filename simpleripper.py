@@ -2106,6 +2106,55 @@ def refresh_folder_state_upwards(config: dict[str, Any], source: Path) -> None:
     refresh_folder_state_batch(config, [source])
 
 
+def delete_folder_index_subtree(connection: sqlite3.Connection, folder: Path, config: dict[str, Any], reason: str) -> tuple[int, int]:
+    prefix = str(folder) + "\\"
+    file_count_row = connection.execute(
+        "SELECT COUNT(*) AS count FROM file_index WHERE path = ? OR path LIKE ?",
+        (str(folder), prefix + "%"),
+    ).fetchone()
+    folder_count_row = connection.execute(
+        "SELECT COUNT(*) AS count FROM folder_index WHERE path = ? OR path LIKE ?",
+        (str(folder), prefix + "%"),
+    ).fetchone()
+    file_count = int(file_count_row["count"] or 0) if file_count_row else 0
+    folder_count = int(folder_count_row["count"] or 0) if folder_count_row else 0
+    connection.execute("DELETE FROM file_index WHERE path = ? OR path LIKE ?", (str(folder), prefix + "%"))
+    connection.execute("DELETE FROM folder_index WHERE path = ? OR path LIKE ?", (str(folder), prefix + "%"))
+    if file_count or folder_count:
+        log_event(config, "stale_cache_subtree_removed", folder=str(folder), reason=reason, removed_files=file_count, removed_folders=folder_count)
+    return file_count, folder_count
+
+
+def cleanup_stale_cache_entries(connection: sqlite3.Connection, folder: Path, live_child_dirs: list[Path], live_video_files: list[Path], config: dict[str, Any]) -> tuple[int, int]:
+    live_file_paths = {str(path) for path in live_video_files}
+    stale_file_rows = connection.execute("SELECT path FROM file_index WHERE parent_dir = ?", (str(folder),)).fetchall()
+    removed_files = 0
+    removed_folders = 0
+    for row in stale_file_rows:
+        stale_path = str(row["path"])
+        if stale_path in live_file_paths:
+            continue
+        connection.execute("DELETE FROM file_index WHERE path = ?", (stale_path,))
+        removed_files += 1
+        log_event(config, "candidate_cache_entry_removed", source_path=stale_path, reason="inventory_missing_source")
+    live_child_paths = {str(path) for path in live_child_dirs}
+    prefix = str(folder) + "\\%"
+    child_rows = connection.execute("SELECT path FROM folder_index WHERE path LIKE ?", (prefix,)).fetchall()
+    stale_children: list[Path] = []
+    for row in child_rows:
+        child_path = Path(str(row["path"]))
+        if child_path.parent != folder:
+            continue
+        if str(child_path) in live_child_paths:
+            continue
+        stale_children.append(child_path)
+    for child_path in stale_children:
+        deleted_files, deleted_folders = delete_folder_index_subtree(connection, child_path, config, "inventory_missing_folder")
+        removed_files += deleted_files
+        removed_folders += deleted_folders
+    return removed_files, removed_folders
+
+
 def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str, Any]:
     now = utc_now()
     generation_id = f"{now}-{os.getpid()}"
@@ -2113,6 +2162,8 @@ def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str
     seen = 0
     changed = 0
     skipped_folders = 0
+    stale_removed_files = 0
+    stale_removed_folders = 0
     queue_count = 0
     current_policy_hash = policy_hash(config)
     settings = scan_cache_settings(config)
@@ -2120,7 +2171,7 @@ def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str
     log_event(config, "inventory_refresh_started", folders=[str(folder) for folder in folders], generation_id=generation_id, scope=scope_fingerprint, cache_path=str(worker_cache_path(config)))
 
     def scan_folder(connection: sqlite3.Connection, folder: Path) -> None:
-        nonlocal seen, changed, skipped_folders
+        nonlocal seen, changed, skipped_folders, stale_removed_files, stale_removed_folders
         if not folder.exists() or not folder.is_dir() or path_is_scan_excluded(folder, config):
             return
         signature = direct_folder_signature(folder, config)
@@ -2137,9 +2188,14 @@ def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str
             return
         if row and str(row["state"] or "") == "clean":
             update_folder_state_row(connection, folder, config, "stale", "signature_or_policy_changed", signature, False, {"scan_complete": False}, generation_id)
-        for child_dir in direct_child_dirs(folder, config):
+        child_dirs = direct_child_dirs(folder, config)
+        for child_dir in child_dirs:
             scan_folder(connection, child_dir)
-        for path in direct_video_files(folder, config):
+        video_files = direct_video_files(folder, config)
+        removed_files, removed_folders = cleanup_stale_cache_entries(connection, folder, child_dirs, video_files, config)
+        stale_removed_files += removed_files
+        stale_removed_folders += removed_folders
+        for path in video_files:
             marker = marker_path(path, config)
             if marker is not None and marker.exists():
                 continue
@@ -2274,11 +2330,11 @@ def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str
             connection.execute("UPDATE folder_index SET state = 'partial', reason = 'inventory_incomplete', scan_complete = 0, updated_at = ? WHERE inventory_generation_id = ? AND state = 'clean'", (utc_now(), generation_id))
         log_event(config, "inventory_refresh_incomplete", generation_id=generation_id)
         raise
-    log_event(config, "inventory_refresh_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, generation_id=generation_id, scope=scope_fingerprint, cache_path=str(worker_cache_path(config)))
+    log_event(config, "inventory_refresh_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, stale_removed_files=stale_removed_files, stale_removed_folders=stale_removed_folders, generation_id=generation_id, scope=scope_fingerprint, cache_path=str(worker_cache_path(config)))
     log_event(config, "candidate_queue_refreshed", count=queue_count, scope=scope_fingerprint)
     log_event(config, "candidate_queue_rebuilt", count=queue_count, scope=scope_fingerprint, generation_id=generation_id)
-    log_event(config, "fast_inventory_scan_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, cache_path=str(worker_cache_path(config)))
-    return {"indexed_files": seen, "changed_files": changed, "skipped_folders": skipped_folders, "generation_id": generation_id, "scope_fingerprint": scope_fingerprint, "last_fast_inventory_scan_at": now}
+    log_event(config, "fast_inventory_scan_done", indexed_files=seen, changed_files=changed, skipped_folders=skipped_folders, stale_removed_files=stale_removed_files, stale_removed_folders=stale_removed_folders, cache_path=str(worker_cache_path(config)))
+    return {"indexed_files": seen, "changed_files": changed, "skipped_folders": skipped_folders, "stale_removed_files": stale_removed_files, "stale_removed_folders": stale_removed_folders, "generation_id": generation_id, "scope_fingerprint": scope_fingerprint, "last_fast_inventory_scan_at": now}
 
 
 def fast_inventory_due(config: dict[str, Any]) -> bool:
@@ -2760,7 +2816,9 @@ def skip_reason(config: dict[str, Any], metadata: dict[str, Any], track_policy_r
     media_type = str(metadata.get("media_type") or "default")
     retention_size_policy = retention_size_policy_evaluation(config, metadata, media_type)
     oversized_reprocess = bool(retention_size_policy.get("oversized")) and codec in {"hevc", "h265", "av1"}
-    if rules.get("skip_4k", True) and int(metadata.get("video_height") or 0) >= 1800:
+    downscale_plan = downscale_settings(config, metadata)
+    allow_4k_reprocess = oversized_reprocess or bool(downscale_plan.get("applied"))
+    if rules.get("skip_4k", True) and int(metadata.get("video_height") or 0) >= 1800 and not allow_4k_reprocess:
         return "skip_4k"
     if rules.get("skip_hdr", True) and metadata.get("is_hdr") and not oversized_reprocess:
         return "skip_hdr"

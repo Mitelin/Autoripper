@@ -711,6 +711,35 @@ class SimpleRipperTests(unittest.TestCase):
                 row = connection.execute("SELECT state FROM folder_index WHERE path = ?", (str(season),)).fetchone()
             self.assertEqual(row["state"], "partial")
 
+    def test_fast_inventory_scan_removes_stale_rows_after_folder_move(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            library = root / "library"
+            old_show = library / "ANIME" / "Old Show"
+            new_show = library / "ANIME" / "Renamed Show"
+            season = old_show / "Season 01"
+            season.mkdir(parents=True)
+            source = season / "episode.mkv"
+            source.write_bytes(b"x" * 10)
+
+            simpleripper.fast_inventory_scan([library], config)
+            old_show.rename(new_show)
+            result = simpleripper.fast_inventory_scan([library], config)
+
+            self.assertGreaterEqual(result["stale_removed_files"], 1)
+            self.assertGreaterEqual(result["stale_removed_folders"], 2)
+            with simpleripper.open_worker_cache(config) as connection:
+                old_file_row = connection.execute("SELECT path FROM file_index WHERE path = ?", (str(source),)).fetchone()
+                old_folder_row = connection.execute("SELECT path FROM folder_index WHERE path = ?", (str(old_show),)).fetchone()
+                season_row = connection.execute("SELECT path FROM folder_index WHERE path = ?", (str(new_show / "Season 01"),)).fetchone()
+                new_file_row = connection.execute("SELECT path FROM file_index WHERE path = ?", (str(new_show / "Season 01" / "episode.mkv"),)).fetchone()
+            self.assertIsNone(old_file_row)
+            self.assertIsNone(old_folder_row)
+            self.assertIsNotNone(season_row)
+            self.assertIsNotNone(new_file_row)
+
     def test_policy_hash_change_marks_clean_folder_stale(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2955,6 +2984,37 @@ class SimpleRipperTests(unittest.TestCase):
         }
         track_policy = simpleripper.select_streams(config, metadata)
 
+        self.assertIsNone(simpleripper.skip_reason(config, metadata, track_policy))
+
+    def test_oversized_4k_anime_with_downscale_enabled_is_not_skipped(self) -> None:
+        config = self.make_config(Path("."))
+        config["quality_profiles"] = {"default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}, "anime": {"encoder": "libx265", "pix_fmt": "yuv420p10le"}}
+        config["skip_rules"] = {"skip_hevc": True, "skip_4k": True, "skip_hdr": True}
+        config["downscale"] = {
+            "enabled": True,
+            "media_types": ["anime"],
+            "only_buckets": ["4k"],
+            "max_width": 1920,
+            "flags": "lanczos",
+            "crf_override": 21,
+        }
+        metadata = {
+            "media_type": "anime",
+            "video_codec": "hevc",
+            "video_pix_fmt": "yuv420p10le",
+            "video_width": 3840,
+            "video_height": 2160,
+            "is_hdr": False,
+            "duration_seconds": 1416,
+            "file_size_bytes": 2041 * 1024 * 1024,
+            "audio_stream_count": 1,
+            "subtitle_stream_count": 0,
+            "audio_streams": [{"index": 1, "codec": "aac", "language": "eng", "title": "English"}],
+            "subtitle_streams": [],
+        }
+        track_policy = simpleripper.select_streams(config, metadata)
+
+        self.assertTrue(simpleripper.downscale_settings(config, metadata)["applied"])
         self.assertIsNone(simpleripper.skip_reason(config, metadata, track_policy))
 
     def test_av1_source_matching_profile_but_oversized_is_not_skipped(self) -> None:

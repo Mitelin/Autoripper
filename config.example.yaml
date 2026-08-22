@@ -81,6 +81,7 @@ quality_profiles:
 downscale:
   enabled: false
   media_types:
+    - anime
     - series
     - movie
   only_buckets:
