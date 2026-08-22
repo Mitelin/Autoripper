@@ -1439,6 +1439,41 @@ class SimpleRipperTests(unittest.TestCase):
 
             wait_mock.assert_called_once_with(3600, "no_usable_candidates")
 
+    def test_run_loop_forces_inventory_repair_before_waiting_for_empty_cached_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24}
+            app = simpleripper.SimpleRipperApp(config)
+            app.state.running = True
+            app._running_requested = True
+
+            with patch("simpleripper.scan_candidates", return_value=[]) as scan_mock, patch("simpleripper.fast_inventory_scan", return_value={}) as repair_mock, patch.object(app, "schedule_rescan_wait", return_value=False) as wait_mock:
+                app._run_loop()
+
+            self.assertEqual(scan_mock.call_count, 2)
+            repair_mock.assert_called_once_with(app.selected_folders, config)
+            wait_mock.assert_called_once_with(3600, "no_candidates")
+
+    def test_run_loop_forces_inventory_repair_before_waiting_when_queue_has_no_usable_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24}
+            app = simpleripper.SimpleRipperApp(config)
+            app.state.running = True
+            app._running_requested = True
+            candidate = root / "library" / "movie.mkv"
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_bytes(b"x" * 10)
+
+            with patch("simpleripper.scan_candidates", return_value=[candidate]) as scan_mock, patch.object(app, "pick_next_candidate", return_value=None), patch("simpleripper.cached_candidate_paths", return_value=[]), patch("simpleripper.fast_inventory_scan", return_value={}) as repair_mock, patch.object(app, "schedule_rescan_wait", return_value=False) as wait_mock:
+                app._run_loop()
+
+            self.assertEqual(scan_mock.call_count, 2)
+            repair_mock.assert_called_once_with(app.selected_folders, config)
+            wait_mock.assert_called_once_with(3600, "no_usable_candidates")
+
     def test_media_type_for_source_prefers_selected_folder_setting(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

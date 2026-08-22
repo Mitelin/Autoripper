@@ -4381,6 +4381,7 @@ class SimpleRipperApp:
         return None
 
     def _run_loop(self) -> None:
+        repaired_empty_inventory = False
         try:
             while True:
                 with self._lock:
@@ -4417,8 +4418,16 @@ class SimpleRipperApp:
                 if not candidates:
                     if self._drain_queued_error_actions():
                         continue
+                    if scan_cache_enabled(self.config) and not repaired_empty_inventory:
+                        self.set_phase("repairing_inventory")
+                        log_event(self.config, "inventory_auto_repair_started", reason="no_candidates", folders=[str(path) for path in folders])
+                        fast_inventory_scan(folders, self.config)
+                        repaired_empty_inventory = True
+                        log_event(self.config, "inventory_auto_repair_done", reason="no_candidates")
+                        continue
                     if not self.schedule_rescan_wait(3600, "no_candidates"):
                         break
+                    repaired_empty_inventory = False
                     continue
                 self.set_phase("selecting_candidate")
                 candidate = self.pick_next_candidate(candidates)
@@ -4427,9 +4436,18 @@ class SimpleRipperApp:
                         continue
                     if self._drain_queued_error_actions():
                         continue
+                    if scan_cache_enabled(self.config) and not repaired_empty_inventory:
+                        self.set_phase("repairing_inventory")
+                        log_event(self.config, "inventory_auto_repair_started", reason="no_usable_candidates", folders=[str(path) for path in folders])
+                        fast_inventory_scan(folders, self.config)
+                        repaired_empty_inventory = True
+                        log_event(self.config, "inventory_auto_repair_done", reason="no_usable_candidates")
+                        continue
                     if not self.schedule_rescan_wait(3600, "no_usable_candidates"):
                         break
+                    repaired_empty_inventory = False
                     continue
+                repaired_empty_inventory = False
                 self.process_one(candidate)
                 with self._lock:
                     if self.state.force_stop or not self._running_requested:
