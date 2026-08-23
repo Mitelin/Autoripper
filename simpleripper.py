@@ -185,6 +185,14 @@ def tail_text_lines(path: Path, limit: int = 100, chunk_size: int = 64 * 1024) -
     return b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()[-limit:]
 
 
+def ffmpeg_failure_message(returncode: int, log_path: Path) -> str:
+    lines = [line.strip() for line in tail_text_lines(log_path, 8) if line.strip()]
+    detail = " | ".join(lines)
+    if len(detail) > 2000:
+        detail = detail[-2000:]
+    return f"ffmpeg failed with exit code {returncode}" + (f": {detail}" if detail else "")
+
+
 def copy_file_interruptible(source: Path, destination: Path, should_stop: callable, chunk_size: int = 8 * 1024 * 1024) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -1365,7 +1373,16 @@ def extract_metadata(path: Path, probe: dict[str, Any], media_type: str = "defau
 
 def select_streams(config: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
     policy = resolved_track_policy(config, str(source.get("media_type") or "unknown"))
-    default_maps = ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]
+    subtitle_streams = source.get("subtitle_streams") or []
+    unsupported_subtitles = [stream for stream in subtitle_streams if "codec" in stream and not stream.get("codec")]
+    supported_subtitles = [stream for stream in subtitle_streams if stream not in unsupported_subtitles]
+    subtitle_maps = ["-map", "0:s?"]
+    if unsupported_subtitles:
+        subtitle_maps = []
+        for stream in supported_subtitles:
+            subtitle_maps.extend(["-map", f"0:{stream['index']}"])
+    expected_subtitle_count = len(supported_subtitles) if unsupported_subtitles else source.get("subtitle_stream_count")
+    default_maps = ["-map", "0:v:0", "-map", "0:a?", *subtitle_maps, "-map", "0:t?"]
     target_languages = sorted(set(policy.get("target_audio_languages") or ["cze"]))
     fallback_base = {
         "target_audio_languages": target_languages,
@@ -1373,38 +1390,42 @@ def select_streams(config: dict[str, Any], source: dict[str, Any]) -> dict[str, 
         "fallback_used": True,
         "selected_audio_streams": [],
         "dropped_audio_streams": [],
+        "dropped_unsupported_subtitle_streams": unsupported_subtitles,
+        "subtitle_filter_applied": bool(unsupported_subtitles),
     }
     if not policy.get("enabled", True) or not policy.get("cleanup_enabled", True):
-        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count"), "decision_summary": "track_policy_cleanup_disabled_fallback_keep_all_audio", **fallback_base}
+        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": expected_subtitle_count, "decision_summary": "track_policy_cleanup_disabled_fallback_keep_all_audio", **fallback_base}
     target_language_set = set(target_languages)
     audio_streams = source.get("audio_streams") or []
     target_audio = [stream for stream in audio_streams if detect_language(stream)[0] in target_language_set]
     if len(audio_streams) <= 1:
-        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count"), "decision_summary": "track_policy_single_audio_fallback_keep_all_audio", **fallback_base}
+        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": expected_subtitle_count, "decision_summary": "track_policy_single_audio_fallback_keep_all_audio", **fallback_base}
     if not target_audio:
-        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count"), "decision_summary": "track_policy_no_target_audio_found_fallback_keep_all_audio", **fallback_base}
+        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": expected_subtitle_count, "decision_summary": "track_policy_no_target_audio_found_fallback_keep_all_audio", **fallback_base}
     if not policy.get("drop_other_audio_if_target_found", True):
-        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": source.get("subtitle_stream_count"), "decision_summary": "track_policy_drop_other_audio_disabled_fallback_keep_all_audio", **fallback_base}
+        return {"applied": False, "map_arguments": default_maps, "expected_audio_stream_count": source.get("audio_stream_count"), "expected_subtitle_stream_count": expected_subtitle_count, "decision_summary": "track_policy_drop_other_audio_disabled_fallback_keep_all_audio", **fallback_base}
     args = ["-map", "0:v:0"]
     for stream in target_audio:
         args.extend(["-map", f"0:{stream['index']}"])
     selected_audio_streams = [describe_audio_stream(stream) for stream in target_audio]
     dropped_audio_streams = [describe_audio_stream(stream) for stream in audio_streams if stream not in target_audio]
-    expected_subtitle_count = 0
+    selected_subtitle_count = 0
     if policy.get("keep_subtitles", True):
-        args.extend(["-map", "0:s?"])
-        expected_subtitle_count = source.get("subtitle_stream_count")
+        args.extend(subtitle_maps)
+        selected_subtitle_count = expected_subtitle_count
     args.extend(["-map", "0:t?"])
     return {
         "applied": True,
         "map_arguments": args,
         "expected_audio_stream_count": len(target_audio),
-        "expected_subtitle_stream_count": expected_subtitle_count,
+        "expected_subtitle_stream_count": selected_subtitle_count,
         "target_audio_languages": target_languages,
         "cleanup_enabled": bool(policy.get("cleanup_enabled", True)),
         "fallback_used": False,
         "selected_audio_streams": selected_audio_streams,
         "dropped_audio_streams": dropped_audio_streams,
+        "dropped_unsupported_subtitle_streams": unsupported_subtitles,
+        "subtitle_filter_applied": bool(unsupported_subtitles),
         "decision_summary": f"track_policy_applied_keep_{language_summary_token(selected_audio_streams)}_drop_extra_{language_summary_token(dropped_audio_streams)}",
     }
 
@@ -1521,7 +1542,7 @@ def verify_output(config: dict[str, Any], source: dict[str, Any], output: Path, 
     threshold = bitrate_threshold(config, str(source.get("media_type") or "default"), output_metadata or source)
     bitrate = output_metadata.get("overall_bitrate_kbps") or estimated_bitrate_kbps(output_size, output_metadata.get("duration_seconds") or source.get("duration_seconds"))
     expected_audio = stream_policy.get("expected_audio_stream_count") if stream_policy.get("applied") else source.get("audio_stream_count")
-    expected_subtitle = stream_policy.get("expected_subtitle_stream_count") if stream_policy.get("applied") else source.get("subtitle_stream_count")
+    expected_subtitle = stream_policy.get("expected_subtitle_stream_count") if stream_policy.get("applied") or stream_policy.get("subtitle_filter_applied") else source.get("subtitle_stream_count")
     duration_diff = abs(float(source.get("duration_seconds") or 0) - float(output_metadata.get("duration_seconds") or 0)) if source.get("duration_seconds") and output_metadata.get("duration_seconds") else None
     warning_reasons = []
     if ratio is not None and ratio <= float(limits.get("low_ratio_warning", 0.15)):
@@ -4647,7 +4668,8 @@ class SimpleRipperApp:
                         time.sleep(0.5)
                     progress_thread.join(timeout=1)
                     if self._ffmpeg.returncode != 0:
-                        raise FfmpegFailedError(f"ffmpeg failed with exit code {self._ffmpeg.returncode}")
+                        log_handle.flush()
+                        raise FfmpegFailedError(ffmpeg_failure_message(self._ffmpeg.returncode, ffmpeg_log))
                 ffmpeg_completed = True
                 log_event(self.config, "ffmpeg_done", job_id=job_id, returncode=self._ffmpeg.returncode)
             self.set_phase("probing_output", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})

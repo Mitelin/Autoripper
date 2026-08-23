@@ -2193,6 +2193,30 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertEqual(result["decision_summary"], "track_policy_no_target_audio_found_fallback_keep_all_audio")
         self.assertEqual(result["dropped_audio_streams"], [])
 
+    def test_track_policy_drops_subtitle_stream_without_detected_codec(self) -> None:
+        source = {
+            "media_type": "movie",
+            "audio_stream_count": 2,
+            "subtitle_stream_count": 1,
+            "audio_streams": [
+                {"index": 1, "codec": "aac", "language": "cze"},
+                {"index": 2, "codec": "aac", "language": "slo"},
+            ],
+            "subtitle_streams": [{"index": 3, "codec": None, "language": "cze"}],
+        }
+
+        result = simpleripper.select_streams(
+            {"track_policy": {"enabled": True, "movie": {"target_audio_languages": ["cze"], "drop_other_audio_if_target_found": True}}},
+            source,
+        )
+
+        self.assertTrue(result["applied"])
+        self.assertTrue(result["subtitle_filter_applied"])
+        self.assertNotIn("0:s?", result["map_arguments"])
+        self.assertNotIn("0:3", result["map_arguments"])
+        self.assertEqual(result["expected_subtitle_stream_count"], 0)
+        self.assertEqual(result["dropped_unsupported_subtitle_streams"], source["subtitle_streams"])
+
     def test_build_ffmpeg_command_enables_progress_pipe(self) -> None:
         command = simpleripper.build_ffmpeg_command(
             self.make_config(Path(".")),
@@ -2205,6 +2229,20 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("-progress", command)
         self.assertIn("pipe:1", command)
         self.assertIn("-nostats", command)
+
+    def test_ffmpeg_failure_message_includes_log_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "ffmpeg.log"
+            log_path.write_text(
+                "input details\nSubtitle codec none (0) is not supported.\nCould not write header: Function not implemented\n",
+                encoding="utf-8",
+            )
+
+            message = simpleripper.ffmpeg_failure_message(218, log_path)
+
+        self.assertIn("exit code 218", message)
+        self.assertIn("Subtitle codec none", message)
+        self.assertIn("Function not implemented", message)
 
     def test_build_ffmpeg_command_adds_thread_limit_when_configured(self) -> None:
         config = self.make_config(Path("."))
