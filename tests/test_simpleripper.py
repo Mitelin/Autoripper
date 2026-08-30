@@ -506,6 +506,25 @@ class SimpleRipperTests(unittest.TestCase):
 
             self.assertEqual(simpleripper.scan_candidates([source.parent], config), [source])
 
+    def test_downscale_policy_change_invalidates_cached_4k_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            config["downscale"] = {"enabled": False, "media_types": ["movie"], "only_buckets": ["4k"], "max_width": 1920}
+            source = root / "library" / "movie-4k.mkv"
+            source.parent.mkdir()
+            source.write_bytes(b"x" * 10)
+            simpleripper.fast_inventory_scan([source.parent], config)
+            old_hash = simpleripper.policy_hash(config)
+            with simpleripper.open_worker_cache(config) as connection:
+                connection.execute("UPDATE file_index SET decision = 'skip', decision_reason = 'skip_4k', policy_hash = ? WHERE path = ?", (old_hash, str(source)))
+
+            config["downscale"]["enabled"] = True
+
+            self.assertNotEqual(simpleripper.policy_hash(config), old_hash)
+            self.assertEqual(simpleripper.scan_candidates([source.parent], config), [source])
+
     def test_selected_folder_change_invalidates_empty_queue_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

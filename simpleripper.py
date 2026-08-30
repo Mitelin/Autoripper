@@ -30,7 +30,7 @@ import yaml
 
 APP_NAME = "SimpleRipper"
 SCAN_SCOPE_SCHEMA_VERSION = 1
-POLICY_HASH_SCHEMA_VERSION = 2
+POLICY_HASH_SCHEMA_VERSION = 3
 WORKER_CACHE_BUSY_TIMEOUT_MS = 30000
 MAX_SAFE_FILENAME_BYTES = 255
 DEFAULT_MAX_VIDEO_BITRATE_KBPS = 8000
@@ -468,6 +468,7 @@ def policy_hash(config: dict[str, Any]) -> str:
         "skip_rules": config.get("skip_rules") or {},
         "track_policy": config.get("track_policy") or {},
         "retention_size_policy": config.get("retention_size_policy") or {},
+        "downscale": config.get("downscale") or {},
         "verification": config.get("verification") or {},
         "libraries": (config.get("libraries") or {}).get("roots") or [],
     }
