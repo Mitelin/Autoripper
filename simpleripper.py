@@ -54,6 +54,10 @@ class FfmpegFailedError(RuntimeError):
     pass
 
 
+class InsufficientLocalSpaceError(RuntimeError):
+    pass
+
+
 class VerificationFailedError(RuntimeError):
     def __init__(self, stage: str, errors: list[str], verification: dict[str, Any]) -> None:
         self.stage = stage
@@ -2940,7 +2944,7 @@ def ensure_local_free_space(config: dict[str, Any], source_size: int) -> None:
     free = shutil.disk_usage(root).free
     required = max(int(minimum_gb * 1024 * 1024 * 1024), int(source_size * 1.5))
     if free < required:
-        raise RuntimeError(f"not enough local free space: free={free}, required={required}")
+        raise InsufficientLocalSpaceError(f"not enough local free space: free={free}, required={required}")
 
 
 LEGACY_CONTAINER_OUTPUT_SUFFIXES = {
@@ -4728,6 +4732,29 @@ class SimpleRipperApp:
         except ForceStopRequested:
             log_event(self.config, "force_stop_completed", job_id=job_id, source_path=str(source), phase=self.state.current_phase)
             self.reset_runtime_state(clear_errors=True, preserve_force_stop=True)
+        except InsufficientLocalSpaceError as exc:
+            discard_work_dir = True
+            self.stop_after_current()
+            set_running_requested(self.config, False, stop_reason="insufficient_local_space")
+            job_summary.update({
+                "status": "error",
+                "finished_at": utc_now(),
+                "error": str(exc),
+                "failure_type": "worker",
+            })
+            append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
+            self.log_error(
+                f"{source}: {exc}",
+                source_path=str(source),
+                failure_type="worker",
+            )
+            log_event(
+                self.config,
+                "worker_stopped_insufficient_local_space",
+                job_id=job_id,
+                source_path=str(source),
+                error=str(exc),
+            )
         except Exception as exc:
             if isinstance(exc, FileNotFoundError) and not source.exists():
                 discard_work_dir = True
