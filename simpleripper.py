@@ -199,8 +199,24 @@ def ffmpeg_failure_message(returncode: int, log_path: Path) -> str:
     return f"ffmpeg failed with exit code {returncode}" + (f": {detail}" if detail else "")
 
 
-def ffmpeg_binary_fingerprint(config: dict[str, Any]) -> str:
-    configured = str((config.get("tools") or {}).get("ffmpeg") or "ffmpeg")
+def ffmpeg_path_for_source(config: dict[str, Any], source: Path | None = None) -> str:
+    tools = config.get("tools") or {}
+    default = str(tools.get("ffmpeg") or "ffmpeg")
+    if source is None:
+        return default
+    normalized_source = str(source).replace("\\", "/").rstrip("/").casefold()
+    for override in tools.get("ffmpeg_path_overrides") or []:
+        if not isinstance(override, dict):
+            continue
+        prefix = str(override.get("path_prefix") or "").replace("\\", "/").rstrip("/").casefold()
+        executable = str(override.get("ffmpeg") or "").strip()
+        if prefix and executable and (normalized_source == prefix or normalized_source.startswith(prefix + "/")):
+            return executable
+    return default
+
+
+def ffmpeg_binary_fingerprint(config: dict[str, Any], source: Path | None = None) -> str:
+    configured = ffmpeg_path_for_source(config, source)
     resolved = shutil.which(configured) or configured
     path = Path(resolved)
     try:
@@ -981,7 +997,7 @@ def recent_ffmpeg_failure_info(config: dict[str, Any], source: Path) -> dict[str
     if not payload or payload.get("status") != "error" or payload.get("failure_type") != "ffmpeg":
         return None
     recorded_fingerprint = payload.get("ffmpeg_binary_fingerprint")
-    if recorded_fingerprint and recorded_fingerprint != ffmpeg_binary_fingerprint(config):
+    if recorded_fingerprint and recorded_fingerprint != ffmpeg_binary_fingerprint(config, source):
         return None
     signature = payload.get("source_signature") or {}
     current = source_signature(source)
@@ -1501,6 +1517,7 @@ def build_ffmpeg_command(
     metadata: dict[str, Any],
     stream_policy: dict[str, Any],
     downscale_plan: dict[str, Any] | None = None,
+    original_source: Path | None = None,
 ) -> list[str]:
     settings = (config.get("quality_profiles") or {}).get(metadata.get("media_type") or "default") or (config.get("quality_profiles") or {}).get("default") or {}
     downscale_plan = downscale_plan or downscale_settings(config, metadata)
@@ -1510,7 +1527,7 @@ def build_ffmpeg_command(
         max_video_bitrate_kbps = DEFAULT_MAX_VIDEO_BITRATE_KBPS
     if downscale_plan.get("applied") and downscale_plan.get("crf_override") is not None:
         crf = downscale_plan["crf_override"]
-    command = [str((config.get("tools") or {}).get("ffmpeg") or "ffmpeg"), "-hide_banner", "-nostats", "-progress", "pipe:1", "-y", "-i", str(source)]
+    command = [ffmpeg_path_for_source(config, original_source or source), "-hide_banner", "-nostats", "-progress", "pipe:1", "-y", "-i", str(source)]
     default_maps = ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]
     map_arguments = list(stream_policy.get("map_arguments") or default_maps)
     if any(option == "-map" and index + 1 < len(map_arguments) and map_arguments[index + 1] == "0" for index, option in enumerate(map_arguments)):
@@ -4625,7 +4642,7 @@ class SimpleRipperApp:
             crf = settings.get("crf", 24)
             if downscale_plan.get("applied") and downscale_plan.get("crf_override") is not None:
                 crf = downscale_plan["crf_override"]
-            command = build_ffmpeg_command(self.config, copied_source, output, source_meta, stream_policy, downscale_plan)
+            command = build_ffmpeg_command(self.config, copied_source, output, source_meta, stream_policy, downscale_plan, original_source=source)
             job_summary["ffmpeg_command"] = command
             if stream_policy.get("applied"):
                 log_event(
@@ -4805,7 +4822,7 @@ class SimpleRipperApp:
             append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
             history_payload = {"status": "error", "job_id": job_id, "source_signature": current_signature, "updated_at": utc_now(), "error": str(exc), "failure_type": failure_type, "failure_count": failure_count, "replacement_path": str(replacement_path)}
             if failure_type == "ffmpeg":
-                history_payload["ffmpeg_binary_fingerprint"] = ffmpeg_binary_fingerprint(self.config)
+                history_payload["ffmpeg_binary_fingerprint"] = ffmpeg_binary_fingerprint(self.config, source)
             write_history_index(self.config, source, history_payload)
             write_shared_worker_history(self.config, source, history_payload)
             cache_failure = update_cache_job_failure(self.config, source, str(exc), block_immediately=fatal_ffmpeg_crash) if ffmpeg_started else None

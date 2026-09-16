@@ -2314,6 +2314,21 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("pipe:1", command)
         self.assertIn("-nostats", command)
 
+    def test_build_ffmpeg_command_overrides_binary_only_for_matching_source_prefix(self) -> None:
+        config = self.make_config(Path("."))
+        config["tools"] = {
+            "ffmpeg": "/usr/bin/ffmpeg",
+            "ffmpeg_path_overrides": [
+                {"path_prefix": "/media/problem-series", "ffmpeg": "/opt/ffmpeg-8.1/bin/ffmpeg"},
+            ],
+        }
+
+        matching = simpleripper.build_ffmpeg_command(config, Path("work/input.mkv"), Path("output.mkv"), {"media_type": "default"}, {"map_arguments": ["-map", "0"]}, original_source=Path("/media/problem-series/episode.mkv"))
+        unrelated = simpleripper.build_ffmpeg_command(config, Path("work/input.mkv"), Path("output.mkv"), {"media_type": "default"}, {"map_arguments": ["-map", "0"]}, original_source=Path("/media/other/episode.mkv"))
+
+        self.assertEqual(matching[0], "/opt/ffmpeg-8.1/bin/ffmpeg")
+        self.assertEqual(unrelated[0], "/usr/bin/ffmpeg")
+
     def test_ffmpeg_failure_message_includes_log_tail(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "ffmpeg.log"
