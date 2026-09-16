@@ -627,6 +627,25 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(row["decision_reason"], "repeated_ffmpeg_failure")
             self.assertEqual(row["failure_count"], 3)
 
+    def test_ffmpeg_failure_from_different_binary_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            source = root / "library" / "native-crash.mkv"
+            old_ffmpeg = root / "ffmpeg-old"
+            new_ffmpeg = root / "ffmpeg-new"
+            source.parent.mkdir()
+            source.write_bytes(b"source")
+            old_ffmpeg.write_bytes(b"old")
+            new_ffmpeg.write_bytes(b"new")
+            config["tools"] = {"ffmpeg": str(old_ffmpeg)}
+            simpleripper.write_history_index(config, source, {"status": "error", "failure_type": "ffmpeg", "failure_count": 3, "source_signature": simpleripper.source_signature(source), "updated_at": simpleripper.utc_now(), "error": "native crash", "ffmpeg_binary_fingerprint": simpleripper.ffmpeg_binary_fingerprint(config)})
+
+            self.assertEqual((simpleripper.recent_ffmpeg_failure_info(config, source) or {})["decision"], "blocked")
+            config["tools"] = {"ffmpeg": str(new_ffmpeg)}
+
+            self.assertIsNone(simpleripper.recent_ffmpeg_failure_info(config, source))
+
     def test_clean_folder_is_skipped_by_fast_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

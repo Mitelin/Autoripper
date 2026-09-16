@@ -199,6 +199,18 @@ def ffmpeg_failure_message(returncode: int, log_path: Path) -> str:
     return f"ffmpeg failed with exit code {returncode}" + (f": {detail}" if detail else "")
 
 
+def ffmpeg_binary_fingerprint(config: dict[str, Any]) -> str:
+    configured = str((config.get("tools") or {}).get("ffmpeg") or "ffmpeg")
+    resolved = shutil.which(configured) or configured
+    path = Path(resolved)
+    try:
+        stat = path.stat()
+        identity = {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    except OSError:
+        identity = {"path": resolved}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def is_fatal_ffmpeg_returncode(returncode: int | None) -> bool:
     return returncode in {-6, -11}
 
@@ -967,6 +979,9 @@ def parse_utc_datetime(value: Any) -> datetime | None:
 def recent_ffmpeg_failure_info(config: dict[str, Any], source: Path) -> dict[str, Any] | None:
     payload = load_history_index(config, source)
     if not payload or payload.get("status") != "error" or payload.get("failure_type") != "ffmpeg":
+        return None
+    recorded_fingerprint = payload.get("ffmpeg_binary_fingerprint")
+    if recorded_fingerprint and recorded_fingerprint != ffmpeg_binary_fingerprint(config):
         return None
     signature = payload.get("source_signature") or {}
     current = source_signature(source)
@@ -4789,6 +4804,8 @@ class SimpleRipperApp:
             job_summary.update({"status": "error", "finished_at": utc_now(), "error": str(exc)})
             append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
             history_payload = {"status": "error", "job_id": job_id, "source_signature": current_signature, "updated_at": utc_now(), "error": str(exc), "failure_type": failure_type, "failure_count": failure_count, "replacement_path": str(replacement_path)}
+            if failure_type == "ffmpeg":
+                history_payload["ffmpeg_binary_fingerprint"] = ffmpeg_binary_fingerprint(self.config)
             write_history_index(self.config, source, history_payload)
             write_shared_worker_history(self.config, source, history_payload)
             cache_failure = update_cache_job_failure(self.config, source, str(exc), block_immediately=fatal_ffmpeg_crash) if ffmpeg_started else None
