@@ -2314,20 +2314,23 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertIn("pipe:1", command)
         self.assertIn("-nostats", command)
 
-    def test_build_ffmpeg_command_overrides_binary_only_for_matching_source_prefix(self) -> None:
+    def test_ffmpeg_fallback_is_used_only_for_native_crashes(self) -> None:
         config = self.make_config(Path("."))
         config["tools"] = {
             "ffmpeg": "/usr/bin/ffmpeg",
-            "ffmpeg_path_overrides": [
-                {"path_prefix": "/media/problem-series", "ffmpeg": "/opt/ffmpeg-8.1/bin/ffmpeg"},
-            ],
+            "ffmpeg_fallback": "/opt/ffmpeg-8.1/bin/ffmpeg",
         }
+        command = simpleripper.build_ffmpeg_command(config, Path("work/input.mkv"), Path("output.mkv"), {"media_type": "default"}, {"map_arguments": ["-map", "0"]})
 
-        matching = simpleripper.build_ffmpeg_command(config, Path("work/input.mkv"), Path("output.mkv"), {"media_type": "default"}, {"map_arguments": ["-map", "0"]}, original_source=Path("/media/problem-series/episode.mkv"))
-        unrelated = simpleripper.build_ffmpeg_command(config, Path("work/input.mkv"), Path("output.mkv"), {"media_type": "default"}, {"map_arguments": ["-map", "0"]}, original_source=Path("/media/other/episode.mkv"))
+        sigsegv = simpleripper.ffmpeg_fallback_command(config, command, -11)
+        sigabrt = simpleripper.ffmpeg_fallback_command(config, command, -6)
 
-        self.assertEqual(matching[0], "/opt/ffmpeg-8.1/bin/ffmpeg")
-        self.assertEqual(unrelated[0], "/usr/bin/ffmpeg")
+        self.assertEqual(command[0], "/usr/bin/ffmpeg")
+        self.assertEqual((sigsegv or [None])[0], "/opt/ffmpeg-8.1/bin/ffmpeg")
+        self.assertEqual((sigsegv or [])[1:], command[1:])
+        self.assertEqual((sigabrt or [None])[0], "/opt/ffmpeg-8.1/bin/ffmpeg")
+        self.assertIsNone(simpleripper.ffmpeg_fallback_command(config, command, 1))
+        self.assertIsNone(simpleripper.ffmpeg_fallback_command(config, command, 0))
 
     def test_ffmpeg_failure_message_includes_log_tail(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4058,6 +4061,42 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual(row["decision"], "blocked")
             self.assertEqual(row["decision_reason"], "repeated_ffmpeg_failure")
             self.assertEqual(row["failure_count"], 3)
+
+    def test_process_one_retries_native_crash_once_with_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["tools"] = {"ffmpeg": "primary-ffmpeg", "ffmpeg_fallback": "fallback-ffmpeg"}
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "native-crash.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 6000)
+            commands: list[list[str]] = []
+
+            class FakeProcess:
+                def __init__(self, command: list[str], returncode: int) -> None:
+                    self.stdout = io.StringIO("")
+                    self.pid = 4242
+                    self.returncode = returncode
+                    if returncode == 0:
+                        Path(command[-1]).write_bytes(b"encoded-output")
+
+                def poll(self) -> int:
+                    return self.returncode
+
+            def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+                commands.append(command)
+                return FakeProcess(command, -11 if len(commands) == 1 else 0)
+
+            source_metadata = {"media_type": "series", "duration_seconds": 1800.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "h264", "video_pix_fmt": "yuv420p", "video_width": 1920, "video_height": 1080, "overall_bitrate_kbps": 4000}
+            output_metadata = {**source_metadata, "video_codec": "hevc", "video_pix_fmt": "yuv420p10le", "overall_bitrate_kbps": 1500}
+            with patch("simpleripper.subprocess.Popen", side_effect=fake_popen), patch("simpleripper.ffprobe_metadata", side_effect=[({}, source_metadata), ({}, output_metadata)]), patch("simpleripper.verify_output", return_value=({}, ["stop after encoding"])):
+                app.process_one(source)
+
+            self.assertEqual(len(commands), 2)
+            self.assertEqual(commands[0][0], "primary-ffmpeg")
+            self.assertEqual(commands[1][0], "fallback-ffmpeg")
+            self.assertEqual(commands[1][1:], commands[0][1:])
 
     def test_approve_verification_error_finishes_replacement_without_rerun(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

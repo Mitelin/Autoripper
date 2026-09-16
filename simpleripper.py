@@ -199,32 +199,27 @@ def ffmpeg_failure_message(returncode: int, log_path: Path) -> str:
     return f"ffmpeg failed with exit code {returncode}" + (f": {detail}" if detail else "")
 
 
-def ffmpeg_path_for_source(config: dict[str, Any], source: Path | None = None) -> str:
+def ffmpeg_binary_fingerprint(config: dict[str, Any]) -> str:
     tools = config.get("tools") or {}
-    default = str(tools.get("ffmpeg") or "ffmpeg")
-    if source is None:
-        return default
-    normalized_source = str(source).replace("\\", "/").rstrip("/").casefold()
-    for override in tools.get("ffmpeg_path_overrides") or []:
-        if not isinstance(override, dict):
+    identities: list[dict[str, Any]] = []
+    for configured in (str(tools.get("ffmpeg") or "ffmpeg"), str(tools.get("ffmpeg_fallback") or "").strip()):
+        if not configured:
             continue
-        prefix = str(override.get("path_prefix") or "").replace("\\", "/").rstrip("/").casefold()
-        executable = str(override.get("ffmpeg") or "").strip()
-        if prefix and executable and (normalized_source == prefix or normalized_source.startswith(prefix + "/")):
-            return executable
-    return default
+        resolved = shutil.which(configured) or configured
+        path = Path(resolved)
+        try:
+            stat = path.stat()
+            identities.append({"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+        except OSError:
+            identities.append({"path": resolved})
+    return hashlib.sha256(json.dumps(identities, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def ffmpeg_binary_fingerprint(config: dict[str, Any], source: Path | None = None) -> str:
-    configured = ffmpeg_path_for_source(config, source)
-    resolved = shutil.which(configured) or configured
-    path = Path(resolved)
-    try:
-        stat = path.stat()
-        identity = {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-    except OSError:
-        identity = {"path": resolved}
-    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+def ffmpeg_fallback_command(config: dict[str, Any], command: list[str], returncode: int | None) -> list[str] | None:
+    fallback = str((config.get("tools") or {}).get("ffmpeg_fallback") or "").strip()
+    if not fallback or not is_fatal_ffmpeg_returncode(returncode) or not command or fallback == command[0]:
+        return None
+    return [fallback, *command[1:]]
 
 
 def is_fatal_ffmpeg_returncode(returncode: int | None) -> bool:
@@ -997,7 +992,7 @@ def recent_ffmpeg_failure_info(config: dict[str, Any], source: Path) -> dict[str
     if not payload or payload.get("status") != "error" or payload.get("failure_type") != "ffmpeg":
         return None
     recorded_fingerprint = payload.get("ffmpeg_binary_fingerprint")
-    if recorded_fingerprint and recorded_fingerprint != ffmpeg_binary_fingerprint(config, source):
+    if recorded_fingerprint and recorded_fingerprint != ffmpeg_binary_fingerprint(config):
         return None
     signature = payload.get("source_signature") or {}
     current = source_signature(source)
@@ -1517,7 +1512,6 @@ def build_ffmpeg_command(
     metadata: dict[str, Any],
     stream_policy: dict[str, Any],
     downscale_plan: dict[str, Any] | None = None,
-    original_source: Path | None = None,
 ) -> list[str]:
     settings = (config.get("quality_profiles") or {}).get(metadata.get("media_type") or "default") or (config.get("quality_profiles") or {}).get("default") or {}
     downscale_plan = downscale_plan or downscale_settings(config, metadata)
@@ -1527,7 +1521,7 @@ def build_ffmpeg_command(
         max_video_bitrate_kbps = DEFAULT_MAX_VIDEO_BITRATE_KBPS
     if downscale_plan.get("applied") and downscale_plan.get("crf_override") is not None:
         crf = downscale_plan["crf_override"]
-    command = [ffmpeg_path_for_source(config, original_source or source), "-hide_banner", "-nostats", "-progress", "pipe:1", "-y", "-i", str(source)]
+    command = [str((config.get("tools") or {}).get("ffmpeg") or "ffmpeg"), "-hide_banner", "-nostats", "-progress", "pipe:1", "-y", "-i", str(source)]
     default_maps = ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]
     map_arguments = list(stream_policy.get("map_arguments") or default_maps)
     if any(option == "-map" and index + 1 < len(map_arguments) and map_arguments[index + 1] == "0" for index, option in enumerate(map_arguments)):
@@ -4642,7 +4636,7 @@ class SimpleRipperApp:
             crf = settings.get("crf", 24)
             if downscale_plan.get("applied") and downscale_plan.get("crf_override") is not None:
                 crf = downscale_plan["crf_override"]
-            command = build_ffmpeg_command(self.config, copied_source, output, source_meta, stream_policy, downscale_plan, original_source=source)
+            command = build_ffmpeg_command(self.config, copied_source, output, source_meta, stream_policy, downscale_plan)
             job_summary["ffmpeg_command"] = command
             if stream_policy.get("applied"):
                 log_event(
@@ -4689,36 +4683,48 @@ class SimpleRipperApp:
                 log_event(self.config, "ffmpeg_start", job_id=job_id, command=command)
                 with ffmpeg_log.open("w", encoding="utf-8", errors="replace") as log_handle:
                     ffmpeg_started = True
-                    self._ffmpeg = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=log_handle, text=True, encoding="utf-8", errors="replace")
-                    self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "ffmpeg_pid": self._ffmpeg.pid, **recovery_context})
-                    progress_state: dict[str, Any] = {}
-
-                    def update_progress(snapshot: dict[str, Any]) -> None:
-                        with self._lock:
-                            progress_state.clear()
-                            progress_state.update(snapshot)
-
-                    progress_thread = threading.Thread(target=consume_ffmpeg_progress, args=(self._ffmpeg.stdout, update_progress), daemon=True)
-                    progress_thread.start()
-                    while self._ffmpeg.poll() is None:
-                        with self._lock:
-                            self.state.output_size_bytes = output.stat().st_size if output.exists() else 0
-                            progress_snapshot = dict(progress_state)
-                            progress_snapshot["size_bytes"] = self.state.output_size_bytes
-                            self.state.ffmpeg_progress = progress_snapshot
-                            force = self.state.force_stop
-                        write_json(ffmpeg_current_log_path(self.config), {"job_id": job_id, "source_path": str(source), "updated_at": utc_now(), "progress": progress_snapshot})
+                    def run_ffmpeg(attempt_command: list[str]) -> int:
+                        self._ffmpeg = subprocess.Popen(attempt_command, stdout=subprocess.PIPE, stderr=log_handle, text=True, encoding="utf-8", errors="replace")
                         self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "ffmpeg_pid": self._ffmpeg.pid, **recovery_context})
-                        if force:
-                            terminate_process_gracefully(self._ffmpeg)
-                            raise ForceStopRequested("force stop requested")
-                        time.sleep(0.5)
-                    progress_thread.join(timeout=1)
-                    if self._ffmpeg.returncode != 0:
+                        progress_state: dict[str, Any] = {}
+
+                        def update_progress(snapshot: dict[str, Any]) -> None:
+                            with self._lock:
+                                progress_state.clear()
+                                progress_state.update(snapshot)
+
+                        progress_thread = threading.Thread(target=consume_ffmpeg_progress, args=(self._ffmpeg.stdout, update_progress), daemon=True)
+                        progress_thread.start()
+                        while self._ffmpeg.poll() is None:
+                            with self._lock:
+                                self.state.output_size_bytes = output.stat().st_size if output.exists() else 0
+                                progress_snapshot = dict(progress_state)
+                                progress_snapshot["size_bytes"] = self.state.output_size_bytes
+                                self.state.ffmpeg_progress = progress_snapshot
+                                force = self.state.force_stop
+                            write_json(ffmpeg_current_log_path(self.config), {"job_id": job_id, "source_path": str(source), "updated_at": utc_now(), "progress": progress_snapshot})
+                            self.set_phase("encoding", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), "ffmpeg_pid": self._ffmpeg.pid, **recovery_context})
+                            if force:
+                                terminate_process_gracefully(self._ffmpeg)
+                                raise ForceStopRequested("force stop requested")
+                            time.sleep(0.5)
+                        progress_thread.join(timeout=1)
+                        return int(self._ffmpeg.returncode or 0)
+
+                    returncode = run_ffmpeg(command)
+                    fallback_command = ffmpeg_fallback_command(self.config, command, returncode)
+                    if fallback_command:
+                        output.unlink(missing_ok=True)
+                        log_handle.write(f"\nRetrying native ffmpeg crash with fallback: {fallback_command[0]}\n")
                         log_handle.flush()
-                        raise FfmpegFailedError(ffmpeg_failure_message(self._ffmpeg.returncode, ffmpeg_log), self._ffmpeg.returncode)
+                        job_summary["ffmpeg_fallback_command"] = fallback_command
+                        log_event(self.config, "ffmpeg_native_crash_fallback", job_id=job_id, returncode=returncode, fallback=fallback_command[0])
+                        returncode = run_ffmpeg(fallback_command)
+                    if returncode != 0:
+                        log_handle.flush()
+                        raise FfmpegFailedError(ffmpeg_failure_message(returncode, ffmpeg_log), returncode)
                 ffmpeg_completed = True
-                log_event(self.config, "ffmpeg_done", job_id=job_id, returncode=self._ffmpeg.returncode)
+                log_event(self.config, "ffmpeg_done", job_id=job_id, returncode=returncode)
             self.set_phase("probing_output", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
             output_probe, output_meta = ffprobe_metadata(self.config, output, source_meta.get("media_type") or "default")
             write_json(metadata_dir / "output.ffprobe.json", {"probe": output_probe, "metadata": output_meta})
@@ -4822,7 +4828,7 @@ class SimpleRipperApp:
             append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
             history_payload = {"status": "error", "job_id": job_id, "source_signature": current_signature, "updated_at": utc_now(), "error": str(exc), "failure_type": failure_type, "failure_count": failure_count, "replacement_path": str(replacement_path)}
             if failure_type == "ffmpeg":
-                history_payload["ffmpeg_binary_fingerprint"] = ffmpeg_binary_fingerprint(self.config, source)
+                history_payload["ffmpeg_binary_fingerprint"] = ffmpeg_binary_fingerprint(self.config)
             write_history_index(self.config, source, history_payload)
             write_shared_worker_history(self.config, source, history_payload)
             cache_failure = update_cache_job_failure(self.config, source, str(exc), block_immediately=fatal_ffmpeg_crash) if ffmpeg_started else None

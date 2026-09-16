@@ -17,7 +17,7 @@ paths:
 tools:
   ffmpeg: ffmpeg
   ffprobe: ffprobe
-  ffmpeg_path_overrides: []
+  ffmpeg_fallback: ""
 
 libraries:
   roots:
