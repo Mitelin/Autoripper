@@ -581,6 +581,52 @@ class SimpleRipperTests(unittest.TestCase):
             self.assertEqual((result or {})["decision"], "blocked")
             self.assertEqual(simpleripper.scan_candidates([source.parent], config), [])
 
+    def test_successful_deep_check_preserves_ffmpeg_failure_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            source = root / "library" / "crashing.mkv"
+            source.parent.mkdir()
+            source.write_bytes(b"x" * 10)
+            simpleripper.fast_inventory_scan([source.parent], config)
+
+            first = simpleripper.update_cache_job_failure(config, source, "ffmpeg signal 11")
+            simpleripper.update_cache_deep_check(config, {"path": source, "status": "ok", "metadata": {}, "score": 1.0})
+            second = simpleripper.update_cache_job_failure(config, source, "ffmpeg signal 11")
+            simpleripper.update_cache_deep_check(config, {"path": source, "status": "ok", "metadata": {}, "score": 1.0})
+            third = simpleripper.update_cache_job_failure(config, source, "ffmpeg signal 11")
+
+            self.assertEqual((first or {})["failure_count"], 1)
+            self.assertEqual((second or {})["failure_count"], 2)
+            self.assertEqual((third or {})["failure_count"], 3)
+            self.assertEqual((third or {})["decision"], "blocked")
+
+    def test_fatal_ffmpeg_signal_blocks_source_immediately_and_survives_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            source = root / "library" / "native-crash.mkv"
+            source.parent.mkdir()
+            source.write_bytes(b"x" * 10)
+            simpleripper.fast_inventory_scan([source.parent], config)
+            error = "ffmpeg failed with exit code -11"
+
+            result = simpleripper.update_cache_job_failure(config, source, error, block_immediately=True)
+            simpleripper.write_history_index(config, source, {"status": "error", "failure_type": "ffmpeg", "failure_count": 3, "source_signature": simpleripper.source_signature(source), "updated_at": simpleripper.utc_now(), "error": error})
+            simpleripper.fast_inventory_scan([source.parent], config)
+
+            self.assertTrue(simpleripper.is_fatal_ffmpeg_returncode(-6))
+            self.assertTrue(simpleripper.is_fatal_ffmpeg_returncode(-11))
+            self.assertFalse(simpleripper.is_fatal_ffmpeg_returncode(1))
+            self.assertEqual((result or {})["decision"], "blocked")
+            with simpleripper.open_worker_cache(config) as connection:
+                row = connection.execute("SELECT decision, decision_reason, failure_count FROM file_index WHERE path = ?", (str(source),)).fetchone()
+            self.assertEqual(row["decision"], "blocked")
+            self.assertEqual(row["decision_reason"], "repeated_ffmpeg_failure")
+            self.assertEqual(row["failure_count"], 3)
+
     def test_clean_folder_is_skipped_by_fast_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3945,6 +3991,39 @@ class SimpleRipperTests(unittest.TestCase):
                 row = connection.execute("SELECT decision, retry_after FROM file_index WHERE path = ?", (str(source),)).fetchone()
             self.assertEqual(row["decision"], "failed")
             self.assertTrue(row["retry_after"])
+
+    def test_process_one_blocks_ffmpeg_sigsegv_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            config["scan_cache"] = {"enabled": True, "queue_size": 25, "fast_inventory_rescan_hours": 24, "max_deep_checks_per_cycle": 50, "failed_retry_hours": 24, "max_failures_before_block": 3, "blocked_retry_days": 30}
+            app = simpleripper.SimpleRipperApp(config)
+            source = root / "library" / "native-crash.mkv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"x" * 6000)
+            simpleripper.fast_inventory_scan([source.parent], config)
+
+            class FakeProcess:
+                def __init__(self) -> None:
+                    self.stdout = io.StringIO("")
+                    self.pid = 4242
+                    self.returncode = -11
+
+                def poll(self) -> int:
+                    return self.returncode
+
+            source_metadata = {"media_type": "series", "duration_seconds": 1800.0, "audio_stream_count": 1, "subtitle_stream_count": 0, "video_codec": "h264", "video_pix_fmt": "yuv420p", "video_width": 1920, "video_height": 1080, "overall_bitrate_kbps": 4000}
+            with patch("simpleripper.subprocess.Popen", return_value=FakeProcess()), patch("simpleripper.ffprobe_metadata", return_value=({}, source_metadata)):
+                app.process_one(source)
+
+            history = simpleripper.load_history_index(config, source)
+            self.assertEqual((history or {})["failure_count"], 3)
+            self.assertIn("exit code -11", (history or {})["error"])
+            with simpleripper.open_worker_cache(config) as connection:
+                row = connection.execute("SELECT decision, decision_reason, failure_count FROM file_index WHERE path = ?", (str(source),)).fetchone()
+            self.assertEqual(row["decision"], "blocked")
+            self.assertEqual(row["decision_reason"], "repeated_ffmpeg_failure")
+            self.assertEqual(row["failure_count"], 3)
 
     def test_approve_verification_error_finishes_replacement_without_rerun(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

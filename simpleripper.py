@@ -51,7 +51,9 @@ class ForceStopRequested(RuntimeError):
 
 
 class FfmpegFailedError(RuntimeError):
-    pass
+    def __init__(self, message: str, returncode: int | None = None) -> None:
+        super().__init__(message)
+        self.returncode = returncode
 
 
 class InsufficientLocalSpaceError(RuntimeError):
@@ -195,6 +197,10 @@ def ffmpeg_failure_message(returncode: int, log_path: Path) -> str:
     if len(detail) > 2000:
         detail = detail[-2000:]
     return f"ffmpeg failed with exit code {returncode}" + (f": {detail}" if detail else "")
+
+
+def is_fatal_ffmpeg_returncode(returncode: int | None) -> bool:
+    return returncode in {-6, -11}
 
 
 def copy_file_interruptible(source: Path, destination: Path, should_stop: callable, chunk_size: int = 8 * 1024 * 1024) -> None:
@@ -976,6 +982,8 @@ def recent_ffmpeg_failure_info(config: dict[str, Any], source: Path) -> dict[str
     except (TypeError, ValueError):
         max_failures = 1
     failure_count = int(payload.get("failure_count") or 1)
+    if failure_count >= int(scan_cache_settings(config)["max_failures_before_block"]):
+        return {"decision": "blocked", "failure_count": failure_count, "retry_after": None, "error": payload.get("error")}
     updated_at = parse_utc_datetime(payload.get("updated_at"))
     if failure_count < max_failures or updated_at is None:
         return None
@@ -2249,8 +2257,8 @@ def fast_inventory_scan(folders: list[Path], config: dict[str, Any]) -> dict[str
             else:
                 failure_info = recent_ffmpeg_failure_info(config, path)
                 if failure_info:
-                    decision = "failed"
-                    decision_reason = "recent_ffmpeg_failure"
+                    decision = str(failure_info.get("decision") or "failed")
+                    decision_reason = "repeated_ffmpeg_failure" if decision == "blocked" else "recent_ffmpeg_failure"
                     decision_policy_hash = current_policy_hash
                     failure_count = int(failure_info.get("failure_count") or 1)
                     last_error = failure_info.get("error")
@@ -2462,15 +2470,15 @@ def update_cache_deep_check(config: dict[str, Any], details: dict[str, Any], ref
     settings = scan_cache_settings(config)
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat(timespec="seconds")
-    failure_count = 0
+    with open_worker_cache(config) as connection:
+        row = connection.execute("SELECT failure_count FROM file_index WHERE path = ?", (str(source),)).fetchone()
+    failure_count = int(row["failure_count"] or 0) if row else 0
     last_error = None
     last_failure_at = None
     retry_after = None
     next_check_after = None
     if details.get("status") != "ok":
-        with open_worker_cache(config) as connection:
-            row = connection.execute("SELECT failure_count FROM file_index WHERE path = ?", (str(source),)).fetchone()
-        failure_count = int(row["failure_count"] or 0) + 1 if row else 1
+        failure_count += 1
         decision = "blocked" if failure_count >= int(settings["max_failures_before_block"]) else "failed"
         decision_reason = "deep_check_blocked" if decision == "blocked" else str(details.get("status") or "deep_check_failed")
         last_error = str(details.get("error") or details.get("status") or "deep_check_failed")
@@ -2565,7 +2573,7 @@ def update_cache_job_success(config: dict[str, Any], source: Path, replacement: 
         refresh_folder_state_upwards(config, replacement)
 
 
-def update_cache_job_failure(config: dict[str, Any], source: Path, error: str) -> dict[str, Any] | None:
+def update_cache_job_failure(config: dict[str, Any], source: Path, error: str, block_immediately: bool = False) -> dict[str, Any] | None:
     if not scan_cache_enabled(config):
         return None
     settings = scan_cache_settings(config)
@@ -2576,6 +2584,8 @@ def update_cache_job_failure(config: dict[str, Any], source: Path, error: str) -
     with open_worker_cache(config) as connection:
         row = connection.execute("SELECT failure_count FROM file_index WHERE path = ?", (str(source),)).fetchone()
         failure_count = int(row["failure_count"] or 0) + 1 if row else 1
+        if block_immediately:
+            failure_count = max(failure_count, int(settings["max_failures_before_block"]))
         decision = "blocked" if failure_count >= int(settings["max_failures_before_block"]) else "failed"
         next_check_after = datetime.fromtimestamp(blocked_after, timezone.utc).isoformat(timespec="seconds") if decision == "blocked" else None
         retry_text = datetime.fromtimestamp(retry_after, timezone.utc).isoformat(timespec="seconds") if decision == "failed" else None
@@ -4674,7 +4684,7 @@ class SimpleRipperApp:
                     progress_thread.join(timeout=1)
                     if self._ffmpeg.returncode != 0:
                         log_handle.flush()
-                        raise FfmpegFailedError(ffmpeg_failure_message(self._ffmpeg.returncode, ffmpeg_log))
+                        raise FfmpegFailedError(ffmpeg_failure_message(self._ffmpeg.returncode, ffmpeg_log), self._ffmpeg.returncode)
                 ffmpeg_completed = True
                 log_event(self.config, "ffmpeg_done", job_id=job_id, returncode=self._ffmpeg.returncode)
             self.set_phase("probing_output", source, {"job_id": job_id, "local_input_path": str(copied_source), "local_output_path": str(output), "temp_output_path": str(tmp_output), **recovery_context})
@@ -4772,12 +4782,16 @@ class SimpleRipperApp:
             previous_signature = (previous_payload or {}).get("source_signature") or {}
             if previous_payload and previous_payload.get("failure_type") == failure_type and current_signature and source_signature_matches(previous_signature, current_signature):
                 previous_failure_count = int(previous_payload.get("failure_count") or 0)
+            fatal_ffmpeg_crash = isinstance(exc, FfmpegFailedError) and is_fatal_ffmpeg_returncode(exc.returncode)
+            failure_count = previous_failure_count + 1
+            if fatal_ffmpeg_crash:
+                failure_count = max(failure_count, int(scan_cache_settings(self.config)["max_failures_before_block"]))
             job_summary.update({"status": "error", "finished_at": utc_now(), "error": str(exc)})
             append_jsonl(history_dir(self.config) / "jobs.jsonl", job_summary)
-            history_payload = {"status": "error", "job_id": job_id, "source_signature": current_signature, "updated_at": utc_now(), "error": str(exc), "failure_type": failure_type, "failure_count": previous_failure_count + 1, "replacement_path": str(replacement_path)}
+            history_payload = {"status": "error", "job_id": job_id, "source_signature": current_signature, "updated_at": utc_now(), "error": str(exc), "failure_type": failure_type, "failure_count": failure_count, "replacement_path": str(replacement_path)}
             write_history_index(self.config, source, history_payload)
             write_shared_worker_history(self.config, source, history_payload)
-            cache_failure = update_cache_job_failure(self.config, source, str(exc)) if ffmpeg_started else None
+            cache_failure = update_cache_job_failure(self.config, source, str(exc), block_immediately=fatal_ffmpeg_crash) if ffmpeg_started else None
             if cache_failure:
                 log_event(self.config, "candidate_cache_failure", job_id=job_id, source_path=str(source), **cache_failure)
             if isinstance(exc, VerificationFailedError):
