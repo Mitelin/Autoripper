@@ -93,6 +93,10 @@ downscale:
 
 retention_size_policy:
   enabled: true
+  resolution_buckets:
+    sd:
+      max_height: 576
+      limit_multiplier: 0.5
   series:
     max_mb_per_25min: 500
   anime:

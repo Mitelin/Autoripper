@@ -2912,19 +2912,34 @@ def retention_size_policy_evaluation(config: dict[str, Any], source_meta: dict[s
         max_mb_per_25min = float(per_media.get("max_mb_per_25min")) if per_media.get("max_mb_per_25min") is not None else None
     except (TypeError, ValueError):
         max_mb_per_25min = None
+    resolution_bucket = None
+    limit_multiplier = 1.0
+    video_height = int(source_meta.get("video_height") or 0)
+    sd_policy = (policy.get("resolution_buckets") or {}).get("sd") or {}
+    try:
+        sd_max_height = int(sd_policy.get("max_height") or 0)
+        sd_multiplier = float(sd_policy.get("limit_multiplier") or 1.0)
+    except (TypeError, ValueError):
+        sd_max_height = 0
+        sd_multiplier = 1.0
+    if video_height > 0 and sd_max_height > 0 and video_height <= sd_max_height and sd_multiplier > 0:
+        resolution_bucket = "sd"
+        limit_multiplier = sd_multiplier
     duration_seconds = to_float(source_meta.get("duration_seconds"))
     duration_minutes = (duration_seconds / 60.0) if duration_seconds is not None else None
     actual_mb = (int(source_meta.get("file_size_bytes") or 0) / 1024 / 1024) if source_meta.get("file_size_bytes") is not None else None
     limit_mb = None
     oversized = False
     if enabled and max_mb_per_25min is not None and duration_minutes and duration_minutes > 0:
-        limit_mb = duration_minutes / 25.0 * max_mb_per_25min
+        limit_mb = duration_minutes / 25.0 * max_mb_per_25min * limit_multiplier
         oversized = actual_mb is not None and actual_mb > limit_mb
     return {
         "enabled": enabled,
         "media_type": bucket,
         "codec": str(source_meta.get("video_codec") or "").lower() or None,
         "max_mb_per_25min": max_mb_per_25min,
+        "resolution_bucket": resolution_bucket,
+        "limit_multiplier": limit_multiplier,
         "duration_minutes": round(duration_minutes, 1) if duration_minutes is not None else None,
         "actual_mb": round(actual_mb, 1) if actual_mb is not None else None,
         "limit_mb": round(limit_mb, 1) if limit_mb is not None else None,

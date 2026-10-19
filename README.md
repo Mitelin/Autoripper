@@ -158,7 +158,7 @@ Important sections:
 - `scan_cache.*`: current SQLite cache behavior for inventory, queue, folder state, retries, and block windows
 - `quality_profiles.*`: encoder, CRF, `max_video_bitrate_kbps` cap (defaults to `8000` when omitted), preset, pixel format, and stream-copy behavior per media type
 - `downscale.*`: optional width-capped downscale for 4K-style sources while preserving aspect ratio
-- `retention_size_policy.*`: keep suspiciously large HEVC or AV1 files eligible for re-encode
+- `retention_size_policy.*`: keep files above the duration-normalized size limit eligible for re-encode; `resolution_buckets.sd` can lower that limit for SD sources
 - `track_policy.*`: select preferred audio languages and subtitle retention behavior
 - `skip_rules.*`: codec, resolution, HDR, size, and duration-based skip logic
 - `verification.*`: duration tolerance, ratio checks, and bitrate thresholds

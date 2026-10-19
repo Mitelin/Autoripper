@@ -3300,6 +3300,37 @@ class SimpleRipperTests(unittest.TestCase):
         self.assertEqual(retention["limit_mb"], 2584.0)
         self.assertEqual(reason, "under_retention_size_limit")
 
+    def test_retention_size_policy_halves_limit_for_sd_only(self) -> None:
+        config = self.make_config(Path("."))
+        config["quality_profiles"] = {
+            "default": {"encoder": "libx265", "pix_fmt": "yuv420p10le"},
+            "series": {"encoder": "libx265", "pix_fmt": "yuv420p10le"},
+        }
+        config["retention_size_policy"]["resolution_buckets"] = {
+            "sd": {"max_height": 576, "limit_multiplier": 0.5},
+        }
+        metadata = {
+            "media_type": "series",
+            "video_codec": "h264",
+            "video_pix_fmt": "yuv420p",
+            "duration_seconds": 1500,
+            "file_size_bytes": 300 * 1024 * 1024,
+        }
+
+        sd = simpleripper.retention_size_policy_evaluation(config, {**metadata, "video_height": 480}, "series")
+        full_hd = simpleripper.retention_size_policy_evaluation(config, {**metadata, "video_height": 1080}, "series")
+
+        self.assertEqual(sd["resolution_bucket"], "sd")
+        self.assertEqual(sd["limit_multiplier"], 0.5)
+        self.assertEqual(sd["limit_mb"], 250.0)
+        self.assertTrue(sd["oversized"])
+        self.assertIsNone(simpleripper.skip_reason(config, {**metadata, "video_height": 480}))
+        self.assertIsNone(full_hd["resolution_bucket"])
+        self.assertEqual(full_hd["limit_multiplier"], 1.0)
+        self.assertEqual(full_hd["limit_mb"], 500.0)
+        self.assertFalse(full_hd["oversized"])
+        self.assertEqual(simpleripper.skip_reason(config, {**metadata, "video_height": 1080}), "under_retention_size_limit")
+
     def test_skip_reason_profile_mismatch_stays_usable_when_retention_disabled(self) -> None:
         config = self.make_config(Path("."))
         config["retention_size_policy"]["enabled"] = False
